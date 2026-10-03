@@ -1,0 +1,6 @@
+{
+  "name": "Binance 5-Minute Crypto Scanner & Auto Trader",
+  "description": "Production-grade Binance 5-minute crypto market scanner, multi-timeframe technical analysis, fixed-trade-amount strategy engine, paper trading wallet, and live Binance Spot auto-trader with risk safety controls.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,17 @@
+{"id":"audit-1791056187728-3n7a6","timestamp":1791056187728,"eventType":"BUY_AUTHORIZED","mode":"PAPER","symbol":"ETHUSDT","side":"BUY","quantity":0.04,"price":2500,"reason":"test"}
+{"id":"audit-1791056187729-f6mkg","timestamp":1791056187729,"eventType":"ACCOUNT_RESET","mode":"PAPER","reason":"Paper account reset to starting balance of 1000 USDT."}
+{"id":"audit-1791056188445-ktzh7","timestamp":1791056188445,"eventType":"SETTINGS_UPDATED","mode":"PAPER","details":{"fixedTradeAmount":100}}
+{"id":"audit-1791056188445-tp9as","timestamp":1791056188445,"eventType":"SETTINGS_UPDATED","mode":"PAPER","details":{"fixedTradeAmount":200}}
+{"id":"audit-1791056188447-wpzny","timestamp":1791056188447,"eventType":"ACCOUNT_RESET","mode":"PAPER","reason":"Paper account reset to starting balance of 1000 USDT."}
+{"id":"audit-1791056211126-9pp8g","timestamp":1791056211126,"eventType":"BUY_AUTHORIZED","mode":"PAPER","symbol":"ETHUSDT","side":"BUY","quantity":0.04,"price":2500,"reason":"test"}
+{"id":"audit-1791056211127-ootkx","timestamp":1791056211127,"eventType":"ACCOUNT_RESET","mode":"PAPER","reason":"Paper account reset to starting balance of 1000 USDT."}
+{"id":"audit-1791056211908-4mjbc","timestamp":1791056211908,"eventType":"SETTINGS_UPDATED","mode":"PAPER","details":{"fixedTradeAmount":100}}
+{"id":"audit-1791056211908-hpf77","timestamp":1791056211908,"eventType":"SETTINGS_UPDATED","mode":"PAPER","details":{"fixedTradeAmount":200}}
+{"id":"audit-1791056211910-x5eup","timestamp":1791056211910,"eventType":"ACCOUNT_RESET","mode":"PAPER","reason":"Paper account reset to starting balance of 1000 USDT."}
+{"id":"audit-1791056220877-k4opp","timestamp":1791056220877,"eventType":"SETTINGS_UPDATED","mode":"PAPER","details":{"autoTrading":false}}
+{"id":"audit-1791056230465-4xxuo","timestamp":1791056230465,"eventType":"SETTINGS_UPDATED","mode":"PAPER","details":{"autoTrading":false}}
+{"id":"audit-1791056544744-y7793","timestamp":1791056544744,"eventType":"BUY_AUTHORIZED","mode":"PAPER","symbol":"ETHUSDT","side":"BUY","quantity":0.04,"price":2500,"reason":"test"}
+{"id":"audit-1791056544745-3oaaj","timestamp":1791056544745,"eventType":"ACCOUNT_RESET","mode":"PAPER","reason":"Paper account reset to starting balance of 1000 USDT."}
+{"id":"audit-1791056545509-o33vi","timestamp":1791056545509,"eventType":"SETTINGS_UPDATED","mode":"PAPER","details":{"fixedTradeAmount":100}}
+{"id":"audit-1791056545509-c4u88","timestamp":1791056545509,"eventType":"SETTINGS_UPDATED","mode":"PAPER","details":{"fixedTradeAmount":200}}
+{"id":"audit-1791056545511-sfp8b","timestamp":1791056545511,"eventType":"ACCOUNT_RESET","mode":"PAPER","reason":"Paper account reset to starting balance of 1000 USDT."}

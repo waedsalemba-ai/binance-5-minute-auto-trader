@@ -1,0 +1,379 @@
+import React, { useState, useEffect } from 'react';
+import {
+  TrendingUp,
+  TrendingDown,
+  DollarSign,
+  Activity,
+  Layers,
+  Zap,
+  Clock,
+  RefreshCw,
+  ShieldCheck,
+  AlertCircle,
+  ArrowRight,
+  Flame,
+  RotateCcw,
+} from 'lucide-react';
+import {
+  WalletBalance,
+  Position,
+  ScannerSummary,
+  TechnicalAnalysis,
+  TradingMode,
+} from '../types/index.ts';
+
+interface DashboardViewProps {
+  mode: TradingMode;
+  wallet: WalletBalance;
+  positions: Position[];
+  summary: ScannerSummary;
+  analyses: TechnicalAnalysis[];
+  fixedTradeAmount: number;
+  autoTrading: boolean;
+  onRunScan: () => void;
+  isScanning: boolean;
+  onSelectSymbol: (symbol: string) => void;
+  onOpenSellModal: (pos: Position) => void;
+  onOpenResetModal?: () => void;
+}
+
+export const DashboardView: React.FC<DashboardViewProps> = ({
+  mode,
+  wallet,
+  positions,
+  summary,
+  analyses,
+  fixedTradeAmount,
+  autoTrading,
+  onRunScan,
+  isScanning,
+  onSelectSymbol,
+  onOpenSellModal,
+  onOpenResetModal,
+}) => {
+  const [secondsToNextScan, setSecondsToNextScan] = useState<number>(0);
+
+  useEffect(() => {
+    const updateCountdown = () => {
+      if (summary.nextScanTime) {
+        const diff = Math.max(0, Math.floor((summary.nextScanTime - Date.now()) / 1000));
+        setSecondsToNextScan(diff);
+      }
+    };
+    updateCountdown();
+    const interval = setInterval(updateCountdown, 1000);
+    return () => clearInterval(interval);
+  }, [summary.nextScanTime]);
+
+  const activePositions = positions.filter(p => p.mode === mode && p.status === 'OPEN');
+  const preBullishSymbols = analyses.filter(a => a.strategyState === 'PRE_BULLISH');
+  const strongBullishSymbols = analyses.filter(a => a.strategyState === 'STRONG_BULLISH');
+  const weakeningSymbols = analyses.filter(a => a.strategyState === 'WEAKENING');
+
+  const formatSec = (sec: number) => {
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    return `${m}:${s < 10 ? '0' : ''}${s}`;
+  };
+
+  return (
+    <div className="space-y-6">
+      {/* Banner / Mode Status Alert */}
+      <div className={`p-4 rounded-2xl border flex flex-wrap items-center justify-between gap-4 ${
+        mode === 'REAL'
+          ? 'bg-amber-500/10 border-amber-500/30 text-amber-300'
+          : 'bg-slate-900/80 border-slate-800 text-slate-300'
+      }`}>
+        <div className="flex items-center gap-3">
+          <div className={`p-2.5 rounded-xl ${mode === 'REAL' ? 'bg-amber-500/20 text-amber-400' : 'bg-emerald-500/20 text-emerald-400'}`}>
+            <ShieldCheck className="w-6 h-6" />
+          </div>
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="font-bold text-sm text-slate-100">
+                {mode === 'REAL' ? 'LIVE BINANCE SPOT TRADING' : 'SIMULATED PAPER TRADING'}
+              </span>
+              <span className={`text-[11px] font-mono px-2 py-0.5 rounded font-semibold ${
+                autoTrading ? 'bg-emerald-500/20 text-emerald-400' : 'bg-slate-800 text-slate-400'
+              }`}>
+                Auto: {autoTrading ? 'ACTIVE' : 'IDLE'}
+              </span>
+            </div>
+            <p className="text-xs text-slate-400 mt-0.5">
+              Strategy Sizing Model: <strong className="text-amber-400 font-mono">{fixedTradeAmount.toFixed(2)} USDT</strong> per new trade. Paper & Real modes remain completely isolated.
+            </p>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-3">
+          {onOpenResetModal && (
+            <button
+              onClick={onOpenResetModal}
+              title="Reset all active positions and restore wallet balance to default 1000 USDT"
+              className="px-3.5 py-1.5 text-xs font-bold bg-amber-500/15 hover:bg-amber-400 text-amber-400 hover:text-slate-950 rounded-xl border border-amber-500/30 transition-all flex items-center gap-1.5 shadow-sm"
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+              <span>Reset Positions & Balance</span>
+            </button>
+          )}
+
+          <button
+            onClick={onRunScan}
+            disabled={isScanning}
+            className="px-3.5 py-1.5 text-xs font-bold bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl border border-slate-700 transition-all flex items-center gap-2"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${isScanning ? 'animate-spin text-amber-400' : ''}`} />
+            {isScanning ? 'Scanning Markets...' : 'Scan Now (5m)'}
+          </button>
+        </div>
+      </div>
+
+      {/* KPI Cards Grid */}
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 sm:gap-4">
+        {/* Total Equity */}
+        <div className="bg-[#0f172a] border border-slate-800 rounded-2xl p-4">
+          <span className="text-[11px] text-slate-400 font-medium">Total Equity</span>
+          <div className="text-xl sm:text-2xl font-black font-mono text-slate-100 mt-1">
+            ${wallet.totalEquity.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+          </div>
+          <div className="text-[11px] text-slate-500 mt-1 font-mono">
+            Avail: ${wallet.usdtAvailable.toFixed(2)}
+          </div>
+        </div>
+
+        {/* Available USDT */}
+        <div className="bg-[#0f172a] border border-slate-800 rounded-2xl p-4">
+          <span className="text-[11px] text-slate-400 font-medium">Available USDT</span>
+          <div className="text-xl sm:text-2xl font-black font-mono text-emerald-400 mt-1">
+            ${wallet.usdtAvailable.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+          </div>
+          <div className="text-[11px] text-slate-500 mt-1 font-mono">
+            Allocated: ${(wallet.accountAssetValue).toFixed(2)}
+          </div>
+        </div>
+
+        {/* Unrealized PnL */}
+        <div className="bg-[#0f172a] border border-slate-800 rounded-2xl p-4">
+          <span className="text-[11px] text-slate-400 font-medium">Unrealized PnL</span>
+          <div className={`text-xl sm:text-2xl font-black font-mono mt-1 ${wallet.unrealizedPnL >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+            {wallet.unrealizedPnL >= 0 ? '+' : ''}${wallet.unrealizedPnL.toFixed(2)}
+          </div>
+          <div className="text-[11px] text-slate-500 mt-1">
+            Across {activePositions.length} active positions
+          </div>
+        </div>
+
+        {/* Realized PnL */}
+        <div className="bg-[#0f172a] border border-slate-800 rounded-2xl p-4">
+          <span className="text-[11px] text-slate-400 font-medium">Realized PnL</span>
+          <div className={`text-xl sm:text-2xl font-black font-mono mt-1 ${wallet.realizedPnL >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+            {wallet.realizedPnL >= 0 ? '+' : ''}${wallet.realizedPnL.toFixed(2)}
+          </div>
+          <div className="text-[11px] text-slate-500 mt-1">
+            Fees paid: ${wallet.totalFeesPaid.toFixed(2)}
+          </div>
+        </div>
+
+        {/* Open Positions */}
+        <div className="bg-[#0f172a] border border-slate-800 rounded-2xl p-4">
+          <span className="text-[11px] text-slate-400 font-medium">Open Positions</span>
+          <div className="text-xl sm:text-2xl font-black font-mono text-slate-100 mt-1">
+            {activePositions.length} <span className="text-sm font-normal text-slate-500">/ 5 max</span>
+          </div>
+          <div className="text-[11px] text-slate-500 mt-1 font-mono">
+            {mode} Mode
+          </div>
+        </div>
+
+        {/* Next 5m Scan */}
+        <div className="bg-[#0f172a] border border-slate-800 rounded-2xl p-4">
+          <span className="text-[11px] text-slate-400 font-medium flex items-center justify-between">
+            <span>Next Scan</span>
+            <Clock className="w-3.5 h-3.5 text-amber-400" />
+          </span>
+          <div className="text-xl sm:text-2xl font-black font-mono text-amber-400 mt-1">
+            {isScanning ? 'SCANNING' : formatSec(secondsToNextScan)}
+          </div>
+          <div className="text-[11px] text-slate-500 mt-1">
+            5m candle sync
+          </div>
+        </div>
+      </div>
+
+      {/* Main Split: Scanner Summary & Signal Radar */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        {/* Signal Radar & Scanner State */}
+        <div className="bg-[#0f172a] border border-slate-800 rounded-2xl p-5 space-y-4">
+          <div className="flex items-center justify-between">
+            <h3 className="font-bold text-sm text-slate-100 flex items-center gap-2">
+              <Zap className="w-4 h-4 text-amber-400" />
+              5-Minute Scanner Telemetry
+            </h3>
+            <span className="text-xs font-mono text-slate-400">
+              {summary.pairsAnalyzed} USDT pairs
+            </span>
+          </div>
+
+          <div className="grid grid-cols-2 gap-2 text-xs font-mono">
+            <div className="p-3 bg-slate-900/80 border border-slate-800 rounded-xl">
+              <div className="text-slate-400 text-[11px]">PRE-BULLISH (Buy Zone)</div>
+              <div className="text-lg font-bold text-sky-400 mt-0.5">{summary.preBullishCount}</div>
+            </div>
+            <div className="p-3 bg-slate-900/80 border border-slate-800 rounded-xl">
+              <div className="text-slate-400 text-[11px]">STRONG BULLISH (Holding)</div>
+              <div className="text-lg font-bold text-emerald-400 mt-0.5">{summary.strongBullishCount}</div>
+            </div>
+            <div className="p-3 bg-slate-900/80 border border-slate-800 rounded-xl">
+              <div className="text-slate-400 text-[11px]">WEAKENING (Exit Zone)</div>
+              <div className="text-lg font-bold text-rose-400 mt-0.5">{summary.weakeningCount}</div>
+            </div>
+            <div className="p-3 bg-slate-900/80 border border-slate-800 rounded-xl">
+              <div className="text-slate-400 text-[11px]">BULLISH / NEUTRAL</div>
+              <div className="text-lg font-bold text-slate-400 mt-0.5">{summary.bullishCount + summary.neutralCount}</div>
+            </div>
+          </div>
+
+          <div className="bg-slate-900/60 border border-slate-800/80 rounded-xl p-3 text-xs text-slate-400 space-y-1.5">
+            <div className="flex justify-between font-mono">
+              <span>Strategy Invariant:</span>
+              <span className="text-amber-400 font-bold">{fixedTradeAmount} USDT per BUY</span>
+            </div>
+            <div className="flex justify-between font-mono">
+              <span>Max Simultaneous Positions:</span>
+              <span className="text-slate-200">5 symbols</span>
+            </div>
+            <div className="flex justify-between font-mono">
+              <span>Post-Sell Cooldown:</span>
+              <span className="text-slate-200">30 minutes</span>
+            </div>
+          </div>
+        </div>
+
+        {/* Current Pre-Bullish Signals (Candidates for Buy) */}
+        <div className="lg:col-span-2 bg-[#0f172a] border border-slate-800 rounded-2xl p-5 space-y-4">
+          <div className="flex items-center justify-between">
+            <h3 className="font-bold text-sm text-slate-100 flex items-center gap-2">
+              <Flame className="w-4 h-4 text-sky-400" />
+              Pre-Bullish Setups (Entry Opportunities)
+            </h3>
+            <span className="text-xs text-slate-400">Score &ge; 65</span>
+          </div>
+
+          {preBullishSymbols.length === 0 ? (
+            <div className="py-8 text-center text-xs text-slate-500 bg-slate-900/40 rounded-xl border border-dashed border-slate-800">
+              No symbols currently in PRE_BULLISH setup state. Scanner runs continuously every 2 minutes.
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              {preBullishSymbols.slice(0, 4).map(item => (
+                <div
+                  key={item.symbol}
+                  onClick={() => onSelectSymbol(item.symbol)}
+                  className="p-3 bg-slate-900/80 hover:bg-slate-800/80 border border-slate-800 rounded-xl cursor-pointer transition-all group"
+                >
+                  <div className="flex items-center justify-between mb-1.5">
+                    <span className="font-bold text-slate-100 group-hover:text-amber-400 transition-colors">
+                      {item.symbol}
+                    </span>
+                    <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-sky-500/10 text-sky-400 border border-sky-500/20">
+                      Score {item.score}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between text-xs font-mono text-slate-400">
+                    <span>${item.price}</span>
+                    <span className={item.priceChange24h >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
+                      {item.priceChange24h >= 0 ? '+' : ''}{item.priceChange24h.toFixed(2)}%
+                    </span>
+                  </div>
+                  <div className="text-[11px] text-slate-500 mt-2 line-clamp-1">
+                    {item.stateReason}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Active Open Positions Table */}
+      <div className="bg-[#0f172a] border border-slate-800 rounded-2xl p-5 space-y-4">
+        <div className="flex items-center justify-between">
+          <h3 className="font-bold text-sm text-slate-100 flex items-center gap-2">
+            <Layers className="w-4 h-4 text-emerald-400" />
+            Active Strategy Positions ({activePositions.length})
+          </h3>
+          <span className="text-xs font-mono text-slate-400">
+            Isolated {mode} Positions
+          </span>
+        </div>
+
+        {activePositions.length === 0 ? (
+          <div className="py-8 text-center text-xs text-slate-500 bg-slate-900/40 rounded-xl border border-dashed border-slate-800">
+            No active positions open in {mode} mode. When a symbol triggers PRE_BULLISH and passes the Safety Gate, a fixed {fixedTradeAmount} USDT position will open.
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs text-left">
+              <thead>
+                <tr className="border-b border-slate-800 text-slate-400 font-mono">
+                  <th className="py-2.5 px-3">Symbol</th>
+                  <th className="py-2.5 px-3">Entry Amount</th>
+                  <th className="py-2.5 px-3">Quantity</th>
+                  <th className="py-2.5 px-3">Entry Price</th>
+                  <th className="py-2.5 px-3">Current Price</th>
+                  <th className="py-2.5 px-3">Unrealized PnL</th>
+                  <th className="py-2.5 px-3">Score</th>
+                  <th className="py-2.5 px-3">State</th>
+                  <th className="py-2.5 px-3 text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-800/60 font-mono">
+                {activePositions.map(pos => (
+                  <tr key={pos.id} className="hover:bg-slate-900/40 transition-colors">
+                    <td className="py-3 px-3 font-bold text-slate-100">{pos.symbol}</td>
+                    <td className="py-3 px-3 text-amber-400">{pos.entryQuoteAmount} USDT</td>
+                    <td className="py-3 px-3 text-slate-300">{pos.remainingQuantity}</td>
+                    <td className="py-3 px-3 text-slate-300">${pos.entryPrice}</td>
+                    <td className="py-3 px-3 text-slate-100">${pos.currentPrice}</td>
+                    <td className={`py-3 px-3 font-bold ${pos.unrealizedPnL >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                      {pos.unrealizedPnL >= 0 ? '+' : ''}${pos.unrealizedPnL.toFixed(2)} ({pos.unrealizedPnLPercent >= 0 ? '+' : ''}{pos.unrealizedPnLPercent}%)
+                    </td>
+                    <td className="py-3 px-3">
+                      <span className="text-slate-300">{pos.currentScore}</span>
+                      <span className="text-slate-500 text-[10px] ml-1">(in: {pos.entryScore})</span>
+                    </td>
+                    <td className="py-3 px-3">
+                      <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                        pos.currentState === 'STRONG_BULLISH'
+                          ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
+                          : pos.currentState === 'WEAKENING'
+                          ? 'bg-rose-500/20 text-rose-400 border border-rose-500/30'
+                          : 'bg-sky-500/20 text-sky-400 border border-sky-500/30'
+                      }`}>
+                        {pos.currentState}
+                      </span>
+                    </td>
+                    <td className="py-3 px-3 text-right space-x-2">
+                      <button
+                        onClick={() => onSelectSymbol(pos.symbol)}
+                        className="px-2.5 py-1 text-[11px] bg-slate-800 hover:bg-slate-700 text-slate-300 rounded"
+                      >
+                        Chart
+                      </button>
+                      <button
+                        onClick={() => onOpenSellModal(pos)}
+                        className="px-2.5 py-1 text-[11px] bg-rose-500/20 hover:bg-rose-500/30 text-rose-400 border border-rose-500/30 rounded font-bold"
+                      >
+                        Sell
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
