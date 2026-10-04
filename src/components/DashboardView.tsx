@@ -123,7 +123,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             className="px-3.5 py-1.5 text-xs font-bold bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl border border-slate-700 transition-all flex items-center gap-2"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${isScanning ? 'animate-spin text-amber-400' : ''}`} />
-            {isScanning ? 'Scanning Markets...' : 'Scan Now (5m)'}
+            {isScanning ? 'Scanning Markets...' : 'Scan Now (2m)'}
           </button>
         </div>
       </div>
@@ -185,7 +185,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           </div>
         </div>
 
-        {/* Next 5m Scan */}
+        {/* Next 2m Scan */}
         <div className="bg-[#0f172a] border border-slate-800 rounded-2xl p-4">
           <span className="text-[11px] text-slate-400 font-medium flex items-center justify-between">
             <span>Next Scan</span>
@@ -195,7 +195,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             {isScanning ? 'SCANNING' : formatSec(secondsToNextScan)}
           </div>
           <div className="text-[11px] text-slate-500 mt-1">
-            5m candle sync
+            2m interval sync
           </div>
         </div>
       </div>
@@ -207,7 +207,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           <div className="flex items-center justify-between">
             <h3 className="font-bold text-sm text-slate-100 flex items-center gap-2">
               <Zap className="w-4 h-4 text-amber-400" />
-              5-Minute Scanner Telemetry
+              2-Minute Scanner Telemetry
             </h3>
             <span className="text-xs font-mono text-slate-400">
               {summary.pairsAnalyzed} USDT pairs
@@ -317,13 +317,12 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               <thead>
                 <tr className="border-b border-slate-800 text-slate-400 font-mono">
                   <th className="py-2.5 px-3">Symbol</th>
-                  <th className="py-2.5 px-3">Entry Amount</th>
-                  <th className="py-2.5 px-3">Quantity</th>
+                  <th className="py-2.5 px-3">Entry / Qty</th>
                   <th className="py-2.5 px-3">Entry Price</th>
                   <th className="py-2.5 px-3">Current Price</th>
-                  <th className="py-2.5 px-3">Unrealized PnL</th>
-                  <th className="py-2.5 px-3">Score</th>
-                  <th className="py-2.5 px-3">State</th>
+                  <th className="py-2.5 px-3">Break-Even / TP / SL</th>
+                  <th className="py-2.5 px-3">Est. Net PnL</th>
+                  <th className="py-2.5 px-3">Score & State</th>
                   <th className="py-2.5 px-3 text-right">Actions</th>
                 </tr>
               </thead>
@@ -331,27 +330,32 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 {activePositions.map(pos => (
                   <tr key={pos.id} className="hover:bg-slate-900/40 transition-colors">
                     <td className="py-3 px-3 font-bold text-slate-100">{pos.symbol}</td>
-                    <td className="py-3 px-3 text-amber-400">{pos.entryQuoteAmount} USDT</td>
-                    <td className="py-3 px-3 text-slate-300">{pos.remainingQuantity}</td>
+                    <td className="py-3 px-3">
+                      <div className="text-amber-400">{pos.entryQuoteAmount} USDT</div>
+                      <div className="text-[10px] text-slate-500">Qty: {pos.remainingQuantity}</div>
+                    </td>
                     <td className="py-3 px-3 text-slate-300">${pos.entryPrice}</td>
-                    <td className="py-3 px-3 text-slate-100">${pos.currentPrice}</td>
-                    <td className={`py-3 px-3 font-bold ${pos.unrealizedPnL >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                      {pos.unrealizedPnL >= 0 ? '+' : ''}${pos.unrealizedPnL.toFixed(2)} ({pos.unrealizedPnLPercent >= 0 ? '+' : ''}{pos.unrealizedPnLPercent}%)
+                    <td className="py-3 px-3 text-slate-100 font-bold">${pos.currentPrice}</td>
+                    <td className="py-3 px-3 text-[11px]">
+                      <div><span className="text-slate-500">BE:</span> <span className="text-amber-400">${pos.breakEvenPrice ?? '-'}</span></div>
+                      <div><span className="text-slate-500">TP:</span> <span className="text-emerald-400">${pos.takeProfitPrice ?? '-'}</span> | <span className="text-slate-500">SL:</span> <span className="text-rose-400">${pos.stopLossPrice ?? '-'}</span></div>
+                    </td>
+                    <td className={`py-3 px-3 font-bold ${(pos.estimatedNetPnL ?? pos.unrealizedPnL) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                      {(pos.estimatedNetPnL ?? pos.unrealizedPnL) >= 0 ? '+' : ''}${(pos.estimatedNetPnL ?? pos.unrealizedPnL).toFixed(2)} ({(pos.estimatedNetPnLPercent ?? pos.unrealizedPnLPercent) >= 0 ? '+' : ''}{pos.estimatedNetPnLPercent ?? pos.unrealizedPnLPercent}%)
                     </td>
                     <td className="py-3 px-3">
-                      <span className="text-slate-300">{pos.currentScore}</span>
-                      <span className="text-slate-500 text-[10px] ml-1">(in: {pos.entryScore})</span>
-                    </td>
-                    <td className="py-3 px-3">
-                      <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                        pos.currentState === 'STRONG_BULLISH'
-                          ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
-                          : pos.currentState === 'WEAKENING'
-                          ? 'bg-rose-500/20 text-rose-400 border border-rose-500/30'
-                          : 'bg-sky-500/20 text-sky-400 border border-sky-500/30'
-                      }`}>
-                        {pos.currentState}
-                      </span>
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-slate-300 font-bold">{pos.currentScore}</span>
+                        <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                          pos.currentState === 'STRONG_BULLISH'
+                            ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
+                            : pos.currentState === 'WEAKENING'
+                            ? 'bg-rose-500/20 text-rose-400 border border-rose-500/30'
+                            : 'bg-sky-500/20 text-sky-400 border border-sky-500/30'
+                        }`}>
+                          {pos.currentState}
+                        </span>
+                      </div>
                     </td>
                     <td className="py-3 px-3 text-right space-x-2">
                       <button

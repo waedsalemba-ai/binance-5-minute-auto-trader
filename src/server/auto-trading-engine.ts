@@ -8,15 +8,20 @@ import {
 } from '../types/index.ts';
 import { Storage } from './storage.ts';
 import { BinanceRequestManager } from './binance-client.ts';
-import { BinanceTimeService } from './binance-time.ts';
-import { calculateAllIndicators, filterClosedCandles } from './indicators.ts';
+import { calculateAllIndicators } from './indicators.ts';
 import { detectCandlePatterns } from './pattern-detector.ts';
 import { analyzeMarketStructure } from './market-structure.ts';
 import { StrategyEngine } from './strategy-engine.ts';
 import { SafetyGate } from './safety-gate.ts';
 import { PaperTradingExecutor, RealBinanceTradingExecutor, TradingExecutor } from './trading-executor.ts';
 import { Logger } from './logger.ts';
-import { AuditLogger } from './audit-logger.ts';
+import {
+  evaluateExitDecision,
+  calculatePositionNetPnL,
+  calculateBreakEvenExitPrice,
+  calculateTargetExitPrice,
+} from './exit-decision-engine.ts';
+import { evaluateEntryEligibility } from './entry-decision-engine.ts';
 
 type StateUpdateListener = (data: { type: string; payload: any }) => void;
 
@@ -26,9 +31,9 @@ export class AutoTradingEngine {
   private paperExecutor = new PaperTradingExecutor();
   private realExecutor = new RealBinanceTradingExecutor();
   private scanTimer: NodeJS.Timeout | null = null;
-  private positionSyncTimer: NodeJS.Timeout | null = null;
   private isScanRunning = false;
-  private isPositionSyncRunning = false;
+  private isEmergencyStopped = false;
+  private pendingBuyLocks = new Set<string>();
   private listeners = new Set<StateUpdateListener>();
 
   private constructor() {}
@@ -60,33 +65,35 @@ export class AutoTradingEngine {
   }
 
   public isEmergencyStopActive(): boolean {
-    return Storage.isEmergencyStopActive();
+    return this.isEmergencyStopped;
   }
 
   public setEmergencyStop(active: boolean): void {
-    Storage.setEmergencyStop(active);
-    this.broadcast('emergency_stop_changed', { isEmergencyStopped: active });
+    this.isEmergencyStopped = active;
+    if (active) {
+      // Turn off auto-trading in settings
+      Storage.updateSettings({ autoTrading: false });
+      Logger.warn(
+        Storage.getSettings().mode,
+        'SECURITY',
+        'EMERGENCY STOP ACTIVATED! Automatic trading halted immediately. Existing positions remain open.'
+      );
+    } else {
+      Logger.info(
+        Storage.getSettings().mode,
+        'SECURITY',
+        'Emergency stop cleared by user.'
+      );
+    }
+    this.broadcast('emergency_stop_changed', { isEmergencyStopped: this.isEmergencyStopped });
   }
 
-  public async startScheduler(): Promise<void> {
+  public startScheduler(): void {
     if (this.scanTimer) return;
     const settings = Storage.getSettings();
-    const intervalMs = settings.scanIntervalMs || 300000; // 5 minutes authoritative
+    const intervalMs = settings.scanIntervalMs || 120000; // 2 minutes
 
-    // Start background Binance time synchronizer
-    BinanceTimeService.getInstance().startPeriodicSync();
-
-    // Start high-frequency online active position synchronizer (every 3s)
-    this.startPositionSyncWorker(3000);
-
-    // Fail-closed startup audit and resume check
-    await this.validateStartupState();
-
-    Logger.info(
-      settings.mode,
-      'SCAN',
-      `AutoTrading scheduler initialized with ${intervalMs / 1000}s interval (5m). Position live-sync online. Auto-trading is ${settings.autoTrading ? 'ACTIVE' : 'IDLE'}.`
-    );
+    Logger.info('PAPER', 'SCAN', `AutoTrading scheduler initialized with ${intervalMs / 1000}s interval (2m).`);
 
     // Run first scan shortly after startup
     setTimeout(() => {
@@ -98,174 +105,11 @@ export class AutoTradingEngine {
     }, intervalMs);
   }
 
-  public startPositionSyncWorker(intervalMs = 3000): void {
-    if (this.positionSyncTimer) return;
-    this.positionSyncTimer = setInterval(() => {
-      this.syncActivePositionsWithBinance().catch(() => {});
-    }, intervalMs);
-  }
-
-  public stopPositionSyncWorker(): void {
-    if (this.positionSyncTimer) {
-      clearInterval(this.positionSyncTimer);
-      this.positionSyncTimer = null;
-    }
-  }
-
-  /**
-   * Always-online continuous synchronization of active positions with live Binance API mark prices and exchange balances.
-   */
-  public async syncActivePositionsWithBinance(): Promise<Position[]> {
-    if (this.isPositionSyncRunning) return Storage.getPositions(undefined, 'OPEN');
-    this.isPositionSyncRunning = true;
-
-    try {
-      const openPositions = Storage.getPositions(undefined, 'OPEN');
-      if (openPositions.length === 0) {
-        return [];
-      }
-
-      const updatedPositions: Position[] = [];
-      const mode = Storage.getSettings().mode;
-
-      // Group unique symbols to fetch current mark prices from Binance
-      const symbols = [...new Set(openPositions.map(p => p.symbol))];
-      const priceMap = new Map<string, number>();
-
-      for (const sym of symbols) {
-        try {
-          const p = await this.binance.getLatestPrice(sym);
-          if (p && p > 0) priceMap.set(sym, p);
-        } catch {
-          // ignore single symbol ticker failure
-        }
-      }
-
-      // Check if real account credentials exist for live balance verification
-      let realAccountData: any = null;
-      const realAcc = Storage.getAccounts().find(a => a.mode === 'REAL');
-      if (realAcc?.hasApiKeys) {
-        const creds = Storage.getDecryptedCredentials(realAcc.id);
-        if (creds) {
-          try {
-            realAccountData = await this.binance.getAccount(creds.apiKey, creds.apiSecret);
-          } catch {
-            // ignore temporary account fetch errors
-          }
-        }
-      }
-
-      for (const pos of openPositions) {
-        const livePrice = priceMap.get(pos.symbol) || pos.currentPrice;
-        if (livePrice && livePrice > 0) {
-          pos.currentPrice = livePrice;
-          pos.unrealizedPnL = Number(((livePrice - pos.entryPrice) * pos.remainingQuantity).toFixed(4));
-          pos.unrealizedPnLPercent = Number((((livePrice - pos.entryPrice) / pos.entryPrice) * 100).toFixed(2));
-          pos.updatedAt = Date.now();
-        }
-
-        // For REAL positions, sync remainingQuantity with real Binance spot balance if available
-        if (pos.mode === 'REAL' && realAccountData) {
-          const baseAsset = pos.symbol.replace('USDT', '');
-          const binanceBalance = realAccountData.balances?.find((b: any) => b.asset === baseAsset);
-          if (binanceBalance) {
-            const freeQty = parseFloat(binanceBalance.free) || 0;
-            const lockedQty = parseFloat(binanceBalance.locked) || 0;
-            const totalQty = freeQty + lockedQty;
-            
-            // If the Binance balance decreased externally, adjust remainingQuantity
-            if (totalQty < pos.remainingQuantity * 0.999) {
-              Logger.info('REAL', 'RECONCILIATION', `Position ${pos.symbol} quantity adjusted from ${pos.remainingQuantity} to ${totalQty} to match Binance online balance.`);
-              pos.remainingQuantity = Number(totalQty.toFixed(8));
-              if (pos.remainingQuantity <= 0) {
-                pos.status = 'CLOSED';
-                pos.closedAt = Date.now();
-              }
-            }
-          }
-        }
-
-        Storage.savePosition(pos);
-        updatedPositions.push(pos);
-      }
-
-      // Update wallet values
-      const currentExecutor = this.getExecutor(mode);
-      await currentExecutor.getBalance().catch(() => {});
-
-      // Broadcast real-time position updates to all connected frontend clients
-      this.broadcast('positions_synced', {
-        positions: updatedPositions,
-        timestamp: Date.now(),
-        count: updatedPositions.length,
-      });
-
-      return updatedPositions;
-    } finally {
-      this.isPositionSyncRunning = false;
-    }
-  }
-
-  /**
-   * Fail-Closed startup validation.
-   * If resumeOnRestart is false, autoTrading is strictly kept OFF.
-   * If resumeOnRestart is true and mode is REAL, checks credentials, time sync, balances, and emergency stop.
-   */
-  public async validateStartupState(): Promise<void> {
-    const settings = Storage.getSettings();
-    const isEmergency = Storage.isEmergencyStopActive();
-
-    if (isEmergency) {
-      Storage.updateSettings({ autoTrading: false });
-      Logger.warn('REAL', 'SECURITY', 'Startup: EMERGENCY STOP is ACTIVE from persistent storage. Auto-trading is LOCKED.');
-      return;
-    }
-
-    if (!settings.resumeOnRestart) {
-      Storage.updateSettings({ autoTrading: false });
-      Logger.info(settings.mode, 'SECURITY', 'Startup: resumeOnRestart is FALSE. Auto-trading remains OFF until explicit user start.');
-      return;
-    }
-
-    if (settings.mode === 'REAL' && settings.autoTrading) {
-      try {
-        Logger.info('REAL', 'SECURITY', 'Startup: Validating REAL trading resumption checklist...');
-        const realAcc = Storage.getAccounts().find(a => a.mode === 'REAL');
-        if (!realAcc || !realAcc.hasApiKeys) {
-          throw new Error('No Binance API credentials configured.');
-        }
-
-        const creds = Storage.getDecryptedCredentials(realAcc.id);
-        if (!creds) {
-          throw new Error('Unable to decrypt Binance credentials.');
-        }
-
-        // Verify Binance connectivity
-        await this.binance.getAccount(creds.apiKey, creds.apiSecret);
-
-        // Verify time synchronization
-        const timeOk = await BinanceTimeService.getInstance().syncWithBinance();
-        if (!timeOk || !BinanceTimeService.getInstance().isSafeDrift()) {
-          throw new Error('Clock drift with Binance is unsafe.');
-        }
-
-        // Reconcile open orders & positions
-        await this.realExecutor.reconcile();
-
-        Logger.info('REAL', 'SECURITY', 'Startup: All REAL trading resumption safety checks PASSED.');
-      } catch (err: any) {
-        Storage.updateSettings({ autoTrading: false });
-        Logger.error('REAL', 'SECURITY', `Startup: REAL resumption check failed (${err.message}). Auto-trading disabled for safety.`);
-      }
-    }
-  }
-
   public stopScheduler(): void {
     if (this.scanTimer) {
       clearInterval(this.scanTimer);
       this.scanTimer = null;
     }
-    this.stopPositionSyncWorker();
   }
 
   public async runScanCycle(): Promise<TechnicalAnalysis[]> {
@@ -276,12 +120,11 @@ export class AutoTradingEngine {
 
     this.isScanRunning = true;
     const startTime = Date.now();
-    const scanId = `scan-${startTime.toString(36)}`;
     const settings = Storage.getSettings();
     const currentMode = settings.mode;
 
     Storage.updateScannerSummary({ isScanning: true, lastScanTime: startTime });
-    this.broadcast('scanner_started', { timestamp: startTime, scanId });
+    this.broadcast('scanner_started', { timestamp: startTime });
 
     try {
       // 1. Fetch 24hr tickers to select liquid USDT universe
@@ -310,7 +153,7 @@ export class AutoTradingEngine {
       Logger.info(
         currentMode,
         'SCAN',
-        `Starting 5m scan [${scanId}] across ${validTickers.length} liquid USDT pairs (min 24h vol: $${(minVolume / 1e6).toFixed(1)}M${maxSymbolsEnv > 0 ? `, limit: ${maxSymbolsEnv}` : ', all liquid pairs'})`
+        `Starting 2m scan across ${validTickers.length} liquid USDT pairs (min 24h vol: $${(minVolume / 1e6).toFixed(1)}M${maxSymbolsEnv > 0 ? `, limit: ${maxSymbolsEnv}` : ', all liquid pairs'})`
       );
 
       const results: TechnicalAnalysis[] = [];
@@ -320,46 +163,42 @@ export class AutoTradingEngine {
       let weakeningCount = 0;
       let neutralCount = 0;
 
-      // 2. Scan each symbol using STRICTLY closed candles
+      // 2. Scan each symbol
       for (const t of validTickers) {
         try {
           const symbol = t.symbol;
-          const rawCandles5m = await this.binance.getKlines(symbol, '5m', Math.min(candleLimit, 250));
-          const closedCandles5m = filterClosedCandles(rawCandles5m);
-          if (closedCandles5m.length < 35) continue;
+          const candles5m = await this.binance.getKlines(symbol, '5m', Math.min(candleLimit, 250));
+          if (candles5m.length < 35) continue;
 
-          // Technical indicators on 5m closed candles
-          const ind5m = calculateAllIndicators(closedCandles5m);
-          const patterns5m = detectCandlePatterns(closedCandles5m);
-          const struct5m = analyzeMarketStructure(closedCandles5m);
-          const tf5mSignal = StrategyEngine.analyzeTimeframe(closedCandles5m, '5m');
+          // Technical indicators on 5m
+          const ind5m = calculateAllIndicators(candles5m);
+          const patterns5m = detectCandlePatterns(candles5m);
+          const struct5m = analyzeMarketStructure(candles5m);
+          const tf5mSignal = StrategyEngine.analyzeTimeframe(candles5m, '5m');
 
-          // Multi-timeframe: fetch 15m, 1h, 4h closed candles
+          // Multi-timeframe: fetch 15m, 1h, 4h
           let tf15mSignal;
           let tf1hSignal;
           let tf4hSignal;
 
           try {
-            const raw15m = await this.binance.getKlines(symbol, '15m', 60);
-            const closed15m = filterClosedCandles(raw15m);
-            if (closed15m.length >= 30) {
-              tf15mSignal = StrategyEngine.analyzeTimeframe(closed15m, '15m');
+            const candles15m = await this.binance.getKlines(symbol, '15m', 60);
+            if (candles15m.length >= 30) {
+              tf15mSignal = StrategyEngine.analyzeTimeframe(candles15m, '15m');
             }
           } catch {}
 
           try {
-            const raw1h = await this.binance.getKlines(symbol, '1h', 60);
-            const closed1h = filterClosedCandles(raw1h);
-            if (closed1h.length >= 30) {
-              tf1hSignal = StrategyEngine.analyzeTimeframe(closed1h, '1h');
+            const candles1h = await this.binance.getKlines(symbol, '1h', 60);
+            if (candles1h.length >= 30) {
+              tf1hSignal = StrategyEngine.analyzeTimeframe(candles1h, '1h');
             }
           } catch {}
 
           try {
-            const raw4h = await this.binance.getKlines(symbol, '4h', 60);
-            const closed4h = filterClosedCandles(raw4h);
-            if (closed4h.length >= 30) {
-              tf4hSignal = StrategyEngine.analyzeTimeframe(closed4h, '4h');
+            const candles4h = await this.binance.getKlines(symbol, '4h', 60);
+            if (candles4h.length >= 30) {
+              tf4hSignal = StrategyEngine.analyzeTimeframe(candles4h, '4h');
             }
           } catch {}
 
@@ -371,7 +210,7 @@ export class AutoTradingEngine {
           };
 
           const { score, components } = StrategyEngine.calculateTechnicalScore(
-            closedCandles5m,
+            candles5m,
             ind5m,
             patterns5m,
             struct5m,
@@ -379,11 +218,10 @@ export class AutoTradingEngine {
           );
 
           const prevAnalysis = Storage.getAnalysis(symbol);
-          const currentPrice = parseFloat(t.lastPrice);
           const { state: strategyState, reason: stateReason } = StrategyEngine.evaluateStrategyState(
             {
               symbol,
-              price: currentPrice,
+              price: parseFloat(t.lastPrice),
               priceChange24h: parseFloat(t.priceChangePercent),
               volume24h: parseFloat(t.volume),
               quoteVolume24h: parseFloat(t.quoteVolume),
@@ -403,7 +241,7 @@ export class AutoTradingEngine {
 
           const analysis: TechnicalAnalysis = {
             symbol,
-            price: currentPrice,
+            price: parseFloat(t.lastPrice),
             priceChange24h: parseFloat(t.priceChangePercent),
             volume24h: parseFloat(t.volume),
             quoteVolume24h: parseFloat(t.quoteVolume),
@@ -427,13 +265,47 @@ export class AutoTradingEngine {
           else if (strategyState === 'WEAKENING') weakeningCount++;
           else neutralCount++;
 
-          // 3. Process automated trading decisions if enabled & emergency stop is not active
-          if (settings.autoTrading && !Storage.isEmergencyStopActive()) {
-            const latestCandleTimestamp = closedCandles5m[closedCandles5m.length - 1]?.timestamp || Date.now();
-            await this.processTradingSignal(analysis, prevAnalysis?.strategyState, settings, currentMode, latestCandleTimestamp);
+          // 3. Process automated trading decisions if enabled
+          if (settings.autoTrading && !this.isEmergencyStopped) {
+            await this.processTradingSignal(analysis, prevAnalysis?.strategyState, settings, currentMode);
           }
         } catch (symErr: any) {
           // continue with next symbol
+        }
+      }
+
+      // 4. Ensure all active open positions are audited every cycle even if not in the volume ticker list
+      if (settings.autoTrading && !this.isEmergencyStopped) {
+        const openPositionsToAudit = Storage.getPositions(currentMode, 'OPEN');
+        const scannedSymbols = new Set(validTickers.map(t => t.symbol));
+        for (const pos of openPositionsToAudit) {
+          if (!scannedSymbols.has(pos.symbol)) {
+            try {
+              let posAnalysis = Storage.getAnalysis(pos.symbol);
+              if (!posAnalysis) {
+                const livePrice = await this.binance.getLatestPrice(pos.symbol);
+                posAnalysis = {
+                  symbol: pos.symbol,
+                  price: livePrice || pos.currentPrice,
+                  priceChange24h: 0,
+                  volume24h: 0,
+                  quoteVolume24h: 0,
+                  timestamp: Date.now(),
+                  indicators: calculateAllIndicators([]),
+                  patterns: [],
+                  marketStructure: { trend: 'CONSOLIDATION', structure: 'NEUTRAL', breakout: 'NONE', supportLevels: [], resistanceLevels: [], swingHighs: [], swingLows: [] },
+                  multiTimeframe: { '5m': { timeframe: '5m', trend: 'NEUTRAL', score: pos.currentScore, rsi: 50, macdCross: 'NONE' } },
+                  score: pos.currentScore,
+                  scoreComponents: [],
+                  strategyState: pos.currentState,
+                  stateReason: 'Direct open position audit',
+                };
+              }
+              await this.evaluateAndProcessPositionExit(pos, posAnalysis, settings, currentMode);
+            } catch (auditErr: any) {
+              Logger.warn(currentMode, 'STRATEGY', `Open position audit error for ${pos.symbol}: ${auditErr.message}`);
+            }
+          }
         }
       }
 
@@ -455,7 +327,7 @@ export class AutoTradingEngine {
         openPositionsCount: openPositions.length,
         todayTradesCount: todayTrades.length,
         lastScanTime: Date.now(),
-        nextScanTime: Date.now() + (settings.scanIntervalMs || 300000),
+        nextScanTime: Date.now() + (settings.scanIntervalMs || 120000),
         isScanning: false,
       };
 
@@ -466,7 +338,7 @@ export class AutoTradingEngine {
       Logger.info(
         currentMode,
         'SCAN',
-        `5m Scan [${scanId}] completed in ${durationSec}s. Analyzed: ${results.length} | Pre-Bullish: ${preBullishCount} | Strong Bullish: ${strongBullishCount} | Weakening: ${weakeningCount}`
+        `2m Scan completed in ${durationSec}s. Analyzed: ${results.length} | Pre-Bullish: ${preBullishCount} | Strong Bullish: ${strongBullishCount} | Weakening: ${weakeningCount}`
       );
 
       return results;
@@ -483,33 +355,71 @@ export class AutoTradingEngine {
     analysis: TechnicalAnalysis,
     previousState: StrategyState | undefined,
     settings: TradingSettings,
-    mode: TradingMode,
-    candleTimestamp: number
+    mode: TradingMode
   ): Promise<void> {
     const symbol = analysis.symbol;
     const executor = this.getExecutor(mode);
     const openPosition = Storage.getOpenPositionForSymbol(symbol, mode);
+    const lockKey = `${mode}:${symbol}`;
+    const isPendingEntry = this.pendingBuyLocks.has(lockKey);
+    const cooldownCheck = Storage.isSymbolInCooldown(symbol, mode);
 
     // -------------------------------------------------------------
-    // BUY LOGIC: NEUTRAL -> PRE_BULLISH transition
+    // 1. POSITION MANAGEMENT & EXIT ARCHITECTURE (IF POSITION OPEN)
     // -------------------------------------------------------------
-    if (analysis.strategyState === 'PRE_BULLISH' && !openPosition) {
+    if (openPosition && openPosition.status === 'OPEN') {
+      await this.evaluateAndProcessPositionExit(openPosition, analysis, settings, mode);
+      return;
+    }
+
+    // -------------------------------------------------------------
+    // 2. CENTRALIZED ENTRY DECISION EVALUATION (IF NO POSITION)
+    // -------------------------------------------------------------
+    const entryDecision = evaluateEntryEligibility({
+      symbol,
+      strategyState: analysis.strategyState,
+      technicalScore: analysis.score,
+      hasOpenPosition: !!openPosition,
+      isPendingEntry,
+      isEmergencyStopped: this.isEmergencyStopped,
+      isInCooldown: cooldownCheck.inCooldown,
+      settings,
+    });
+
+    if (!entryDecision.eligible) {
+      // Log blocked or skipped entry for informative diagnostic tracking
+      if (analysis.strategyState === 'PRE_BULLISH' || analysis.strategyState === 'STRONG_BULLISH') {
+        Logger.info(
+          mode,
+          'STRATEGY',
+          `Entry check for ${symbol}: ${entryDecision.reason}`,
+          {
+            symbol,
+            strategyState: analysis.strategyState,
+            technicalScore: analysis.score,
+          }
+        );
+      }
+      return;
+    }
+
+    // Acquire atomic per-symbol entry lock to prevent duplicate BUY in flight
+    this.pendingBuyLocks.add(lockKey);
+
+    try {
       const fixedAmount = settings.fixedTradeAmount;
       const wallet = Storage.getWallet(mode);
       const openPositions = Storage.getPositions(mode, 'OPEN');
       const symbolFilter = await this.binance.getSymbolFilters(symbol);
 
-      // Deterministic idempotency key based on symbol, timeframe bar, and state
-      const signalId = `SIG-${mode}-${symbol}-${candleTimestamp}-${analysis.strategyState}`;
       const clientOrderId = `AUTO-${mode}-${symbol}-${Date.now().toString(36)}`;
-
       const orderRequest = {
         symbol,
         side: 'BUY' as const,
         quoteAmount: fixedAmount, // Strict invariant: exactly fixed trade amount
-        reason: `Auto-trader: PRE_BULLISH setup confirmed (Score: ${analysis.score} >= ${settings.preBullishScoreMin}).`,
-        strategyState: analysis.strategyState,
-        technicalScore: analysis.score,
+        reason: entryDecision.reason,
+        strategyState: entryDecision.strategyState,
+        technicalScore: entryDecision.technicalScore,
         clientOrderId,
       };
 
@@ -521,8 +431,7 @@ export class AutoTradingEngine {
         openPositions,
         symbolFilter,
         analysis.price,
-        Storage.isEmergencyStopActive(),
-        signalId
+        this.isEmergencyStopped
       );
 
       if (!safetyResult.allowed) {
@@ -532,8 +441,8 @@ export class AutoTradingEngine {
           `BUY Signal blocked by Safety Gate for ${symbol}: ${safetyResult.reason}`,
           {
             symbol,
-            strategyState: analysis.strategyState,
-            technicalScore: analysis.score,
+            strategyState: entryDecision.strategyState,
+            technicalScore: entryDecision.technicalScore,
           }
         );
         return;
@@ -542,53 +451,118 @@ export class AutoTradingEngine {
       Logger.info(
         mode,
         'STRATEGY',
-        `BUY SIGNAL AUTHORIZED: ${symbol} | Fixed Amount: ${fixedAmount} USDT | Score: ${analysis.score}`,
+        `BUY SIGNAL TRIGGERED: ${symbol} (${entryDecision.strategyState}) | Fixed Amount: ${fixedAmount} USDT | Score: ${entryDecision.technicalScore}`,
         {
           symbol,
-          strategyState: analysis.strategyState,
-          technicalScore: analysis.score,
+          strategyState: entryDecision.strategyState,
+          technicalScore: entryDecision.technicalScore,
         }
       );
 
-      try {
-        const execResult = await executor.buy(orderRequest);
-        if (execResult.success) {
-          Storage.recordIdempotencyKey(signalId, execResult.order.id, clientOrderId);
-          this.broadcast('order_executed', { mode, order: execResult.order, position: execResult.position });
-        }
-      } catch (err: any) {
-        Logger.error(mode, 'ORDER', `Execution of BUY failed for ${symbol}: ${err.message}`, {
-          symbol,
-          strategyState: analysis.strategyState,
-          technicalScore: analysis.score,
-        });
+      const execResult = await executor.buy(orderRequest);
+      if (execResult.success) {
+        this.broadcast('order_executed', { mode, order: execResult.order, position: execResult.position });
       }
-      return;
+    } catch (err: any) {
+      Logger.error(mode, 'ORDER', `Execution of BUY failed for ${symbol}: ${err.message}`, {
+        symbol,
+        strategyState: entryDecision.strategyState,
+        technicalScore: entryDecision.technicalScore,
+      });
+    } finally {
+      // Release atomic lock regardless of outcome
+      this.pendingBuyLocks.delete(lockKey);
+    }
+  }
+
+  public async evaluateAndProcessPositionExit(
+    position: Position,
+    analysis: TechnicalAnalysis,
+    settings: TradingSettings,
+    mode: TradingMode
+  ): Promise<void> {
+    const symbol = position.symbol;
+    const executor = this.getExecutor(mode);
+
+    // 1. Fetch fresh live Binance market price
+    let freshPrice = analysis.price;
+    let priceTimestamp = analysis.timestamp;
+    try {
+      const livePrice = await this.binance.getLatestPrice(symbol);
+      if (livePrice && livePrice > 0) {
+        freshPrice = livePrice;
+        priceTimestamp = Date.now();
+      }
+    } catch {
+      // Fall back to analysis.price
     }
 
-    // -------------------------------------------------------------
-    // SELL LOGIC: STRONG_BULLISH -> WEAKENING transition
-    // -------------------------------------------------------------
-    if (openPosition && (analysis.strategyState === 'WEAKENING' || analysis.strategyState === 'EXIT')) {
+    // 2. Authoritative Exit Decision Evaluation
+    const exitDecision = evaluateExitDecision({
+      position,
+      currentPrice: freshPrice,
+      priceTimestamp,
+      strategyState: analysis.strategyState,
+      technicalScore: analysis.score,
+      settings,
+      isEmergencyStopped: this.isEmergencyStopped,
+    });
+
+    // 3. Update Position state with enriched metrics
+    position.currentPrice = freshPrice;
+    position.currentScore = analysis.score;
+    position.currentState = analysis.strategyState;
+    position.grossPnL = exitDecision.grossPnL;
+    position.unrealizedPnL = exitDecision.grossPnL;
+    position.unrealizedPnLPercent = Number((((freshPrice - position.entryPrice) / position.entryPrice) * 100).toFixed(2));
+    position.estimatedNetPnL = exitDecision.netPnL;
+    position.estimatedNetPnLPercent = exitDecision.netPnLPercent;
+    position.breakEvenPrice = exitDecision.breakEvenPrice;
+    position.takeProfitPrice = exitDecision.takeProfitPrice;
+    position.stopLossPrice = exitDecision.stopLossPrice;
+    position.exitReason = exitDecision.reason;
+    position.exitStatus = exitDecision.shouldSell
+      ? 'CLOSING'
+      : exitDecision.reason === 'TAKE_PROFIT'
+      ? 'WAITING_TP'
+      : exitDecision.reason === 'STOP_LOSS'
+      ? 'WAITING_SL'
+      : 'HOLD';
+    position.updatedAt = Date.now();
+    Storage.savePosition(position);
+
+    // Log the Exit Check
+    Logger.info(mode, 'STRATEGY', exitDecision.logMessage, {
+      symbol,
+      strategyState: analysis.strategyState,
+      technicalScore: analysis.score,
+      details: {
+        price: freshPrice,
+        entry: position.entryPrice,
+        netPnLPercent: exitDecision.netPnLPercent,
+        decision: exitDecision.shouldSell ? 'SELL' : 'HOLD',
+        reason: exitDecision.reason,
+      },
+    });
+
+    // 4. If SELL decision is authorized
+    if (exitDecision.shouldSell) {
       const clientOrderId = `AUTO-${mode}-SELL-${symbol}-${Date.now().toString(36)}`;
       const orderRequest = {
         symbol,
         side: 'SELL' as const,
-        quantity: openPosition.remainingQuantity, // Sell entire strategy-owned position
-        reason: `Auto-trader: Strong bullish momentum weakened (Score: ${analysis.score}, State: ${analysis.strategyState}). Exiting full position.`,
+        quantity: position.remainingQuantity,
+        reason: `Auto-trader Exit: ${exitDecision.reason} (Net PnL: ${exitDecision.netPnLPercent >= 0 ? '+' : ''}${exitDecision.netPnLPercent}%, State: ${analysis.strategyState}, Score: ${analysis.score}).`,
         strategyState: analysis.strategyState,
         technicalScore: analysis.score,
         clientOrderId,
       };
 
-      const symbolFilter = await this.binance.getSymbolFilters(symbol);
       const safetyResult = SafetyGate.validateSell(
         orderRequest,
-        openPosition,
+        position,
         mode,
-        Storage.isEmergencyStopActive(),
-        symbolFilter,
-        analysis.price
+        this.isEmergencyStopped
       );
 
       if (!safetyResult.allowed) {
@@ -605,21 +579,58 @@ export class AutoTradingEngine {
         return;
       }
 
+      // Pre-Execution Price Gap Protection: re-verify price right before submitting
+      try {
+        const preExecPrice = await this.binance.getLatestPrice(symbol);
+        if (preExecPrice && preExecPrice > 0) {
+          const reCheckDecision = evaluateExitDecision({
+            position,
+            currentPrice: preExecPrice,
+            priceTimestamp: Date.now(),
+            strategyState: analysis.strategyState,
+            technicalScore: analysis.score,
+            settings,
+            isEmergencyStopped: this.isEmergencyStopped,
+          });
+
+          if (!reCheckDecision.shouldSell) {
+            Logger.warn(
+              mode,
+              'STRATEGY',
+              `SELL ABORTED due to pre-execution price gap for ${symbol}. Decision reversed to ${reCheckDecision.reason} (Net PnL: ${reCheckDecision.netPnLPercent}%).`,
+              {
+                symbol,
+                strategyState: analysis.strategyState,
+                technicalScore: analysis.score,
+                details: { preExecPrice, netPnLPercent: reCheckDecision.netPnLPercent },
+              }
+            );
+            return;
+          }
+        }
+      } catch {
+        // proceed if single price ping fails
+      }
+
       Logger.info(
         mode,
         'STRATEGY',
-        `SELL SIGNAL AUTHORIZED: ${symbol} | Qty: ${openPosition.remainingQuantity} | Reason: Momentum weakening`,
+        `AUTOMATIC SELL EXECUTING: ${symbol} | Reason: ${exitDecision.reason} | Estimated Net PnL: ${exitDecision.netPnLPercent}% | Qty: ${position.remainingQuantity}`,
         {
           symbol,
           strategyState: analysis.strategyState,
           technicalScore: analysis.score,
+          details: {
+            exitReason: exitDecision.reason,
+            netPnLPercent: exitDecision.netPnLPercent,
+          },
         }
       );
 
       try {
-        const execResult = await executor.sell(orderRequest, openPosition.id);
+        const execResult = await executor.sell(orderRequest, position.id);
         if (execResult.success) {
-          this.broadcast('order_executed', { mode, order: execResult.order, trade: execResult.trade });
+          this.broadcast('order_executed', { mode, order: execResult.order, trade: execResult.trade, position: execResult.position });
         }
       } catch (err: any) {
         Logger.error(mode, 'ORDER', `Execution of SELL failed for ${symbol}: ${err.message}`, {
@@ -628,20 +639,6 @@ export class AutoTradingEngine {
           technicalScore: analysis.score,
         });
       }
-      return;
-    }
-
-    // -------------------------------------------------------------
-    // HOLD STATUS: Update open position metrics
-    // -------------------------------------------------------------
-    if (openPosition) {
-      openPosition.currentPrice = analysis.price;
-      openPosition.currentScore = analysis.score;
-      openPosition.currentState = analysis.strategyState;
-      openPosition.unrealizedPnL = Number(((analysis.price - openPosition.entryPrice) * openPosition.remainingQuantity).toFixed(4));
-      openPosition.unrealizedPnLPercent = Number((((analysis.price - openPosition.entryPrice) / openPosition.entryPrice) * 100).toFixed(2));
-      openPosition.updatedAt = Date.now();
-      Storage.savePosition(openPosition);
     }
   }
 }

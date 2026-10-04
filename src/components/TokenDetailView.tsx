@@ -11,9 +11,11 @@ import {
   Info,
   DollarSign,
   BarChart2,
+  Star,
 } from 'lucide-react';
 import { Candle, TechnicalAnalysis, Position, TradingMode } from '../types/index.ts';
 import { CandleChart } from './CandleChart.tsx';
+import { useFirebase } from '../firebase/context.tsx';
 
 interface TokenDetailViewProps {
   symbol: string;
@@ -32,6 +34,8 @@ export const TokenDetailView: React.FC<TokenDetailViewProps> = ({
   onBack,
   onOpenSellModal,
 }) => {
+  const { watchlist, toggleWatchlist } = useFirebase();
+  const isStarred = watchlist.some(w => w.symbol === symbol);
   const [interval, setIntervalState] = useState<'5m' | '15m' | '1h' | '4h'>('5m');
   const [candles, setCandles] = useState<Candle[]>([]);
   const [loading, setLoading] = useState(false);
@@ -76,6 +80,17 @@ export const TokenDetailView: React.FC<TokenDetailViewProps> = ({
           <div>
             <div className="flex items-center gap-2.5">
               <h2 className="text-xl font-black text-slate-100 font-mono">{symbol}</h2>
+              <button
+                onClick={() => toggleWatchlist(symbol)}
+                title={isStarred ? 'Remove from Firebase Watchlist' : 'Add to Firebase Watchlist'}
+                className={`p-1.5 rounded-lg border transition-all ${
+                  isStarred
+                    ? 'bg-amber-500/15 border-amber-500/30 text-amber-400'
+                    : 'bg-slate-900 border-slate-800 text-slate-500 hover:text-slate-300'
+                }`}
+              >
+                <Star className={`w-4 h-4 ${isStarred ? 'fill-amber-400' : ''}`} />
+              </button>
               {analysis && (
                 <span className={`px-2.5 py-0.5 rounded text-xs font-mono font-bold ${
                   analysis.strategyState === 'STRONG_BULLISH'

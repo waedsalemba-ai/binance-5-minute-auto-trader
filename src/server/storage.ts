@@ -13,35 +13,16 @@ import {
 } from '../types/index.ts';
 import { EncryptedPayload, encryptSecret, decryptSecret, maskApiKey } from './security.ts';
 import { Logger } from './logger.ts';
-import { AuditLogger } from './audit-logger.ts';
 
-function resolveDataDir(): string {
-  let envDir = process.env.DATA_DIR?.trim();
-  if (envDir && envDir.startsWith('=')) {
-    envDir = envDir.substring(1).trim();
-  }
-  const dir = envDir && envDir.length > 0 ? path.resolve(process.cwd(), envDir) : path.resolve(process.cwd(), '.data');
-  try {
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-    return dir;
-  } catch {
-    const fallback = path.resolve(process.cwd(), '.data');
-    if (!fs.existsSync(fallback)) {
-      fs.mkdirSync(fallback, { recursive: true });
-    }
-    return fallback;
-  }
+const DATA_DIR = path.resolve(process.cwd(), '.data');
+if (!fs.existsSync(DATA_DIR)) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
-const DATA_DIR = resolveDataDir();
 const DB_FILE = path.join(DATA_DIR, 'database.json');
 
 export interface DatabaseSchema {
   version: number;
-  emergencyStopActive: boolean;
-  realModeConfirmed: boolean;
   settings: TradingSettings;
   accounts: Record<string, TradingAccount>;
   credentials: Record<string, { apiKey: string; secretPayload: EncryptedPayload }>;
@@ -52,7 +33,6 @@ export interface DatabaseSchema {
   realWallet: WalletBalance;
   latestAnalysis: Record<string, TechnicalAnalysis>;
   symbolCooldowns: Record<string, { symbol: string; mode: TradingMode; until: number }>;
-  idempotencyKeys: Record<string, { orderId: string; clientOrderId: string; timestamp: number }>;
   scannerSummary: ScannerSummary;
 }
 
@@ -72,7 +52,11 @@ const DEFAULT_SETTINGS: TradingSettings = {
   paperSlippageBps: Number(process.env.PAPER_SLIPPAGE_BPS) || 5,
   manageExistingHoldings: false,
   resumeOnRestart: false,
-  scanIntervalMs: Number(process.env.SCAN_INTERVAL_MS) || 300000, // 5 minutes authoritative
+  scanIntervalMs: Number(process.env.SCAN_INTERVAL_MS) || 120000,
+  takeProfitPercent: Number(process.env.TAKE_PROFIT_PERCENT) || 2.0,
+  stopLossPercent: Number(process.env.STOP_LOSS_PERCENT) || 3.0,
+  minProfitForTechnicalExitPercent: Number(process.env.MIN_PROFIT_TO_TECHNICAL_EXIT_PERCENT) || 0.20,
+  maxExitPriceAgeMs: Number(process.env.MAX_EXIT_PRICE_AGE_MS) || 5000,
 };
 
 function createInitialPaperWallet(startingBalance = 1000): WalletBalance {
@@ -117,8 +101,6 @@ function getInitialDb(): DatabaseSchema {
 
   return {
     version: 2,
-    emergencyStopActive: false,
-    realModeConfirmed: false,
     settings: { ...DEFAULT_SETTINGS },
     accounts: {
       [paperAccId]: {
@@ -150,7 +132,6 @@ function getInitialDb(): DatabaseSchema {
     realWallet: createInitialRealWallet(),
     latestAnalysis: {},
     symbolCooldowns: {},
-    idempotencyKeys: {},
     scannerSummary: {
       pairsAnalyzed: 0,
       preBullishCount: 0,
@@ -180,44 +161,25 @@ class StorageEngine {
       try {
         const raw = fs.readFileSync(DB_FILE, 'utf8');
         const parsed = JSON.parse(raw);
-        
-        const mergedSettings = {
+        // Ensure defaults merge and migrate schema version
+        const mergedSettings: TradingSettings = {
           ...DEFAULT_SETTINGS,
           ...(parsed.settings || {}),
+          takeProfitPercent: Number(parsed.settings?.takeProfitPercent ?? DEFAULT_SETTINGS.takeProfitPercent),
+          stopLossPercent: Number(parsed.settings?.stopLossPercent ?? DEFAULT_SETTINGS.stopLossPercent),
+          minProfitForTechnicalExitPercent: Number(parsed.settings?.minProfitForTechnicalExitPercent ?? DEFAULT_SETTINGS.minProfitForTechnicalExitPercent),
+          maxExitPriceAgeMs: Number(parsed.settings?.maxExitPriceAgeMs ?? DEFAULT_SETTINGS.maxExitPriceAgeMs),
         };
+        if (mergedSettings.scanIntervalMs === 300000) {
+          mergedSettings.scanIntervalMs = 120000;
+        }
 
-        const initial = getInitialDb();
         const loadedDb: DatabaseSchema = {
-          ...initial,
+          ...getInitialDb(),
           ...parsed,
-          emergencyStopActive: Boolean(parsed.emergencyStopActive),
-          realModeConfirmed: Boolean(parsed.realModeConfirmed),
+          version: 2,
           settings: mergedSettings,
-          accounts: {
-            ...initial.accounts,
-            ...(parsed.accounts || {}),
-          },
-          idempotencyKeys: parsed.idempotencyKeys || {},
         };
-
-        // --- PRODUCTION FAIL-CLOSED RESTARTS ---
-        // 1. If resumeOnRestart is false, ensure autoTrading is explicitly disabled after restart
-        if (!mergedSettings.resumeOnRestart) {
-          loadedDb.settings.autoTrading = false;
-          Object.values(loadedDb.accounts).forEach(acc => {
-            acc.autoTrading = false;
-          });
-          Logger.info('PAPER', 'SECURITY', 'resumeOnRestart is FALSE: Auto-trading disabled on startup.');
-        }
-
-        // 2. If Emergency Stop was active before shutdown, keep it locked and autoTrading OFF
-        if (loadedDb.emergencyStopActive) {
-          loadedDb.settings.autoTrading = false;
-          Object.values(loadedDb.accounts).forEach(acc => {
-            acc.autoTrading = false;
-          });
-          Logger.warn('PAPER', 'SECURITY', 'EMERGENCY STOP is ACTIVE from persistent storage. Auto-trading remains locked.');
-        }
 
         return loadedDb;
       } catch (err) {
@@ -232,87 +194,21 @@ class StorageEngine {
 
   private saveImmediate(): void {
     try {
-      const tempPath = `${DB_FILE}.tmp`;
-      fs.writeFileSync(tempPath, JSON.stringify(this.db, null, 2), { mode: 0o600 });
+      const tempPath = `${DB_FILE}.tmp.${Date.now()}`;
+      fs.writeFileSync(tempPath, JSON.stringify(this.db, null, 2), 'utf8');
       fs.renameSync(tempPath, DB_FILE);
     } catch (err) {
-      Logger.error('PAPER', 'ERROR', `Failed to write DB file: ${err}`);
+      Logger.error('PAPER', 'ERROR', `Atomic database save error: ${err}`);
     }
   }
 
-  private save(): void {
+  public save(): void {
     if (this.saveTimeout) {
       clearTimeout(this.saveTimeout);
     }
     this.saveTimeout = setTimeout(() => {
       this.saveImmediate();
-      this.saveTimeout = null;
-    }, 100);
-  }
-
-  // --- Emergency Stop Persistence ---
-  public isEmergencyStopActive(): boolean {
-    return Boolean(this.db.emergencyStopActive);
-  }
-
-  public setEmergencyStop(active: boolean): void {
-    this.db.emergencyStopActive = active;
-    if (active) {
-      this.db.settings.autoTrading = false;
-      Object.values(this.db.accounts).forEach(acc => {
-        acc.autoTrading = false;
-      });
-      AuditLogger.log({
-        eventType: 'EMERGENCY_STOP',
-        mode: this.db.settings.mode,
-        reason: 'Emergency stop activated. All automated buying locked.',
-      });
-    } else {
-      AuditLogger.log({
-        eventType: 'EMERGENCY_RESET',
-        mode: this.db.settings.mode,
-        reason: 'Emergency stop reset by authenticated user.',
-      });
-    }
-    this.saveImmediate();
-  }
-
-  // --- Real Mode Confirmation ---
-  public isRealModeConfirmed(): boolean {
-    return Boolean(this.db.realModeConfirmed);
-  }
-
-  public setRealModeConfirmed(confirmed: boolean): void {
-    this.db.realModeConfirmed = confirmed;
-    if (confirmed) {
-      AuditLogger.log({
-        eventType: 'REAL_MODE_CONFIRMED',
-        mode: 'REAL',
-        reason: 'Real mode disclaimer explicitly confirmed with verified phrase.',
-      });
-    }
-    this.save();
-  }
-
-  // --- Idempotency & Duplicate Prevention ---
-  public hasIdempotencyKey(key: string): boolean {
-    const entry = this.db.idempotencyKeys[key];
-    if (!entry) return false;
-    // Expire keys older than 24 hours
-    if (Date.now() - entry.timestamp > 24 * 60 * 60 * 1000) {
-      delete this.db.idempotencyKeys[key];
-      return false;
-    }
-    return true;
-  }
-
-  public recordIdempotencyKey(key: string, orderId: string, clientOrderId: string): void {
-    this.db.idempotencyKeys[key] = {
-      orderId,
-      clientOrderId,
-      timestamp: Date.now(),
-    };
-    this.save();
+    }, 50);
   }
 
   // --- Settings ---
@@ -321,45 +217,97 @@ class StorageEngine {
   }
 
   public updateSettings(updates: Partial<TradingSettings>): TradingSettings {
-    const prevMode = this.db.settings.mode;
-    const prevAuto = this.db.settings.autoTrading;
-
-    // Reject real mode if not confirmed
-    if (updates.mode === 'REAL' && !this.db.realModeConfirmed) {
-      throw new Error('Cannot switch to REAL mode without prior server-side confirmation (phrase verification required).');
+    // Validate fixed trade amount if provided
+    if (updates.fixedTradeAmount !== undefined) {
+      const val = Number(updates.fixedTradeAmount);
+      if (isNaN(val) || !isFinite(val) || val <= 0 || val > this.db.settings.maxTradeAmount) {
+        throw new Error(`Invalid trade amount. Must be a positive number up to ${this.db.settings.maxTradeAmount} USDT.`);
+      }
+      this.db.settings.fixedTradeAmount = Number(val.toFixed(2));
     }
 
-    // Reject auto trading start if emergency stop is active
-    if (updates.autoTrading && this.db.emergencyStopActive) {
-      throw new Error('Cannot enable auto-trading while Emergency Stop is active. Reset Emergency Stop first.');
+    if (updates.maxOpenPositions !== undefined) {
+      const maxPos = Math.max(1, Math.min(20, Math.floor(Number(updates.maxOpenPositions))));
+      this.db.settings.maxOpenPositions = maxPos;
     }
 
-    this.db.settings = {
-      ...this.db.settings,
-      ...updates,
-    };
-
-    if (updates.mode !== undefined && updates.mode !== prevMode) {
-      AuditLogger.log({
-        eventType: updates.mode === 'REAL' ? 'REAL_MODE_ENABLED' : 'REAL_MODE_DISABLED',
-        mode: updates.mode,
-        reason: `Trading mode switched from ${prevMode} to ${updates.mode}.`,
-      });
+    if (updates.minimumUsdtReserve !== undefined) {
+      this.db.settings.minimumUsdtReserve = Math.max(0, Number(updates.minimumUsdtReserve));
     }
 
-    if (updates.autoTrading !== undefined && updates.autoTrading !== prevAuto) {
-      AuditLogger.log({
-        eventType: updates.autoTrading ? 'TRADING_STARTED' : 'TRADING_STOPPED',
-        mode: this.db.settings.mode,
-        reason: `Auto trading ${updates.autoTrading ? 'started' : 'stopped'}.`,
-      });
+    if (updates.symbolCooldownMinutes !== undefined) {
+      this.db.settings.symbolCooldownMinutes = Math.max(1, Math.floor(Number(updates.symbolCooldownMinutes)));
     }
 
-    AuditLogger.log({
-      eventType: 'SETTINGS_UPDATED',
-      mode: this.db.settings.mode,
-      details: updates as Record<string, unknown>,
-    });
+    if (updates.preBullishScoreMin !== undefined) {
+      this.db.settings.preBullishScoreMin = Math.max(50, Math.min(95, Number(updates.preBullishScoreMin)));
+    }
+
+    if (updates.strongBullishScoreMin !== undefined) {
+      this.db.settings.strongBullishScoreMin = Math.max(60, Math.min(100, Number(updates.strongBullishScoreMin)));
+    }
+
+    if (updates.weakeningThreshold !== undefined) {
+      this.db.settings.weakeningThreshold = Math.max(40, Math.min(90, Number(updates.weakeningThreshold)));
+    }
+
+    if (updates.mode !== undefined) {
+      this.db.settings.mode = updates.mode;
+    }
+
+    if (updates.autoTrading !== undefined) {
+      this.db.settings.autoTrading = Boolean(updates.autoTrading);
+    }
+
+    if (updates.resumeOnRestart !== undefined) {
+      this.db.settings.resumeOnRestart = Boolean(updates.resumeOnRestart);
+    }
+
+    if (updates.manageExistingHoldings !== undefined) {
+      this.db.settings.manageExistingHoldings = Boolean(updates.manageExistingHoldings);
+    }
+
+    if (updates.takeProfitPercent !== undefined) {
+      const tp = Number(updates.takeProfitPercent);
+      if (!isNaN(tp) && tp > 0) {
+        this.db.settings.takeProfitPercent = Number(tp.toFixed(2));
+      }
+    }
+
+    if (updates.stopLossPercent !== undefined) {
+      const sl = Number(updates.stopLossPercent);
+      if (!isNaN(sl) && sl > 0) {
+        this.db.settings.stopLossPercent = Number(sl.toFixed(2));
+      }
+    }
+
+    if (updates.minProfitForTechnicalExitPercent !== undefined) {
+      const minP = Number(updates.minProfitForTechnicalExitPercent);
+      if (!isNaN(minP) && minP >= 0) {
+        this.db.settings.minProfitForTechnicalExitPercent = Number(minP.toFixed(2));
+      }
+    }
+
+    if (updates.maxExitPriceAgeMs !== undefined) {
+      const age = Number(updates.maxExitPriceAgeMs);
+      if (!isNaN(age) && age >= 1000) {
+        this.db.settings.maxExitPriceAgeMs = Math.floor(age);
+      }
+    }
+
+    if (updates.paperFeeRate !== undefined) {
+      const fee = Number(updates.paperFeeRate);
+      if (!isNaN(fee) && fee >= 0) {
+        this.db.settings.paperFeeRate = fee;
+      }
+    }
+
+    if (updates.paperSlippageBps !== undefined) {
+      const slip = Number(updates.paperSlippageBps);
+      if (!isNaN(slip) && slip >= 0) {
+        this.db.settings.paperSlippageBps = slip;
+      }
+    }
 
     this.save();
     return this.getSettings();
@@ -404,14 +352,7 @@ class StorageEngine {
     acc.updatedAt = Date.now();
 
     this.db.accounts[accountId] = acc;
-    AuditLogger.log({
-      eventType: 'CREDENTIALS_UPDATED',
-      mode: 'REAL',
-      account: accountId,
-      reason: `Binance Spot credentials securely saved (API Key: ${acc.apiKeyMasked}).`,
-    });
-
-    this.saveImmediate();
+    this.save();
   }
 
   public getDecryptedCredentials(accountId: string): { apiKey: string; apiSecret: string } | null {
@@ -438,13 +379,7 @@ class StorageEngine {
       this.db.accounts[accountId].autoTrading = false;
       this.db.accounts[accountId].permissions = undefined;
     }
-    AuditLogger.log({
-      eventType: 'CREDENTIALS_REMOVED',
-      mode: 'REAL',
-      account: accountId,
-      reason: 'Binance credentials removed from secure storage.',
-    });
-    this.saveImmediate();
+    this.save();
   }
 
   // --- Wallets ---
@@ -486,14 +421,7 @@ class StorageEngine {
       }
     });
     this.db.scannerSummary.openPositionsCount = this.getPositions('PAPER', 'OPEN').length;
-
-    AuditLogger.log({
-      eventType: 'ACCOUNT_RESET',
-      mode: 'PAPER',
-      reason: `Paper account reset to starting balance of ${starting} USDT.`,
-    });
-
-    this.saveImmediate();
+    this.save();
     Logger.info('PAPER', 'WALLET', `Paper account successfully reset: all active positions closed, wallet balance restored to default ${starting} USDT.`);
   }
 
@@ -560,7 +488,7 @@ class StorageEngine {
       list = list.filter(t => t.mode === mode);
     }
     if (symbol) {
-      list = list.filter(o => o.symbol === symbol);
+      list = list.filter(t => t.symbol === symbol);
     }
     return list.slice().reverse();
   }

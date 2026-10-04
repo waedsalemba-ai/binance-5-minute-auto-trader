@@ -7,7 +7,20 @@ import { SafetyGate } from '../src/server/safety-gate.ts';
 import { PaperTradingExecutor } from '../src/server/trading-executor.ts';
 import { Storage } from '../src/server/storage.ts';
 import { normalizeBinanceBaseUrl } from '../src/server/binance-client.ts';
-import { Candle, TradingSettings, WalletBalance, Position, SymbolFilterRules } from '../src/types/index.ts';
+import {
+  Candle,
+  TradingSettings,
+  WalletBalance,
+  Position,
+  SymbolFilterRules,
+} from '../src/types/index.ts';
+import {
+  calculatePositionNetPnL,
+  calculateBreakEvenExitPrice,
+  calculateTargetExitPrice,
+  evaluateExitDecision,
+} from '../src/server/exit-decision-engine.ts';
+import { evaluateEntryEligibility } from '../src/server/entry-decision-engine.ts';
 
 function createMockCandles(count = 60, startPrice = 100, trend = 'up'): Candle[] {
   const candles: Candle[] = [];
@@ -131,6 +144,10 @@ async function runAllTests() {
       manageExistingHoldings: false,
       resumeOnRestart: false,
       scanIntervalMs: 120000,
+      takeProfitPercent: 2.0,
+      stopLossPercent: 3.0,
+      minProfitForTechnicalExitPercent: 0.20,
+      maxExitPriceAgeMs: 5000,
     };
 
     const wallet: WalletBalance = {
@@ -389,6 +406,392 @@ async function runAllTests() {
     assert.strictEqual(normalizeBinanceBaseUrl('https://data-api.binance.vision/api/v3/'), 'https://data-api.binance.vision');
   });
 
+  // -------------------------------------------------------------
+  // 7. Authoritative Net PnL Calculation & Break-Even Formula
+  // -------------------------------------------------------------
+  console.log('\n7. Authoritative Net PnL & Break-Even Calculation:');
+  test('calculatePositionNetPnL accounts for entry fees, exit fees, and slippage', () => {
+    const mockPos = {
+      quantity: 1,
+      remainingQuantity: 1,
+      entryPrice: 100,
+      entryQuoteAmount: 100,
+      entryFees: 0.1, // 0.1% entry fee
+    };
+
+    // At entry price $100: Gross is 0, but after slippage (5bps = 0.05%) and exit fee (0.1%), net must be negative
+    const pnlAtEntry = calculatePositionNetPnL(mockPos, 100, 0.001, 5);
+    assert.ok(pnlAtEntry.netPnL < 0, 'Net PnL at entry price must be negative due to roundtrip fees & slippage');
+    assert.strictEqual(pnlAtEntry.grossPnL, 0);
+    assert.ok(pnlAtEntry.estimatedExitFees > 0);
+
+    // At break-even price: Net PnL must equal 0
+    const bePrice = calculateBreakEvenExitPrice(mockPos, 0.001, 5);
+    assert.ok(bePrice > 100, 'Break-even price must be higher than entry price');
+    const pnlAtBE = calculatePositionNetPnL(mockPos, bePrice, 0.001, 5);
+    assert.ok(Math.abs(pnlAtBE.netPnL) < 0.01, `Net PnL at break-even price must be ~0, got ${pnlAtBE.netPnL}`);
+  });
+
+  // -------------------------------------------------------------
+  // 8. Exit Architecture & Decision Rules (TEST 1 to TEST 8)
+  // -------------------------------------------------------------
+  console.log('\n8. Exit Decision Engine Verification:');
+  const baseSettings: TradingSettings = {
+    ...Storage.getSettings(),
+    takeProfitPercent: 2.0,
+    stopLossPercent: 3.0,
+    minProfitForTechnicalExitPercent: 0.20,
+    maxExitPriceAgeMs: 5000,
+  };
+
+  const samplePos: Position = {
+    id: 'pos-test-1',
+    accountId: 'paper-default',
+    mode: 'PAPER',
+    symbol: 'BTCUSDT',
+    quantity: 1,
+    remainingQuantity: 1,
+    entryPrice: 100,
+    entryQuoteAmount: 100,
+    entryFees: 0.1,
+    entryScore: 75,
+    entryState: 'PRE_BULLISH',
+    entryReason: 'entry',
+    currentPrice: 100,
+    currentScore: 75,
+    currentState: 'PRE_BULLISH',
+    unrealizedPnL: 0,
+    unrealizedPnLPercent: 0,
+    openedAt: Date.now() - 60000,
+    updatedAt: Date.now() - 60000,
+    status: 'OPEN',
+    entryOrderId: 'ord-1',
+  };
+
+  test('TEST 1: Weakening while losing (Price 98, Net PnL -2%) -> MUST HOLD, NEVER SELL AT A LOSS', () => {
+    const decision = evaluateExitDecision({
+      position: samplePos,
+      currentPrice: 98,
+      priceTimestamp: Date.now(),
+      strategyState: 'WEAKENING',
+      technicalScore: 68,
+      settings: baseSettings,
+    });
+
+    assert.strictEqual(decision.shouldSell, false, 'Weakening with loss must NOT trigger sell');
+    assert.strictEqual(decision.reason, 'HOLD_PROFIT_PROTECTION');
+    assert.ok(decision.netPnLPercent < 0);
+  });
+
+  test('TEST 2: Weakening while profitable (Price 101, Net PnL +0.75% >= +0.20%) -> MUST SELL with TECHNICAL_PROFIT_EXIT', () => {
+    const decision = evaluateExitDecision({
+      position: samplePos,
+      currentPrice: 101,
+      priceTimestamp: Date.now(),
+      strategyState: 'WEAKENING',
+      technicalScore: 68,
+      settings: baseSettings,
+    });
+
+    assert.strictEqual(decision.shouldSell, true);
+    assert.strictEqual(decision.reason, 'TECHNICAL_PROFIT_EXIT');
+    assert.ok(decision.netPnLPercent >= 0.20);
+  });
+
+  test('TEST 3: Take profit triggered (Net PnL +2.05% >= +2.0%) -> MUST SELL with TAKE_PROFIT', () => {
+    const tpPrice = calculateTargetExitPrice(samplePos, 2.05, 0.001, 5);
+    const decision = evaluateExitDecision({
+      position: samplePos,
+      currentPrice: tpPrice,
+      priceTimestamp: Date.now(),
+      strategyState: 'STRONG_BULLISH',
+      technicalScore: 85,
+      settings: baseSettings,
+    });
+
+    assert.strictEqual(decision.shouldSell, true);
+    assert.strictEqual(decision.reason, 'TAKE_PROFIT');
+    assert.ok(decision.netPnLPercent >= 2.0);
+  });
+
+  test('TEST 4: Stop loss triggered (Net PnL -3.10% <= -3.0%) -> MUST SELL with STOP_LOSS', () => {
+    const slPrice = calculateTargetExitPrice(samplePos, -3.10, 0.001, 5);
+    const decision = evaluateExitDecision({
+      position: samplePos,
+      currentPrice: slPrice,
+      priceTimestamp: Date.now(),
+      strategyState: 'STRONG_BULLISH',
+      technicalScore: 85,
+      settings: baseSettings,
+    });
+
+    assert.strictEqual(decision.shouldSell, true);
+    assert.strictEqual(decision.reason, 'STOP_LOSS');
+    assert.ok(decision.netPnLPercent <= -3.0);
+  });
+
+  test('TEST 5: Small loss (Net PnL -0.50%, State WEAKENING) -> MUST HOLD', () => {
+    const smallLossPrice = calculateTargetExitPrice(samplePos, -0.50, 0.001, 5);
+    const decision = evaluateExitDecision({
+      position: samplePos,
+      currentPrice: smallLossPrice,
+      priceTimestamp: Date.now(),
+      strategyState: 'WEAKENING',
+      technicalScore: 65,
+      settings: baseSettings,
+    });
+
+    assert.strictEqual(decision.shouldSell, false);
+    assert.strictEqual(decision.reason, 'HOLD_PROFIT_PROTECTION');
+  });
+
+  test('TEST 6: Small profit below technical threshold (Net PnL +0.10% < +0.20%) -> MUST HOLD', () => {
+    const smallProfitPrice = calculateTargetExitPrice(samplePos, 0.10, 0.001, 5);
+    const decision = evaluateExitDecision({
+      position: samplePos,
+      currentPrice: smallProfitPrice,
+      priceTimestamp: Date.now(),
+      strategyState: 'WEAKENING',
+      technicalScore: 68,
+      settings: baseSettings,
+    });
+
+    assert.strictEqual(decision.shouldSell, false);
+    assert.strictEqual(decision.reason, 'HOLD_PROFIT_PROTECTION');
+  });
+
+  test('TEST 7: Strong bullish (Net PnL +1.0%, State STRONG_BULLISH) -> MUST HOLD', () => {
+    const profitPrice = calculateTargetExitPrice(samplePos, 1.0, 0.001, 5);
+    const decision = evaluateExitDecision({
+      position: samplePos,
+      currentPrice: profitPrice,
+      priceTimestamp: Date.now(),
+      strategyState: 'STRONG_BULLISH',
+      technicalScore: 88,
+      settings: baseSettings,
+    });
+
+    assert.strictEqual(decision.shouldSell, false);
+    assert.strictEqual(decision.reason, 'HOLD');
+  });
+
+  test('TEST 8: Manual SELL is always allowed with reason MANUAL', () => {
+    const decision = evaluateExitDecision({
+      position: samplePos,
+      currentPrice: 95, // losing position
+      priceTimestamp: Date.now(),
+      strategyState: 'NEUTRAL',
+      technicalScore: 50,
+      settings: baseSettings,
+      isManual: true,
+    });
+
+    assert.strictEqual(decision.shouldSell, true);
+    assert.strictEqual(decision.reason, 'MANUAL');
+  });
+
+  test('TEST 9: Stale price protection blocks automatic SELL if price is older than 5000ms', () => {
+    const stalePriceTimestamp = Date.now() - 10000; // 10s old
+    const decision = evaluateExitDecision({
+      position: samplePos,
+      currentPrice: 105,
+      priceTimestamp: stalePriceTimestamp,
+      strategyState: 'WEAKENING',
+      technicalScore: 65,
+      settings: baseSettings,
+    });
+
+    assert.strictEqual(decision.shouldSell, false);
+    assert.strictEqual(decision.reason, 'HOLD');
+  });
+
+  // -------------------------------------------------------------
+  // 9. Atomic CLOSING State Transition & Partial Fill Handling
+  // -------------------------------------------------------------
+  console.log('\n9. Atomic State Transition & Partial Fill Accounting:');
+  test('Paper sell transitions OPEN -> CLOSING -> CLOSED and records trade', async () => {
+    Storage.resetPaperAccount();
+    const paperExec = new PaperTradingExecutor();
+    
+    // Create an open position
+    const posToSell: Position = {
+      id: 'pos-test-sell-1',
+      accountId: 'paper-default',
+      mode: 'PAPER',
+      symbol: 'ETHUSDT',
+      quantity: 0.1,
+      remainingQuantity: 0.1,
+      entryPrice: 2000,
+      entryQuoteAmount: 200,
+      entryFees: 0.2,
+      entryScore: 78,
+      entryState: 'PRE_BULLISH',
+      entryReason: 'initial',
+      currentPrice: 2000,
+      currentScore: 78,
+      currentState: 'PRE_BULLISH',
+      unrealizedPnL: 0,
+      unrealizedPnLPercent: 0,
+      openedAt: Date.now() - 120000,
+      updatedAt: Date.now() - 120000,
+      status: 'OPEN',
+      entryOrderId: 'ord-buy-1',
+    };
+    Storage.savePosition(posToSell);
+
+    const sellResult = await paperExec.sell({
+      symbol: 'ETHUSDT',
+      side: 'SELL',
+      quantity: 0.1,
+      reason: 'Take Profit Exit',
+      strategyState: 'EXIT',
+      technicalScore: 60,
+      clientOrderId: 'client-sell-1',
+    }, posToSell.id);
+
+    assert.strictEqual(sellResult.success, true);
+    assert.strictEqual(sellResult.position?.status, 'CLOSED');
+    assert.strictEqual(sellResult.position?.remainingQuantity, 0);
+    assert.ok(sellResult.trade !== undefined);
+    assert.strictEqual(sellResult.trade?.exitReason, 'Take Profit Exit');
+  });
+
+  // -------------------------------------------------------------
+  // 10. Centralized Entry Decision Engine (Bullish Entry Verification)
+  // -------------------------------------------------------------
+  console.log('\n10. Bullish Entry Decision Engine Verification:');
+
+  test('ENTRY TEST 1: STRONG_BULLISH signal (Score 85, no position) -> MUST BE ELIGIBLE FOR BUY', () => {
+    const decision = evaluateEntryEligibility({
+      symbol: 'BTCUSDT',
+      strategyState: 'STRONG_BULLISH',
+      technicalScore: 85,
+      hasOpenPosition: false,
+      settings: baseSettings,
+    });
+
+    assert.strictEqual(decision.eligible, true, 'STRONG_BULLISH signal with no position must be eligible for BUY');
+    assert.strictEqual(decision.strategyState, 'STRONG_BULLISH');
+    assert.strictEqual(decision.technicalScore, 85);
+  });
+
+  test('ENTRY TEST 2: PRE_BULLISH signal (Score 72, no position) -> MUST BE ELIGIBLE FOR BUY', () => {
+    const decision = evaluateEntryEligibility({
+      symbol: 'ETHUSDT',
+      strategyState: 'PRE_BULLISH',
+      technicalScore: 72,
+      hasOpenPosition: false,
+      settings: baseSettings,
+    });
+
+    assert.strictEqual(decision.eligible, true, 'PRE_BULLISH signal with no position must be eligible for BUY');
+    assert.strictEqual(decision.strategyState, 'PRE_BULLISH');
+    assert.strictEqual(decision.technicalScore, 72);
+  });
+
+  test('ENTRY TEST 3: Unknown previous state entering scanner directly as STRONG_BULLISH (Score 88) -> MUST BE ELIGIBLE FOR BUY', () => {
+    const decision = evaluateEntryEligibility({
+      symbol: 'SOLUSDT',
+      strategyState: 'STRONG_BULLISH',
+      technicalScore: 88,
+      hasOpenPosition: false,
+      settings: baseSettings,
+    });
+
+    assert.strictEqual(decision.eligible, true, 'Fresh token entering directly as STRONG_BULLISH must be eligible for BUY');
+  });
+
+  test('ENTRY TEST 4: STRONG_BULLISH with existing open position -> MUST BLOCK duplicate BUY (Hold position)', () => {
+    const decision = evaluateEntryEligibility({
+      symbol: 'BTCUSDT',
+      strategyState: 'STRONG_BULLISH',
+      technicalScore: 90,
+      hasOpenPosition: true,
+      settings: baseSettings,
+    });
+
+    assert.strictEqual(decision.eligible, false, 'STRONG_BULLISH with open position must NOT create a duplicate BUY');
+    assert.ok(decision.reason.includes('Open position exists'));
+  });
+
+  test('ENTRY TEST 5: STRONG_BULLISH with in-flight pending BUY lock -> MUST BLOCK duplicate in-flight BUY', () => {
+    const decision = evaluateEntryEligibility({
+      symbol: 'BNBUSDT',
+      strategyState: 'STRONG_BULLISH',
+      technicalScore: 86,
+      hasOpenPosition: false,
+      isPendingEntry: true,
+      settings: baseSettings,
+    });
+
+    assert.strictEqual(decision.eligible, false, 'In-flight pending BUY lock must prevent concurrent double-entry');
+    assert.ok(decision.reason.includes('Pending BUY entry'));
+  });
+
+  test('ENTRY TEST 6: NEUTRAL state (Score 55) -> MUST BLOCK BUY', () => {
+    const decision = evaluateEntryEligibility({
+      symbol: 'DOGEUSDT',
+      strategyState: 'NEUTRAL',
+      technicalScore: 55,
+      hasOpenPosition: false,
+      settings: baseSettings,
+    });
+
+    assert.strictEqual(decision.eligible, false, 'NEUTRAL state must never be bought');
+  });
+
+  test('ENTRY TEST 7: WEAKENING state (Score 68) -> MUST BLOCK BUY', () => {
+    const decision = evaluateEntryEligibility({
+      symbol: 'XRPUSDT',
+      strategyState: 'WEAKENING',
+      technicalScore: 68,
+      hasOpenPosition: false,
+      settings: baseSettings,
+    });
+
+    assert.strictEqual(decision.eligible, false, 'WEAKENING state must never be bought');
+  });
+
+  test('ENTRY TEST 8: EXIT state (Score 40) -> MUST BLOCK BUY', () => {
+    const decision = evaluateEntryEligibility({
+      symbol: 'ADAUSDT',
+      strategyState: 'EXIT',
+      technicalScore: 40,
+      hasOpenPosition: false,
+      settings: baseSettings,
+    });
+
+    assert.strictEqual(decision.eligible, false, 'EXIT state must never be bought');
+  });
+
+  test('ENTRY TEST 9: Cooldown active on symbol -> MUST BLOCK BUY', () => {
+    const decision = evaluateEntryEligibility({
+      symbol: 'AVAXUSDT',
+      strategyState: 'STRONG_BULLISH',
+      technicalScore: 88,
+      hasOpenPosition: false,
+      isInCooldown: true,
+      settings: baseSettings,
+    });
+
+    assert.strictEqual(decision.eligible, false, 'Symbol in cooldown must block automatic BUY');
+    assert.ok(decision.reason.includes('cooldown'));
+  });
+
+  test('ENTRY TEST 10: Emergency stop active -> MUST BLOCK BUY', () => {
+    const decision = evaluateEntryEligibility({
+      symbol: 'NEARUSDT',
+      strategyState: 'STRONG_BULLISH',
+      technicalScore: 92,
+      hasOpenPosition: false,
+      isEmergencyStopped: true,
+      settings: baseSettings,
+    });
+
+    assert.strictEqual(decision.eligible, false, 'Emergency stop must block all BUYs');
+    assert.ok(decision.reason.includes('Emergency stop'));
+  });
+
   console.log(`\n==============================================`);
   console.log(`Test Results: ${passed} Passed, ${failed} Failed.`);
   console.log(`==============================================\n`);
@@ -402,3 +805,4 @@ runAllTests().catch(err => {
   console.error('Test runner fatal error:', err);
   process.exit(1);
 });
+

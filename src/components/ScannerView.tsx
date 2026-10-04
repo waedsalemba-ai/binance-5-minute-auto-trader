@@ -8,8 +8,10 @@ import {
   ExternalLink,
   RefreshCw,
   SlidersHorizontal,
+  Star,
 } from 'lucide-react';
 import { TechnicalAnalysis, StrategyState, Position, TradingMode } from '../types/index.ts';
+import { useFirebase } from '../firebase/context.tsx';
 
 interface ScannerViewProps {
   analyses: TechnicalAnalysis[];
@@ -28,10 +30,15 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
   onRunScan,
   isScanning,
 }) => {
+  const { watchlist, toggleWatchlist, user } = useFirebase();
   const [searchTerm, setSearchTerm] = useState('');
   const [stateFilter, setStateFilter] = useState<string>('ALL');
   const [sortBy, setSortBy] = useState<'score' | 'change' | 'volume' | 'price'>('score');
   const [sortAsc, setSortAsc] = useState(false);
+
+  const watchlistSymbolSet = useMemo(() => {
+    return new Set(watchlist.map(w => w.symbol));
+  }, [watchlist]);
 
   const activeSymbolSet = useMemo(() => {
     return new Set(positions.filter(p => p.mode === mode && p.status === 'OPEN').map(p => p.symbol));
@@ -42,6 +49,9 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       .filter(item => {
         if (searchTerm && !item.symbol.toLowerCase().includes(searchTerm.toLowerCase())) {
           return false;
+        }
+        if (stateFilter === 'WATCHLIST') {
+          return watchlistSymbolSet.has(item.symbol);
         }
         if (stateFilter === 'POSITIONS') {
           return activeSymbolSet.has(item.symbol);
@@ -59,7 +69,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
         else if (sortBy === 'price') diff = b.price - a.price;
         return sortAsc ? -diff : diff;
       });
-  }, [analyses, searchTerm, stateFilter, sortBy, sortAsc, activeSymbolSet]);
+  }, [analyses, searchTerm, stateFilter, sortBy, sortAsc, activeSymbolSet, watchlistSymbolSet]);
 
   const getStateBadge = (state: StrategyState) => {
     switch (state) {
@@ -93,6 +103,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
         <div className="flex flex-wrap items-center gap-1.5 text-xs font-medium">
           {[
             { id: 'ALL', label: 'All Pairs' },
+            { id: 'WATCHLIST', label: `★ Watchlist (${watchlist.length})` },
             { id: 'PRE_BULLISH', label: 'Pre-Bullish (Buy)' },
             { id: 'STRONG_BULLISH', label: 'Strong Bullish' },
             { id: 'WEAKENING', label: 'Weakening (Exit)' },
@@ -194,6 +205,18 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
                       {/* Symbol */}
                       <td className="py-3 px-3">
                         <div className="flex items-center gap-2">
+                          <button
+                            onClick={e => {
+                              e.stopPropagation();
+                              toggleWatchlist(item.symbol);
+                            }}
+                            title={watchlistSymbolSet.has(item.symbol) ? 'Remove from Firebase Watchlist' : 'Add to Firebase Watchlist'}
+                            className={`p-1 rounded hover:bg-slate-700/60 transition-colors ${
+                              watchlistSymbolSet.has(item.symbol) ? 'text-amber-400' : 'text-slate-600 hover:text-slate-400'
+                            }`}
+                          >
+                            <Star className={`w-3.5 h-3.5 ${watchlistSymbolSet.has(item.symbol) ? 'fill-amber-400' : ''}`} />
+                          </button>
                           <span className="font-bold text-slate-100">{item.symbol}</span>
                           {hasPosition && (
                             <span className="px-1.5 py-0.2 rounded text-[9px] font-bold bg-amber-500 text-slate-950">

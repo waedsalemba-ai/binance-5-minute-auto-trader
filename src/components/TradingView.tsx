@@ -42,6 +42,9 @@ export const TradingView: React.FC<TradingViewProps> = ({
   const [preBullishMinInput, setPreBullishMinInput] = useState<string>(settings.preBullishScoreMin.toString());
   const [strongBullishMinInput, setStrongBullishMinInput] = useState<string>(settings.strongBullishScoreMin.toString());
   const [weakeningInput, setWeakeningInput] = useState<string>(settings.weakeningThreshold.toString());
+  const [tpInput, setTpInput] = useState<string>((settings.takeProfitPercent ?? 2.0).toString());
+  const [slInput, setSlInput] = useState<string>((settings.stopLossPercent ?? 3.0).toString());
+  const [minTechProfitInput, setMinTechProfitInput] = useState<string>((settings.minProfitForTechnicalExitPercent ?? 0.20).toString());
 
   const [validationError, setValidationError] = useState<string | null>(null);
   const [savedSuccess, setSavedSuccess] = useState(false);
@@ -74,6 +77,10 @@ export const TradingView: React.FC<TradingViewProps> = ({
       return;
     }
 
+    const tpVal = parseFloat(tpInput);
+    const slVal = parseFloat(slInput);
+    const minTechVal = parseFloat(minTechProfitInput);
+
     setSaving(true);
     try {
       await onUpdateSettings({
@@ -84,6 +91,9 @@ export const TradingView: React.FC<TradingViewProps> = ({
         preBullishScoreMin: parseFloat(preBullishMinInput) || 65,
         strongBullishScoreMin: parseFloat(strongBullishMinInput) || 80,
         weakeningThreshold: parseFloat(weakeningInput) || 70,
+        takeProfitPercent: isNaN(tpVal) || tpVal <= 0 ? 2.0 : tpVal,
+        stopLossPercent: isNaN(slVal) || slVal <= 0 ? 3.0 : slVal,
+        minProfitForTechnicalExitPercent: isNaN(minTechVal) || minTechVal < 0 ? 0.20 : minTechVal,
       });
       setSavedSuccess(true);
       setTimeout(() => setSavedSuccess(false), 3000);
@@ -256,6 +266,48 @@ export const TradingView: React.FC<TradingViewProps> = ({
                 className="w-full px-3 py-1.5 text-xs font-mono bg-slate-900 border border-slate-800 rounded-xl text-slate-100 focus:outline-none focus:border-amber-400"
               />
               <p className="text-[10px] text-slate-500">Triggers SELL when score falls below this (Default: 70)</p>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-xs font-bold text-emerald-400">
+                Take Profit %
+              </label>
+              <input
+                type="number"
+                step="0.1"
+                value={tpInput}
+                onChange={e => setTpInput(e.target.value)}
+                className="w-full px-3 py-1.5 text-xs font-mono bg-slate-900 border border-slate-800 rounded-xl text-slate-100 focus:outline-none focus:border-amber-400"
+              />
+              <p className="text-[10px] text-slate-500">Net profit target to trigger SELL (Default: 2.0%)</p>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-xs font-bold text-rose-400">
+                Stop Loss %
+              </label>
+              <input
+                type="number"
+                step="0.1"
+                value={slInput}
+                onChange={e => setSlInput(e.target.value)}
+                className="w-full px-3 py-1.5 text-xs font-mono bg-slate-900 border border-slate-800 rounded-xl text-slate-100 focus:outline-none focus:border-amber-400"
+              />
+              <p className="text-[10px] text-slate-500">Sole automated loss exit trigger (Default: 3.0%)</p>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-xs font-bold text-amber-400">
+                Min Profit for Tech Exit %
+              </label>
+              <input
+                type="number"
+                step="0.05"
+                value={minTechProfitInput}
+                onChange={e => setMinTechProfitInput(e.target.value)}
+                className="w-full px-3 py-1.5 text-xs font-mono bg-slate-900 border border-slate-800 rounded-xl text-slate-100 focus:outline-none focus:border-amber-400"
+              />
+              <p className="text-[10px] text-slate-500">Buffer required for weakening exits (Default: 0.20%)</p>
             </div>
           </div>
 

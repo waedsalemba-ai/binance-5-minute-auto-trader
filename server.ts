@@ -13,7 +13,35 @@ const isProduction = process.env.NODE_ENV === 'production';
 // 1. Mount API Router with all /api/*, /health, /ready routes
 app.use(apiApp);
 
-// 2. Frontend delivery: Vite middleware in dev or static dist in production
+// 2. Reverse proxy for Firebase Auth helper files (eliminates third-party cookie/iframe blocking)
+app.use('/__/auth', async (req: Request, res: Response) => {
+  try {
+    const targetUrl = `https://powerful-utility-tsx2c.firebaseapp.com/__/auth${req.url}`;
+    const headers: Record<string, string> = {};
+    for (const [key, value] of Object.entries(req.headers)) {
+      if (key !== 'host' && typeof value === 'string') {
+        headers[key] = value;
+      }
+    }
+    const response = await fetch(targetUrl, {
+      method: req.method,
+      headers,
+    });
+
+    res.status(response.status);
+    response.headers.forEach((val, key) => {
+      if (key !== 'transfer-encoding' && key !== 'content-encoding') {
+        res.setHeader(key, val);
+      }
+    });
+    const buffer = Buffer.from(await response.arrayBuffer());
+    res.send(buffer);
+  } catch (err: any) {
+    res.status(500).send(`Auth proxy error: ${err.message}`);
+  }
+});
+
+// 3. Frontend delivery: Vite middleware in dev or static dist in production
 async function startServer() {
   const distPath = path.resolve(process.cwd(), 'dist');
   const hasDist = fs.existsSync(distPath) && fs.existsSync(path.join(distPath, 'index.html'));

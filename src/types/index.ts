@@ -37,8 +37,7 @@ export type LogCategory =
   | 'WALLET'
   | 'RECONCILIATION'
   | 'BINANCE'
-  | 'SECURITY'
-  | 'SYSTEM';
+  | 'SECURITY';
 
 export interface Candle {
   timestamp: number; // Open time ms
@@ -180,12 +179,62 @@ export interface Position {
   currentState: StrategyState;
   unrealizedPnL: number;
   unrealizedPnLPercent: number;
+  grossPnL?: number;
+  estimatedNetPnL?: number;
+  estimatedNetPnLPercent?: number;
+  breakEvenPrice?: number;
+  takeProfitPrice?: number;
+  stopLossPrice?: number;
+  exitStatus?: string;
+  exitReason?: string;
   openedAt: number;
   updatedAt: number;
-  closedAt?: number;
   status: PositionStatus;
   entryOrderId: string;
   exitOrderId?: string;
+}
+
+export type ExitReason =
+  | 'TAKE_PROFIT'
+  | 'STOP_LOSS'
+  | 'TECHNICAL_PROFIT_EXIT'
+  | 'HOLD_PROFIT_PROTECTION'
+  | 'HOLD'
+  | 'MANUAL'
+  | 'EMERGENCY';
+
+export interface PositionNetPnLResult {
+  grossPnL: number;
+  netPnL: number;
+  netPnLPercent: number;
+  estimatedExitPrice: number;
+  estimatedExitValue: number;
+  entryFees: number;
+  estimatedExitFees: number;
+}
+
+export interface ExitDecision {
+  shouldSell: boolean;
+  reason: ExitReason;
+  netPnL: number;
+  netPnLPercent: number;
+  currentPrice: number;
+  breakEvenPrice: number;
+  takeProfitPrice: number;
+  stopLossPrice: number;
+  grossPnL: number;
+  estimatedExitPrice: number;
+  estimatedExitValue: number;
+  entryFees: number;
+  estimatedExitFees: number;
+  logMessage: string;
+}
+
+export interface EntryDecision {
+  eligible: boolean;
+  reason: string;
+  strategyState: StrategyState;
+  technicalScore: number;
 }
 
 export interface Order {
@@ -288,6 +337,11 @@ export interface TradingSettings {
   manageExistingHoldings: boolean;
   resumeOnRestart: boolean;
   scanIntervalMs: number;
+  // Exit Engine & Profitability Gate Parameters
+  takeProfitPercent: number; // e.g. 2.0% NET profit target
+  stopLossPercent: number; // e.g. 3.0% NET loss ceiling
+  minProfitForTechnicalExitPercent: number; // e.g. 0.20% minimum buffer for technical weakening exits
+  maxExitPriceAgeMs: number; // e.g. 5000 ms max allowable price age before exit decision
 }
 
 export interface SystemLogEntry {

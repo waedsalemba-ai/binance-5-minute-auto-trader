@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { Layers, TrendingUp, TrendingDown, Clock, ShieldAlert, BarChart3, AlertCircle, RotateCcw, RefreshCw, Radio } from 'lucide-react';
+import React from 'react';
+import { Layers, TrendingUp, TrendingDown, Clock, ShieldAlert, BarChart3, AlertCircle, RotateCcw } from 'lucide-react';
 import { Position, TradingMode } from '../types/index.ts';
 
 interface PositionsViewProps {
@@ -8,7 +8,6 @@ interface PositionsViewProps {
   onSelectSymbol: (symbol: string) => void;
   onOpenSellModal: (pos: Position) => void;
   onOpenResetModal?: () => void;
-  onSyncPositions?: () => Promise<void>;
 }
 
 export const PositionsView: React.FC<PositionsViewProps> = ({
@@ -17,23 +16,11 @@ export const PositionsView: React.FC<PositionsViewProps> = ({
   onSelectSymbol,
   onOpenSellModal,
   onOpenResetModal,
-  onSyncPositions,
 }) => {
-  const [syncing, setSyncing] = useState(false);
   const currentPositions = positions.filter(p => p.mode === mode && p.status === 'OPEN');
   const totalAllocated = currentPositions.reduce((sum, p) => sum + p.entryQuoteAmount, 0);
   const totalCurrentValue = currentPositions.reduce((sum, p) => sum + p.currentPrice * p.remainingQuantity, 0);
   const totalUnrealized = currentPositions.reduce((sum, p) => sum + p.unrealizedPnL, 0);
-
-  const handleManualSync = async () => {
-    if (!onSyncPositions || syncing) return;
-    setSyncing(true);
-    try {
-      await onSyncPositions();
-    } finally {
-      setTimeout(() => setSyncing(false), 500);
-    }
-  };
 
   const formatDuration = (openedAt: number) => {
     const diff = Math.max(0, Math.floor((Date.now() - openedAt) / 1000));
@@ -49,34 +36,16 @@ export const PositionsView: React.FC<PositionsViewProps> = ({
       <div className="bg-[#0f172a] border border-slate-800 rounded-2xl p-5">
         <div className="flex flex-wrap items-center justify-between gap-4 mb-4">
           <div>
-            <div className="flex items-center gap-2.5">
-              <h2 className="text-lg font-bold text-slate-100 flex items-center gap-2">
-                <Layers className="w-5 h-5 text-amber-400" />
-                Active Strategy Positions ({mode} Mode)
-              </h2>
-              <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-mono font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping" />
-                Online Sync Active
-              </span>
-            </div>
+            <h2 className="text-lg font-bold text-slate-100 flex items-center gap-2">
+              <Layers className="w-5 h-5 text-amber-400" />
+              Open Strategy Positions ({mode} Mode)
+            </h2>
             <p className="text-xs text-slate-400 mt-1">
-              Active positions continuously synchronized with live Binance mark prices, exchange balances, and strategy states.
+              Active positions managed by the 2-minute auto trader. Each new BUY is strictly sized to your fixed trade amount.
             </p>
           </div>
 
           <div className="flex items-center gap-3">
-            {onSyncPositions && (
-              <button
-                onClick={handleManualSync}
-                disabled={syncing}
-                title="Force instant online synchronization with Binance API"
-                className="px-3.5 py-1.5 text-xs font-bold text-slate-200 hover:text-white bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-xl transition-all flex items-center gap-1.5 shadow-sm active:scale-95 disabled:opacity-50"
-              >
-                <RefreshCw className={`w-3.5 h-3.5 text-amber-400 ${syncing ? 'animate-spin' : ''}`} />
-                <span>{syncing ? 'Syncing...' : 'Sync with Binance'}</span>
-              </button>
-            )}
-
             {onOpenResetModal && (
               <button
                 onClick={onOpenResetModal}
@@ -138,7 +107,6 @@ export const PositionsView: React.FC<PositionsViewProps> = ({
                     <span className="text-[10px] px-2 py-0.2 rounded font-mono font-bold bg-slate-800 text-slate-300">
                       {pos.mode}
                     </span>
-                    <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" title="Live price streaming from Binance" />
                   </div>
                   <span className="text-[11px] text-slate-500 font-mono flex items-center gap-1 mt-0.5">
                     <Clock className="w-3 h-3" /> Opened {formatDuration(pos.openedAt)} ago
@@ -163,7 +131,7 @@ export const PositionsView: React.FC<PositionsViewProps> = ({
               </div>
 
               {/* Data Rows */}
-              <div className="space-y-2 text-xs font-mono bg-slate-900/60 p-3 rounded-xl border border-slate-800/80 text-slate-300">
+              <div className="space-y-2 text-xs font-mono bg-slate-900/60 p-3.5 rounded-xl border border-slate-800/80 text-slate-300">
                 <div className="flex justify-between">
                   <span className="text-slate-400">Position Quantity:</span>
                   <span className="text-slate-200">{pos.remainingQuantity}</span>
@@ -173,11 +141,20 @@ export const PositionsView: React.FC<PositionsViewProps> = ({
                   <span className="text-slate-200">${pos.entryPrice}</span>
                 </div>
                 <div className="flex justify-between">
-                  <span className="text-slate-400">Current Price (Binance):</span>
-                  <span className="text-slate-100 font-bold flex items-center gap-1.5">
-                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-                    ${pos.currentPrice}
-                  </span>
+                  <span className="text-slate-400">Current Price:</span>
+                  <span className="text-slate-100 font-bold">${pos.currentPrice}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-400">Break-Even Price:</span>
+                  <span className="text-amber-400 font-bold">${pos.breakEvenPrice ?? '-'}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-400">Take-Profit Price:</span>
+                  <span className="text-emerald-400 font-bold">${pos.takeProfitPrice ?? '-'}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-400">Stop-Loss Price:</span>
+                  <span className="text-rose-400 font-bold">${pos.stopLossPrice ?? '-'}</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-slate-400">Score Progress:</span>
@@ -186,10 +163,26 @@ export const PositionsView: React.FC<PositionsViewProps> = ({
                     <span className="text-slate-500 text-[10px] ml-1">(entry: {pos.entryScore})</span>
                   </span>
                 </div>
-                <div className="flex justify-between pt-2 border-t border-slate-800 font-bold">
-                  <span className="text-slate-300">Unrealized PnL:</span>
-                  <span className={pos.unrealizedPnL >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
-                    {pos.unrealizedPnL >= 0 ? '+' : ''}${pos.unrealizedPnL.toFixed(2)} ({pos.unrealizedPnLPercent >= 0 ? '+' : ''}{pos.unrealizedPnLPercent}%)
+
+                <div className="pt-2 border-t border-slate-800 space-y-1.5">
+                  <div className="flex justify-between">
+                    <span className="text-slate-400">Current Gross PnL:</span>
+                    <span className={(pos.grossPnL ?? pos.unrealizedPnL) >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
+                      {(pos.grossPnL ?? pos.unrealizedPnL) >= 0 ? '+' : ''}${(pos.grossPnL ?? pos.unrealizedPnL).toFixed(2)}
+                    </span>
+                  </div>
+                  <div className="flex justify-between font-bold">
+                    <span className="text-slate-200">Estimated Net PnL:</span>
+                    <span className={(pos.estimatedNetPnL ?? pos.unrealizedPnL) >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
+                      {(pos.estimatedNetPnL ?? pos.unrealizedPnL) >= 0 ? '+' : ''}${(pos.estimatedNetPnL ?? pos.unrealizedPnL).toFixed(2)} ({(pos.estimatedNetPnLPercent ?? pos.unrealizedPnLPercent) >= 0 ? '+' : ''}{pos.estimatedNetPnLPercent ?? pos.unrealizedPnLPercent}%)
+                    </span>
+                  </div>
+                </div>
+
+                <div className="pt-2 border-t border-slate-800/80 flex justify-between items-center text-[11px]">
+                  <span className="text-slate-400">Exit Status / Reason:</span>
+                  <span className="text-amber-300 font-bold">
+                    {pos.exitStatus ?? 'HOLD'}{pos.exitReason ? ` (${pos.exitReason})` : ''}
                   </span>
                 </div>
               </div>

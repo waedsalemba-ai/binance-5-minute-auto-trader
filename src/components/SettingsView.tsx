@@ -171,10 +171,66 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ settings, onUpdateSe
           </div>
         </div>
 
+        {/* Exit Engine & Profitability Gate Section */}
+        <div className="space-y-4">
+          <h3 className="text-sm font-bold text-slate-200 border-b border-slate-800 pb-2">
+            4. Exit Engine, Take Profit & Stop Loss Rules
+          </h3>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 text-xs font-mono">
+            <div className="space-y-1.5">
+              <label className="text-emerald-400 font-bold">Take Profit %</label>
+              <input
+                type="number"
+                step="0.1"
+                value={form.takeProfitPercent}
+                onChange={e => setForm({ ...form, takeProfitPercent: parseFloat(e.target.value) || 2.0 })}
+                className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-slate-100 focus:outline-none focus:border-amber-400"
+              />
+              <p className="text-[10px] text-slate-500">Net profit target to trigger SELL (Default: 2.0%).</p>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-rose-400 font-bold">Stop Loss %</label>
+              <input
+                type="number"
+                step="0.1"
+                value={form.stopLossPercent}
+                onChange={e => setForm({ ...form, stopLossPercent: parseFloat(e.target.value) || 3.0 })}
+                className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-slate-100 focus:outline-none focus:border-amber-400"
+              />
+              <p className="text-[10px] text-slate-500">Sole automated loss exit trigger (Default: 3.0%).</p>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-amber-400 font-bold">Min Profit for Tech Exit %</label>
+              <input
+                type="number"
+                step="0.05"
+                value={form.minProfitForTechnicalExitPercent}
+                onChange={e => setForm({ ...form, minProfitForTechnicalExitPercent: parseFloat(e.target.value) || 0.20 })}
+                className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-slate-100 focus:outline-none focus:border-amber-400"
+              />
+              <p className="text-[10px] text-slate-500">Profitability gate buffer for weakening exit (Default: 0.20%).</p>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-slate-300">Max Exit Price Age (ms)</label>
+              <input
+                type="number"
+                step="500"
+                value={form.maxExitPriceAgeMs}
+                onChange={e => setForm({ ...form, maxExitPriceAgeMs: parseInt(e.target.value) || 5000 })}
+                className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-slate-100 focus:outline-none focus:border-amber-400"
+              />
+              <p className="text-[10px] text-slate-500">Stale price protection threshold (Default: 5000ms).</p>
+            </div>
+          </div>
+        </div>
+
         {/* Paper Simulation Parameters */}
         <div className="space-y-4">
           <h3 className="text-sm font-bold text-slate-200 border-b border-slate-800 pb-2">
-            4. Paper Trading Simulation Parameters
+            5. Paper Trading Simulation Parameters
           </h3>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs font-mono">
             <div className="space-y-1.5">
