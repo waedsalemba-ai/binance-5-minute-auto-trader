@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { AlertTriangle, ShieldAlert, RotateCcw, Power, CheckCircle2, X } from 'lucide-react';
+import { AlertTriangle, ShieldAlert, RotateCcw, Power, CheckCircle2, X, Trash2 } from 'lucide-react';
 import { Position } from '../types/index.ts';
 
 interface ModalProps {
@@ -386,4 +386,102 @@ export const AdminUnlockModal: React.FC<AdminUnlockModalProps> = ({ isOpen, onCl
     </div>
   );
 };
+
+export interface DeleteSavedDataModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  onConfirm: (resetSettings: boolean) => Promise<void> | void;
+  loading?: boolean;
+}
+
+export const DeleteSavedDataModal: React.FC<DeleteSavedDataModalProps> = ({
+  isOpen,
+  onClose,
+  onConfirm,
+  loading = false,
+}) => {
+  const [resetSettings, setResetSettings] = useState(false);
+  if (!isOpen) return null;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+      <div className="relative w-full max-w-lg bg-[#0f172a] border-2 border-rose-500/50 rounded-2xl p-6 shadow-2xl">
+        <button
+          onClick={onClose}
+          disabled={loading}
+          className="absolute top-4 right-4 text-slate-400 hover:text-slate-200 transition-colors"
+        >
+          <X className="w-5 h-5" />
+        </button>
+
+        <div className="flex items-center gap-3 text-rose-400 mb-4">
+          <div className="p-3 bg-rose-500/10 rounded-xl border border-rose-500/30">
+            <Trash2 className="w-7 h-7 text-rose-400" />
+          </div>
+          <div>
+            <h3 className="text-lg font-bold text-slate-100">Permanently Delete Saved Data</h3>
+            <span className="text-xs text-rose-400 font-mono font-medium">PURGE PERSISTENT STORAGE & CACHE</span>
+          </div>
+        </div>
+
+        <div className="space-y-3 text-sm text-slate-300 mb-6 bg-slate-900/70 p-4 rounded-xl border border-slate-800">
+          <p className="font-semibold text-slate-200">This action permanently deletes all saved trading data:</p>
+          <ul className="space-y-2 text-xs text-slate-300">
+            <li className="flex items-start gap-2">
+              <span className="text-rose-400 font-bold">✕</span>
+              <span><strong>Active & Closed Positions:</strong> All positions are closed and permanently wiped.</span>
+            </li>
+            <li className="flex items-start gap-2">
+              <span className="text-rose-400 font-bold">✕</span>
+              <span><strong>Orders & Fills:</strong> All order records, Binance order IDs, and execution history are purged.</span>
+            </li>
+            <li className="flex items-start gap-2">
+              <span className="text-rose-400 font-bold">✕</span>
+              <span><strong>Trade History & Decisions:</strong> Realized PnL, fee metrics, strategy scores, and audit logs are deleted.</span>
+            </li>
+            <li className="flex items-start gap-2">
+              <span className="text-rose-400 font-bold">✕</span>
+              <span><strong>Disk Files & Logs:</strong> Legacy database.json, backup snapshots, temporary files, and server logs are purged.</span>
+            </li>
+            <li className="flex items-start gap-2">
+              <span className="text-emerald-400 font-bold">✓</span>
+              <span><strong>Paper Wallet:</strong> Restored to fresh initial default (1,000.00 USDT).</span>
+            </li>
+          </ul>
+
+          <div className="pt-3 border-t border-slate-800">
+            <label className="flex items-center gap-2.5 text-xs text-slate-300 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={resetSettings}
+                onChange={(e) => setResetSettings(e.target.checked)}
+                className="w-4 h-4 rounded border-slate-700 bg-slate-800 text-rose-500 focus:ring-rose-500 cursor-pointer"
+              />
+              <span>Also reset trading settings to default parameters</span>
+            </label>
+          </div>
+        </div>
+
+        <div className="flex items-center justify-end gap-3">
+          <button
+            onClick={onClose}
+            disabled={loading}
+            className="px-4 py-2 text-sm font-medium text-slate-400 hover:text-slate-200 bg-slate-800 rounded-lg transition-colors"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={() => onConfirm(resetSettings)}
+            disabled={loading}
+            className="px-5 py-2 text-sm font-bold text-white bg-rose-600 hover:bg-rose-500 rounded-lg shadow-lg shadow-rose-600/30 transition-all flex items-center gap-2"
+          >
+            <Trash2 className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
+            {loading ? 'Deleting All Data...' : 'Confirm & Delete Saved Data'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 

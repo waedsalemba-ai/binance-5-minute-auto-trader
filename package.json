@@ -8,7 +8,8 @@
     "build": "vite build",
     "start": "tsx server.ts",
     "preview": "vite preview",
-    "test": "tsx test/run-tests.ts",
+    "test": "NODE_ENV=test tsx test/run-tests.ts",
+    "delete-data": "tsx scripts/delete-saved-data.ts",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit"
   },

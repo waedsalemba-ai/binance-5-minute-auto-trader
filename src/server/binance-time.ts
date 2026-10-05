@@ -15,6 +15,14 @@ function sanitizeUrl(rawUrl?: string): string {
   }
 }
 
+const FALLBACK_TIME_URLS = [
+  'https://api.binance.com',
+  'https://data-api.binance.vision',
+  'https://api1.binance.com',
+  'https://api2.binance.com',
+  'https://api3.binance.com',
+];
+
 export class BinanceTimeService {
   private static instance: BinanceTimeService;
   private timeOffset = 0; // binanceTime - localTime
@@ -52,33 +60,47 @@ export class BinanceTimeService {
   public async syncWithBinance(rawBaseUrl?: string): Promise<boolean> {
     if (this.isSyncing) return false;
     this.isSyncing = true;
-    const url = sanitizeUrl(rawBaseUrl || this.baseUrl);
+    const initialUrl = sanitizeUrl(rawBaseUrl || this.baseUrl);
+    const urlsToTry = [initialUrl, ...FALLBACK_TIME_URLS.filter(u => u !== initialUrl)];
+
     try {
-      const localBefore = Date.now();
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 5000);
+      for (const url of urlsToTry) {
+        try {
+          const localBefore = Date.now();
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 4000);
 
-      const response = await fetch(`${url}/api/v3/time`, {
-        signal: controller.signal,
-        headers: { 'User-Agent': 'Binance-Scanner-Trader/2.0' },
-      });
-      clearTimeout(timeoutId);
+          const response = await fetch(`${url}/api/v3/time`, {
+            signal: controller.signal,
+            headers: { 'User-Agent': 'Binance-Scanner-Trader/2.0' },
+          });
+          clearTimeout(timeoutId);
 
-      if (!response.ok) {
-        throw new Error(`Failed to fetch Binance server time: HTTP ${response.status}`);
+          if (response.status === 451) {
+            Logger.warn('PAPER', 'BINANCE', `Binance endpoint ${url} returned HTTP 451 (Region Restricted / Geo-blocked). Trying fallback endpoint...`);
+            continue;
+          }
+
+          if (!response.ok) {
+            continue;
+          }
+
+          const data = (await response.json()) as { serverTime: number };
+          const localAfter = Date.now();
+          const roundTrip = localAfter - localBefore;
+          const estimatedServerTime = data.serverTime + Math.floor(roundTrip / 2);
+
+          this.timeOffset = estimatedServerTime - localAfter;
+          this.lastSyncedAt = Date.now();
+          this.baseUrl = url;
+
+          return true;
+        } catch {
+          // Try next fallback endpoint
+        }
       }
 
-      const data = (await response.json()) as { serverTime: number };
-      const localAfter = Date.now();
-      const roundTrip = localAfter - localBefore;
-      const estimatedServerTime = data.serverTime + Math.floor(roundTrip / 2);
-
-      this.timeOffset = estimatedServerTime - localAfter;
-      this.lastSyncedAt = Date.now();
-
-      return true;
-    } catch (err: any) {
-      Logger.warn('REAL', 'BINANCE', `Periodic Binance time sync error: ${err.message}`);
+      Logger.warn('PAPER', 'BINANCE', 'Periodic Binance time sync was unable to reach any Binance time endpoint. Using local time clock.');
       return false;
     } finally {
       this.isSyncing = false;

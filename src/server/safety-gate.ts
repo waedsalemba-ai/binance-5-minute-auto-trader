@@ -22,6 +22,15 @@ export class SafetyGate {
     currentPrice: number,
     isEmergencyStopped: boolean
   ): SafetyCheckResult {
+    // 0. Authoritative Database Readiness Check
+    if (!Storage.isReady()) {
+      return {
+        allowed: false,
+        code: 'DATABASE_UNAVAILABLE',
+        reason: 'Authoritative PostgreSQL database is currently disconnected. Automated BUY orders are blocked until database connection and rehydration are restored.',
+      };
+    }
+
     // 1. Emergency Stop Check
     if (isEmergencyStopped) {
       return {

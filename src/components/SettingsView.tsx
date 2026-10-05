@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
-import { Sliders, Save, CheckCircle2, AlertTriangle, Database, HardDrive, Download, RefreshCw } from 'lucide-react';
+import { Sliders, Save, CheckCircle2, AlertTriangle, Database, HardDrive, Download, RefreshCw, Trash2, X } from 'lucide-react';
 import { TradingSettings } from '../types/index.ts';
+import { DeleteSavedDataModal } from './Modals.tsx';
 
 interface SettingsViewProps {
   settings: TradingSettings;
@@ -18,6 +19,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ settings, onUpdateSe
   const [dbStats, setDbStats] = useState<any>(null);
   const [backingUp, setBackingUp] = useState(false);
   const [backupMessage, setBackupMessage] = useState<string | null>(null);
+  const [deletingData, setDeletingData] = useState(false);
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
 
   const fetchDbStats = async () => {
     try {
@@ -54,6 +57,34 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ settings, onUpdateSe
       setBackupMessage(`Backup error: ${err.message}`);
     } finally {
       setBackingUp(false);
+    }
+  };
+
+  const handleDeleteSavedData = async (resetSettings = false) => {
+    setDeletingData(true);
+    setBackupMessage(null);
+    try {
+      const fetcher = authFetch || fetch;
+      const res = await fetcher('/api/db/clear', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ resetSettings }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        setBackupMessage('All saved data, positions, trades, orders, and cache have been successfully deleted.');
+        setDeleteConfirmOpen(false);
+        fetchDbStats();
+        if (resetSettings) {
+          setForm({ ...settings });
+        }
+      } else {
+        setBackupMessage(`Delete failed: ${data.error}`);
+      }
+    } catch (err: any) {
+      setBackupMessage(`Delete error: ${err.message}`);
+    } finally {
+      setDeletingData(false);
     }
   };
 
@@ -342,6 +373,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ settings, onUpdateSe
               <Download className="w-3.5 h-3.5 text-amber-400" />
               {backingUp ? 'Creating Backup...' : 'Backup Snapshot'}
             </button>
+            <button
+              type="button"
+              onClick={() => setDeleteConfirmOpen(true)}
+              disabled={deletingData}
+              className="px-3 py-1.5 text-xs font-semibold text-rose-300 hover:text-white bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 rounded-lg transition-all flex items-center gap-1.5"
+            >
+              <Trash2 className="w-3.5 h-3.5 text-rose-400" />
+              {deletingData ? 'Deleting...' : 'Delete Saved Data'}
+            </button>
           </div>
         </div>
 
@@ -396,6 +436,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ settings, onUpdateSe
           </p>
         </div>
       </div>
+
+      {/* Delete Saved Data Confirmation Modal */}
+      <DeleteSavedDataModal
+        isOpen={deleteConfirmOpen}
+        onClose={() => setDeleteConfirmOpen(false)}
+        onConfirm={handleDeleteSavedData}
+        loading={deletingData}
+      />
     </div>
   );
 };

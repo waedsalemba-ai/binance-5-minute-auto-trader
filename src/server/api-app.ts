@@ -665,3 +665,25 @@ apiApp.post('/api/db/backup', requireAdminAuth, (req: Request, res: Response) =>
     });
   }
 });
+
+apiApp.all(['/api/db/clear', '/api/db/delete', '/api/db/reset', '/api/db/saved-data'], requireAdminAuth, async (req: Request, res: Response) => {
+  if (req.method !== 'POST' && req.method !== 'DELETE') {
+    return res.status(405).json({ success: false, error: 'Method not allowed. Use POST or DELETE.' });
+  }
+  try {
+    const result = await Storage.clearAllSavedData({
+      resetSettings: req.body?.resetSettings === true,
+      wipeLogs: true,
+    });
+    res.json({
+      success: true,
+      message: 'All saved data, positions, trades, orders, and disk caches have been successfully deleted.',
+      data: result,
+    });
+  } catch (err: any) {
+    res.status(500).json({
+      success: false,
+      error: `Failed to delete saved data: ${err.message}`,
+    });
+  }
+});

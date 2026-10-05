@@ -23,6 +23,8 @@ import {
   sanitizeDatabaseUrl,
   openPositionTransaction,
   closePositionTransaction,
+  isPostgresConnected,
+  registerDatabaseReconnectHandler,
   OpenPositionParams,
   ClosePositionParams,
 } from './postgres.ts';
@@ -123,6 +125,10 @@ class PostgresStorageEngine {
 
   constructor() {
     this.cache = this.createDefaultCache();
+    // Register automatic rehydration callback on reconnect
+    registerDatabaseReconnectHandler(async () => {
+      await this.loadFromPostgres();
+    });
     // Initialize PostgreSQL schema and load on boot
     this.initPromise = this.init();
   }
@@ -182,8 +188,6 @@ class PostgresStorageEngine {
   }
 
   public async init(): Promise<void> {
-    if (this.isInitialized) return;
-
     try {
       // 1. Initialize PostgreSQL schema
       await initializePostgresSchema();
@@ -195,10 +199,10 @@ class PostgresStorageEngine {
       await this.loadFromPostgres();
 
       this.isInitialized = true;
-      Logger.info('PAPER', 'DATABASE', 'PostgreSQL storage engine initialized and state rehydrated successfully.');
+      Logger.info('PAPER', 'DATABASE', '[DATABASE] [POSTGRES] PostgreSQL storage engine initialized and state rehydrated successfully.');
     } catch (err: any) {
-      Logger.error('PAPER', 'DATABASE', `Failed to initialize PostgreSQL storage engine: ${err.message}`);
-      this.isInitialized = true;
+      Logger.error('PAPER', 'DATABASE', `[DATABASE] [POSTGRES] Failed to initialize PostgreSQL storage engine: ${err.message}`);
+      this.isInitialized = false;
       if (process.env.NODE_ENV === 'production' && !process.env.DATABASE_URL) {
         throw err;
       }
@@ -208,6 +212,9 @@ class PostgresStorageEngine {
   public async ensureReady(): Promise<void> {
     if (this.initPromise) {
       await this.initPromise;
+    }
+    if (!this.isInitialized && isPostgresConnected()) {
+      await this.init();
     }
   }
 
@@ -419,7 +426,7 @@ class PostgresStorageEngine {
 
   // --- Health & Readiness ---
   public isReady(): boolean {
-    return this.isInitialized;
+    return this.isInitialized && isPostgresConnected();
   }
 
   public async isDatabaseReadyAsync(): Promise<boolean> {
@@ -875,6 +882,189 @@ class PostgresStorageEngine {
     Logger.info('PAPER', 'WALLET', `Paper account successfully reset: all active positions closed, wallet balance restored to default ${starting} USDT.`);
   }
 
+  // --- Clear All Saved Data ---
+  public async clearAllSavedData(options?: { resetSettings?: boolean; wipeLogs?: boolean }): Promise<{
+    positionsCleared: number;
+    ordersCleared: number;
+    tradesCleared: number;
+    filesRemoved: string[];
+    paperWalletReset: boolean;
+  }> {
+    const positionsCleared = this.cache.positions.length;
+    const ordersCleared = this.cache.orders.length;
+    const tradesCleared = this.cache.trades.length;
+
+    // 1. Reset memory cache
+    this.cache.positions = [];
+    this.cache.orders = [];
+    this.cache.trades = [];
+    this.cache.symbolCooldowns = {};
+    const defaultStarting = this.cache.settings.paperStartingBalance || 1000;
+    this.cache.paperWallet = createInitialPaperWallet(defaultStarting);
+    this.cache.realWallet = createInitialRealWallet();
+    this.cache.scannerSummary.openPositionsCount = 0;
+    this.cache.scannerSummary.todayTradesCount = 0;
+    this.cache.latestAnalysis = {};
+
+    if (options?.resetSettings) {
+      this.cache.settings = { ...DEFAULT_SETTINGS };
+    }
+
+    // 2. Wipe database tables
+    try {
+      await withTransaction(async (client) => {
+        await client.query('DELETE FROM positions');
+        await client.query('DELETE FROM orders');
+        await client.query('DELETE FROM trades');
+        await client.query('DELETE FROM trade_decisions');
+        await client.query('DELETE FROM symbol_cooldowns');
+        await client.query('DELETE FROM system_state');
+
+        if (options?.resetSettings) {
+          await client.query('DELETE FROM trading_settings');
+        }
+
+        const pw = this.cache.paperWallet;
+        await client.query(
+          `INSERT INTO wallets (
+            mode, usdt_available, usdt_locked, usdt_total, account_asset_value,
+            total_equity, starting_balance, realized_pnl, unrealized_pnl,
+            total_fees_paid, assets, last_reconciled_at, reconciliation_status, updated_at
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+          ON CONFLICT (mode) DO UPDATE SET
+            usdt_available = EXCLUDED.usdt_available,
+            usdt_locked = EXCLUDED.usdt_locked,
+            usdt_total = EXCLUDED.usdt_total,
+            account_asset_value = EXCLUDED.account_asset_value,
+            total_equity = EXCLUDED.total_equity,
+            starting_balance = EXCLUDED.starting_balance,
+            realized_pnl = EXCLUDED.realized_pnl,
+            unrealized_pnl = EXCLUDED.unrealized_pnl,
+            total_fees_paid = EXCLUDED.total_fees_paid,
+            assets = EXCLUDED.assets,
+            last_reconciled_at = EXCLUDED.last_reconciled_at,
+            updated_at = EXCLUDED.updated_at`,
+          [
+            'PAPER',
+            pw.usdtAvailable,
+            pw.usdtLocked,
+            pw.usdtTotal,
+            pw.accountAssetValue,
+            pw.totalEquity,
+            pw.startingBalance,
+            pw.realizedPnL,
+            pw.unrealizedPnL,
+            pw.totalFeesPaid,
+            JSON.stringify(pw.assets),
+            pw.lastReconciledAt,
+            pw.reconciliationStatus,
+            Date.now(),
+          ]
+        );
+
+        const rw = this.cache.realWallet;
+        await client.query(
+          `INSERT INTO wallets (
+            mode, usdt_available, usdt_locked, usdt_total, account_asset_value,
+            total_equity, starting_balance, realized_pnl, unrealized_pnl,
+            total_fees_paid, assets, last_reconciled_at, reconciliation_status, updated_at
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+          ON CONFLICT (mode) DO UPDATE SET
+            usdt_available = EXCLUDED.usdt_available,
+            usdt_locked = EXCLUDED.usdt_locked,
+            usdt_total = EXCLUDED.usdt_total,
+            account_asset_value = EXCLUDED.account_asset_value,
+            total_equity = EXCLUDED.total_equity,
+            starting_balance = EXCLUDED.starting_balance,
+            realized_pnl = EXCLUDED.realized_pnl,
+            unrealized_pnl = EXCLUDED.unrealized_pnl,
+            total_fees_paid = EXCLUDED.total_fees_paid,
+            assets = EXCLUDED.assets,
+            last_reconciled_at = EXCLUDED.last_reconciled_at,
+            updated_at = EXCLUDED.updated_at`,
+          [
+            'REAL',
+            rw.usdtAvailable,
+            rw.usdtLocked,
+            rw.usdtTotal,
+            rw.accountAssetValue,
+            rw.totalEquity,
+            rw.startingBalance,
+            rw.realizedPnL,
+            rw.unrealizedPnL,
+            rw.totalFeesPaid,
+            JSON.stringify(rw.assets),
+            rw.lastReconciledAt,
+            rw.reconciliationStatus,
+            Date.now(),
+          ]
+        );
+      });
+    } catch (err: any) {
+      Logger.error('PAPER', 'DATABASE', `Error wiping database tables: ${err.message}`);
+    }
+
+    // 3. Delete disk files (migrated JSON files, backups, temporary files, logs)
+    const filesRemoved: string[] = [];
+    const explicitTargets = [
+      DB_FILE,
+      path.join(DATA_DIR, 'database.json'),
+      path.resolve(process.cwd(), '.data', 'database.json'),
+      path.resolve(process.cwd(), 'data', 'database.json'),
+      '/data/database.json',
+      path.join(DATA_DIR, 'app.log'),
+      path.resolve(process.cwd(), '.data', 'app.log'),
+    ];
+
+    for (const target of explicitTargets) {
+      if (fs.existsSync(target)) {
+        try {
+          if (fs.statSync(target).isFile()) {
+            fs.unlinkSync(target);
+            filesRemoved.push(target);
+          }
+        } catch {}
+      }
+    }
+
+    const dirsToCheck = [DATA_DIR, path.resolve(process.cwd(), '.data'), path.join(DATA_DIR, 'backups')];
+
+    for (const dir of dirsToCheck) {
+      if (fs.existsSync(dir)) {
+        try {
+          const files = fs.readdirSync(dir);
+          for (const file of files) {
+            if (
+              file.endsWith('.json') ||
+              file.includes('.migrated') ||
+              file.endsWith('.log') ||
+              file.startsWith('database-backup') ||
+              file.startsWith('pg-database-backup')
+            ) {
+              const fullPath = path.join(dir, file);
+              try {
+                if (fs.existsSync(fullPath) && fs.statSync(fullPath).isFile()) {
+                  fs.unlinkSync(fullPath);
+                  filesRemoved.push(fullPath);
+                }
+              } catch {}
+            }
+          }
+        } catch {}
+      }
+    }
+
+    Logger.info('PAPER', 'DATABASE', `All saved data deleted: ${positionsCleared} positions, ${ordersCleared} orders, ${tradesCleared} trades cleared, ${filesRemoved.length} disk files wiped.`);
+
+    return {
+      positionsCleared,
+      ordersCleared,
+      tradesCleared,
+      filesRemoved,
+      paperWalletReset: true,
+    };
+  }
+
   // --- Positions ---
   public getPositions(mode?: TradingMode, status?: Position['status']): Position[] {
     let list = this.cache.positions;
@@ -939,21 +1129,21 @@ class PostgresStorageEngine {
         updated_at = EXCLUDED.updated_at`,
       [
         updated.id,
-        updated.accountId,
+        updated.accountId || 'paper-default',
         updated.symbol,
         updated.mode,
         updated.status,
         updated.entryPrice,
         updated.quantity,
-        updated.remainingQuantity,
+        updated.remainingQuantity ?? updated.quantity,
         updated.entryQuoteAmount,
-        updated.entryFees,
-        updated.entryScore,
-        updated.entryState,
-        updated.entryReason,
-        updated.currentPrice,
+        updated.entryFees ?? 0,
+        updated.entryScore ?? 0,
+        updated.entryState || 'STRONG_BULLISH',
+        updated.entryReason || 'Auto Trade Entry',
+        updated.currentPrice ?? updated.entryPrice,
         updated.currentScore || 0,
-        updated.currentState,
+        updated.currentState || updated.entryState || 'STRONG_BULLISH',
         updated.grossPnL || 0,
         updated.unrealizedPnL || 0,
         updated.unrealizedPnLPercent || 0,
@@ -962,8 +1152,8 @@ class PostgresStorageEngine {
         updated.breakEvenPrice || updated.entryPrice,
         updated.takeProfitPrice || (updated.entryPrice * 1.02),
         updated.stopLossPrice || (updated.entryPrice * 0.97),
-        updated.openedAt,
-        updated.updatedAt,
+        updated.openedAt || Date.now(),
+        updated.updatedAt || Date.now(),
         updated.entryOrderId || null,
         updated.exitOrderId || null,
         null,
@@ -972,7 +1162,7 @@ class PostgresStorageEngine {
         null,
         null,
         null,
-        0,
+        (updated as any).exitFees ?? 0,
       ]
     ).catch(err => {
       Logger.error('PAPER', 'DATABASE', `Failed to persist position to PostgreSQL: ${err.message}`);

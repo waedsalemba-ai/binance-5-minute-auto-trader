@@ -6,7 +6,15 @@ import { StrategyEngine } from '../src/server/strategy-engine.ts';
 import { SafetyGate } from '../src/server/safety-gate.ts';
 import { PaperTradingExecutor } from '../src/server/trading-executor.ts';
 import { Storage } from '../src/server/storage.ts';
-import { sanitizeDatabaseUrl } from '../src/server/postgres.ts';
+import { newDb } from 'pg-mem';
+import pg from 'pg';
+import {
+  sanitizeDatabaseUrl,
+  setTestPool,
+  initializePostgresSchema,
+  checkPostgresHealth,
+  isPostgresConnected,
+} from '../src/server/postgres.ts';
 import { normalizeBinanceBaseUrl } from '../src/server/binance-client.ts';
 import {
   Candle,
@@ -65,7 +73,14 @@ function createMockCandles(count = 60, startPrice = 100, trend = 'up'): Candle[]
 
 async function runAllTests() {
   console.log('🧪 Starting Binance 5m Scanner & Auto Trader Automated Test Suite...\n');
+  process.env.NODE_ENV = 'test';
+  const memDb = newDb();
+  const MemPool = memDb.adapters.createPg().Pool;
+  const testPool = new MemPool() as unknown as pg.Pool;
+  setTestPool(testPool);
+  await initializePostgresSchema();
   await Storage.ensureReady();
+  await Storage.loadFromPostgres();
 
   let passed = 0;
   let failed = 0;
@@ -1084,6 +1099,52 @@ async function runAllTests() {
     assert.ok(backup.backupPath.includes('pg-database-backup'));
   });
 
+  test('PERSISTENCE TEST 6: PostgreSQL disconnect marks storage unready, blocks BUY, and recovers cleanly on reconnect', async () => {
+    // 1. Simulate PostgreSQL disconnect
+    setTestPool(null);
+    const healthWhenDown = await checkPostgresHealth();
+    assert.strictEqual(healthWhenDown.isConnected, false);
+    assert.strictEqual(Storage.isReady(), false);
+
+    // 2. Verify BUY is blocked
+    const filter: SymbolFilterRules = {
+      minNotional: 5,
+      minQty: 0.0001,
+      maxQty: 999999,
+      stepSize: 0.0001,
+      tickSize: 0.01,
+      minPrice: 0.01,
+      maxPrice: 1000000,
+    };
+    const paperWallet = Storage.getWallet('PAPER');
+    const safetyResult = SafetyGate.validateBuy(
+      {
+        symbol: 'BTCUSDT',
+        side: 'BUY',
+        quoteAmount: 100,
+        reason: 'Test Buy While Disconnected',
+        strategyState: 'STRONG_BULLISH',
+        technicalScore: 90,
+        clientOrderId: 'test-dc-1',
+      },
+      'PAPER',
+      { ...baseSettings, autoTrading: true, fixedTradeAmount: 100 },
+      paperWallet,
+      [],
+      filter,
+      50000,
+      false
+    );
+    assert.strictEqual(safetyResult.allowed, false);
+    assert.strictEqual(safetyResult.code, 'DATABASE_UNAVAILABLE');
+
+    // 3. Reconnect PostgreSQL
+    setTestPool(testPool);
+    const healthWhenUp = await checkPostgresHealth();
+    assert.strictEqual(healthWhenUp.isConnected, true);
+    assert.strictEqual(Storage.isReady(), true);
+  });
+
   // -------------------------------------------------------------
   // 13. Live Trading Safety Guard (LIVE_TRADING_ENABLED)
   // -------------------------------------------------------------
@@ -1147,6 +1208,101 @@ async function runAllTests() {
     }
   });
 
+  test('GUARD TEST 2: Automated BUY is strictly blocked when PostgreSQL is unavailable', () => {
+    const originalIsReady = Storage.isReady;
+    try {
+      (Storage as any).isReady = () => false;
+
+      const filter: SymbolFilterRules = {
+        minNotional: 5,
+        minQty: 0.0001,
+        maxQty: 999999,
+        stepSize: 0.0001,
+        tickSize: 0.01,
+        minPrice: 0.01,
+        maxPrice: 1000000,
+      };
+
+      const paperWallet = Storage.getWallet('PAPER');
+
+      const safetyResult = SafetyGate.validateBuy(
+        {
+          symbol: 'ETHUSDT',
+          side: 'BUY',
+          quoteAmount: 100,
+          reason: 'Test DB Disconnect Buy',
+          strategyState: 'STRONG_BULLISH',
+          technicalScore: 90,
+          clientOrderId: 'test-db-guard-1',
+        },
+        'PAPER',
+        { ...baseSettings, autoTrading: true, fixedTradeAmount: 100 },
+        paperWallet,
+        [],
+        filter,
+        2500,
+        false
+      );
+
+      assert.strictEqual(safetyResult.allowed, false);
+      assert.strictEqual(safetyResult.code, 'DATABASE_UNAVAILABLE');
+      assert.ok(safetyResult.reason?.includes('PostgreSQL'));
+    } finally {
+      (Storage as any).isReady = originalIsReady;
+    }
+  });
+
+  // -------------------------------------------------------------
+  // 17. Delete Saved Data & Full Persistence Purge
+  // -------------------------------------------------------------
+  console.log('17. Delete Saved Data & Storage Purge:');
+  test('Storage.clearAllSavedData completely wipes positions, orders, trades, and restores paper wallet to 1000 USDT', async () => {
+    // 1. Seed sample data
+    const samplePos: Position = {
+      id: 'test-purge-pos-1',
+      accountId: 'paper-default',
+      symbol: 'ETHUSDT',
+      mode: 'PAPER',
+      status: 'OPEN',
+      entryPrice: 2000,
+      quantity: 0.1,
+      remainingQuantity: 0.1,
+      entryQuoteAmount: 200,
+      entryFees: 0.2,
+      openedAt: Date.now(),
+      updatedAt: Date.now(),
+      entryScore: 88,
+      entryState: 'STRONG_BULLISH',
+      entryReason: 'Test Purge Entry',
+      currentPrice: 2050,
+      currentScore: 88,
+      currentState: 'STRONG_BULLISH',
+      entryOrderId: 'test-purge-ord-1',
+      unrealizedPnL: 5,
+      unrealizedPnLPercent: 2.5,
+      takeProfitPrice: 2040,
+      stopLossPrice: 1940,
+      breakEvenPrice: 2002,
+    };
+    Storage.savePosition(samplePos);
+    assert.ok(Storage.getPositions().length > 0);
+
+    // 2. Clear all saved data
+    const purgeResult = await Storage.clearAllSavedData({ resetSettings: false, wipeLogs: true });
+
+    assert.strictEqual(purgeResult.paperWalletReset, true);
+    assert.strictEqual(Storage.getPositions().length, 0);
+    assert.strictEqual(Storage.getOrders().length, 0);
+    assert.strictEqual(Storage.getTrades().length, 0);
+
+    const wallet = Storage.getWallet('PAPER');
+    assert.strictEqual(wallet.usdtAvailable, 1000);
+    assert.strictEqual(wallet.totalEquity, 1000);
+    assert.strictEqual(wallet.realizedPnL, 0);
+    assert.strictEqual(wallet.unrealizedPnL, 0);
+    assert.strictEqual(wallet.assets.length, 0);
+  });
+
   await testQueue;
 
   console.log(`\n==============================================`);
@@ -1155,6 +1311,8 @@ async function runAllTests() {
 
   if (failed > 0) {
     process.exit(1);
+  } else {
+    process.exit(0);
   }
 }
 

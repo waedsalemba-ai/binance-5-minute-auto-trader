@@ -18,10 +18,27 @@ import { Logger } from './logger.ts';
 // 1. Database Connection & URL Sanitization
 // --------------------------------------------------------------------------
 
+export function normalizeDatabaseUrl(rawUrl?: string): string {
+  if (!rawUrl) return '';
+  const trimmed = rawUrl.trim();
+  try {
+    const parsed = new URL(trimmed);
+    // If Render internal service hostname is used (e.g. dpg-db1udtss728c73ac7e00-a) without a domain suffix,
+    // normalize to the standard Render Postgres public hostname format: dpg-*.oregon-postgres.render.com
+    if (parsed.hostname && parsed.hostname.startsWith('dpg-') && !parsed.hostname.includes('.')) {
+      parsed.hostname = `${parsed.hostname}.oregon-postgres.render.com`;
+      return parsed.toString();
+    }
+    return trimmed;
+  } catch {
+    return trimmed;
+  }
+}
+
 export function sanitizeDatabaseUrl(rawUrl?: string): string {
   if (!rawUrl) return '[NOT_SET]';
   try {
-    const u = new URL(rawUrl);
+    const u = new URL(normalizeDatabaseUrl(rawUrl));
     if (u.password) {
       u.password = '****';
     }
@@ -32,20 +49,24 @@ export function sanitizeDatabaseUrl(rawUrl?: string): string {
 }
 
 let activePool: pg.Pool | null = null;
-let fallbackPool: pg.Pool | null = null;
-let isInMemory = false;
-let isUsingFallback = false;
 let isRemoteConnected = false;
-let fallbackReason = '';
+let lastConnectionError: string | null = null;
+let reconnectIntervalTimer: NodeJS.Timeout | null = null;
+let isReconnecting = false;
+const onReconnectCallbacks: Array<() => Promise<void>> = [];
 
-export function getFallbackPool(): pg.Pool {
-  if (fallbackPool) {
-    return fallbackPool;
+export function registerDatabaseReconnectHandler(fn: () => Promise<void>): void {
+  onReconnectCallbacks.push(fn);
+}
+
+async function notifyReconnected(): Promise<void> {
+  for (const cb of onReconnectCallbacks) {
+    try {
+      await cb();
+    } catch (err: any) {
+      Logger.error('PAPER', 'DATABASE', `Error during database rehydration callback: ${err.message}`);
+    }
   }
-  const memDb = newDb();
-  const MemPool = memDb.adapters.createPg().Pool;
-  fallbackPool = new MemPool() as unknown as pg.Pool;
-  return fallbackPool;
 }
 
 function isNetworkOrDnsError(err: any): boolean {
@@ -64,8 +85,71 @@ function isNetworkOrDnsError(err: any): boolean {
   );
 }
 
+export function startDatabaseReconnectLoop(): void {
+  if (reconnectIntervalTimer) return;
+
+  const rawUrl = process.env.DATABASE_URL?.trim();
+  if (!rawUrl) return;
+
+  const effectiveUrl = normalizeDatabaseUrl(rawUrl);
+  reconnectIntervalTimer = setInterval(async () => {
+    if (isRemoteConnected || isReconnecting) return;
+    isReconnecting = true;
+    const sanitized = sanitizeDatabaseUrl(effectiveUrl);
+
+    try {
+      const isLocal = effectiveUrl.includes('localhost') || effectiveUrl.includes('127.0.0.1');
+      const testPool = new pg.Pool({
+        connectionString: effectiveUrl,
+        ssl: isLocal ? false : { rejectUnauthorized: false },
+        max: 10,
+        idleTimeoutMillis: 30000,
+        connectionTimeoutMillis: 5000,
+      });
+
+      const testClient = await testPool.connect();
+      const res = await testClient.query('SELECT 1 as ping');
+      testClient.release();
+
+      if (res.rows?.[0]?.ping === 1 || res.rows?.[0]?.ping === '1') {
+        if (activePool) {
+          try {
+            await activePool.end();
+          } catch {}
+        }
+        activePool = testPool;
+        isRemoteConnected = true;
+        lastConnectionError = null;
+
+        Logger.info('PAPER', 'DATABASE', `[DATABASE] [POSTGRES] Re-established connection to PostgreSQL at ${sanitized}. Running schema verification and rehydrating state...`);
+        await initializePostgresSchema();
+        await notifyReconnected();
+        Logger.info('PAPER', 'DATABASE', '[DATABASE] [POSTGRES] Rehydration complete. Trading engine is now READY.');
+      }
+    } catch (err: any) {
+      lastConnectionError = err.message;
+      isRemoteConnected = false;
+      Logger.warn('PAPER', 'DATABASE', `[DATABASE] [POSTGRES] Reconnection attempt failed (${err.message}). Retrying in 5s...`);
+    } finally {
+      isReconnecting = false;
+    }
+  }, 5000);
+  reconnectIntervalTimer.unref();
+}
+
 export async function probeAndSelectPool(): Promise<pg.Pool> {
-  if (activePool) {
+  if (activePool && isRemoteConnected) {
+    return activePool;
+  }
+
+  const isTest = process.env.NODE_ENV === 'test';
+  if (isTest) {
+    if (!activePool) {
+      const memDb = newDb();
+      const MemPool = memDb.adapters.createPg().Pool;
+      activePool = new MemPool() as unknown as pg.Pool;
+      isRemoteConnected = true;
+    }
     return activePool;
   }
 
@@ -79,35 +163,40 @@ export async function probeAndSelectPool(): Promise<pg.Pool> {
       throw new Error(errMsg);
     }
 
-    activePool = getFallbackPool();
-    isInMemory = true;
-    isUsingFallback = true;
-    Logger.info('PAPER', 'DATABASE', 'DATABASE_URL not set in non-production. Initialized in-memory PostgreSQL engine.');
-    return activePool;
+    if (isTest) {
+      // In explicit automated test runner with no external DB, provide pg-mem for unit tests only
+      if (!activePool) {
+        const memDb = newDb();
+        const MemPool = memDb.adapters.createPg().Pool;
+        activePool = new MemPool() as unknown as pg.Pool;
+        isRemoteConnected = true;
+        Logger.info('PAPER', 'DATABASE', '[TEST] Initialized in-memory PostgreSQL engine for test suite execution.');
+      }
+      return activePool;
+    }
+
+    const errMsg = 'DATABASE_URL environment variable is not configured.';
+    Logger.error('PAPER', 'DATABASE', errMsg);
+    throw new Error(errMsg);
   }
 
-  const sanitized = sanitizeDatabaseUrl(rawUrl);
-  const isLocal = rawUrl.includes('localhost') || rawUrl.includes('127.0.0.1');
+  const effectiveUrl = normalizeDatabaseUrl(rawUrl);
+  const sanitized = sanitizeDatabaseUrl(effectiveUrl);
+  const isLocal = effectiveUrl.includes('localhost') || effectiveUrl.includes('127.0.0.1');
 
   const remotePool = new pg.Pool({
-    connectionString: rawUrl,
+    connectionString: effectiveUrl,
     ssl: isLocal ? false : { rejectUnauthorized: false },
     max: 10,
     idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 3500,
+    connectionTimeoutMillis: 5000,
   });
 
   remotePool.on('error', (err) => {
-    if (isNetworkOrDnsError(err)) {
-      if (!isUsingFallback) {
-        isUsingFallback = true;
-        isRemoteConnected = false;
-        activePool = getFallbackPool();
-        Logger.warn('PAPER', 'DATABASE', `PostgreSQL network issue (${err.message}). Switched seamlessly to embedded PostgreSQL engine.`);
-      }
-    } else {
-      Logger.error('PAPER', 'DATABASE', `PostgreSQL error: ${err.message}`);
-    }
+    isRemoteConnected = false;
+    lastConnectionError = err.message;
+    Logger.error('PAPER', 'DATABASE', `[DATABASE] [POSTGRES] Connection pool error: ${err.message}. Marking database disconnected.`);
+    startDatabaseReconnectLoop();
   });
 
   // Test remote connection with timeout
@@ -115,62 +204,91 @@ export async function probeAndSelectPool(): Promise<pg.Pool> {
     const testClient = await Promise.race([
       remotePool.connect(),
       new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('Connection timed out after 3500ms')), 3500)
+        setTimeout(() => reject(new Error('Connection timed out after 5000ms')), 5000)
       ),
     ]);
     const res = await testClient.query('SELECT 1 as ping');
     testClient.release();
+
     if (res.rows?.[0]?.ping === 1 || res.rows?.[0]?.ping === '1') {
       activePool = remotePool;
       isRemoteConnected = true;
-      isUsingFallback = false;
-      Logger.info('PAPER', 'DATABASE', `Successfully connected to PostgreSQL at ${sanitized}`);
+      lastConnectionError = null;
+      Logger.info('PAPER', 'DATABASE', `[DATABASE] [POSTGRES] Successfully connected to PostgreSQL at ${sanitized}`);
       return activePool;
     }
   } catch (err: any) {
-    // If connection failed due to DNS (e.g. Render internal host outside Render network), switch to fallback pool
-    const isDnsOrNet = isNetworkOrDnsError(err);
-    fallbackReason = isDnsOrNet
-      ? `Host is an internal network name or unreachable from this environment (${err.message})`
-      : err.message;
-
-    activePool = getFallbackPool();
-    isInMemory = true;
-    isUsingFallback = true;
+    lastConnectionError = err.message;
     isRemoteConnected = false;
+    activePool = null;
 
-    Logger.warn(
+    Logger.error(
       'PAPER',
       'DATABASE',
-      `PostgreSQL remote host at ${sanitized} is not directly reachable (${err.message}). Switching seamlessly to embedded PostgreSQL engine to maintain uninterrupted 24/7 trading operations.`
+      `[DATABASE] [POSTGRES] Failed to connect to PostgreSQL at ${sanitized}: ${err.message}. Storage is marked UNHEALTHY. Starting automatic reconnection loop.`
     );
+
+    startDatabaseReconnectLoop();
+
+    if (isProduction) {
+      // In production, do not proceed with dummy database
+      throw new Error(`Failed to connect to production PostgreSQL at ${sanitized}: ${err.message}`);
+    }
+
+    if (isTest) {
+      // Test suite fallback
+      const memDb = newDb();
+      const MemPool = memDb.adapters.createPg().Pool;
+      activePool = new MemPool() as unknown as pg.Pool;
+      isRemoteConnected = true;
+      return activePool;
+    }
+
+    throw err;
   }
 
-  return activePool || getFallbackPool();
+  throw new Error('PostgreSQL connection failed.');
 }
 
-export function getPostgresPool(): pg.Pool {
-  if (activePool) {
-    return activePool;
+export function getPostgresPool(): pg.Pool | null {
+  return activePool;
+}
+
+export function setTestPool(pool: pg.Pool | null): void {
+  activePool = pool;
+  isRemoteConnected = Boolean(pool);
+  if (pool) {
+    lastConnectionError = null;
   }
-  return getFallbackPool();
+}
+
+export function isPostgresConnected(): boolean {
+  return isRemoteConnected;
 }
 
 export async function query<T extends pg.QueryResultRow = any>(
   text: string,
   params?: any[]
 ): Promise<pg.QueryResult<T>> {
-  const pool = activePool || (await probeAndSelectPool());
+  if (!activePool || !isRemoteConnected) {
+    try {
+      await probeAndSelectPool();
+    } catch {
+      throw new Error(`[DATABASE] PostgreSQL is currently disconnected: ${lastConnectionError || 'Connection unavailable'}. Query rejected to prevent data loss.`);
+    }
+  }
+
+  if (!activePool) {
+    throw new Error('[DATABASE] PostgreSQL active pool is unavailable.');
+  }
+
   try {
-    return await pool.query<T>(text, params);
+    return await activePool.query<T>(text, params);
   } catch (err: any) {
-    if (isNetworkOrDnsError(err) && !isUsingFallback) {
-      isUsingFallback = true;
+    if (isNetworkOrDnsError(err)) {
       isRemoteConnected = false;
-      activePool = getFallbackPool();
-      Logger.warn('PAPER', 'DATABASE', `PostgreSQL query network error (${err.message}). Recovering with embedded PostgreSQL engine.`);
-      await initializePostgresSchema();
-      return await activePool.query<T>(text, params);
+      lastConnectionError = err.message;
+      startDatabaseReconnectLoop();
     }
     throw err;
   }
@@ -179,21 +297,26 @@ export async function query<T extends pg.QueryResultRow = any>(
 export async function withTransaction<T>(
   callback: (client: pg.PoolClient) => Promise<T>
 ): Promise<T> {
-  const pool = activePool || (await probeAndSelectPool());
+  if (!activePool || !isRemoteConnected) {
+    try {
+      await probeAndSelectPool();
+    } catch {
+      throw new Error(`[DATABASE] PostgreSQL is currently disconnected: ${lastConnectionError || 'Connection unavailable'}. Transaction rejected to prevent data loss.`);
+    }
+  }
+
+  if (!activePool) {
+    throw new Error('[DATABASE] PostgreSQL active pool is unavailable.');
+  }
+
   let client: pg.PoolClient;
   try {
-    client = await pool.connect();
+    client = await activePool.connect();
   } catch (err: any) {
-    if (isNetworkOrDnsError(err) && !isUsingFallback) {
-      isUsingFallback = true;
-      isRemoteConnected = false;
-      activePool = getFallbackPool();
-      Logger.warn('PAPER', 'DATABASE', `PostgreSQL connection error (${err.message}). Recovering transaction on embedded PostgreSQL engine.`);
-      await initializePostgresSchema();
-      client = await activePool.connect();
-    } else {
-      throw err;
-    }
+    isRemoteConnected = false;
+    lastConnectionError = err.message;
+    startDatabaseReconnectLoop();
+    throw err;
   }
 
   try {
@@ -216,25 +339,32 @@ export async function withTransaction<T>(
 export async function checkPostgresHealth(): Promise<{
   isConnected: boolean;
   error?: string;
-  inMemory: boolean;
-  isFallback: boolean;
-  fallbackReason?: string;
+  storageEngine: string;
 }> {
-  try {
-    const res = await query('SELECT 1 as ping');
+  if (!isRemoteConnected || !activePool) {
     return {
-      isConnected: res.rows?.[0]?.ping === 1 || res.rows?.[0]?.ping === '1',
-      inMemory: isInMemory || isUsingFallback,
-      isFallback: isUsingFallback,
-      fallbackReason: isUsingFallback ? fallbackReason : undefined,
+      isConnected: false,
+      error: lastConnectionError || 'PostgreSQL database is currently disconnected.',
+      storageEngine: 'PostgreSQL',
+    };
+  }
+
+  try {
+    const res = await activePool.query('SELECT 1 as ping');
+    const ok = res.rows?.[0]?.ping === 1 || res.rows?.[0]?.ping === '1';
+    return {
+      isConnected: ok,
+      error: ok ? undefined : 'Ping query did not return expected response',
+      storageEngine: 'PostgreSQL',
     };
   } catch (err: any) {
+    isRemoteConnected = false;
+    lastConnectionError = err.message;
+    startDatabaseReconnectLoop();
     return {
       isConnected: false,
       error: err.message,
-      inMemory: isInMemory || isUsingFallback,
-      isFallback: isUsingFallback,
-      fallbackReason: isUsingFallback ? fallbackReason : undefined,
+      storageEngine: 'PostgreSQL',
     };
   }
 }
@@ -246,18 +376,27 @@ export async function checkPostgresHealth(): Promise<{
 export async function initializePostgresSchema(): Promise<void> {
   Logger.info('PAPER', 'DATABASE', 'Checking and applying PostgreSQL database schema migrations...');
 
-  await query(`
-    CREATE TABLE IF NOT EXISTS schema_migrations (
-      id INT PRIMARY KEY,
-      name VARCHAR(128) NOT NULL,
-      applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `);
+  await withTransaction(async (client) => {
+    try {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+          id VARCHAR(32) PRIMARY KEY,
+          name VARCHAR(128) NOT NULL,
+          applied_at BIGINT NOT NULL
+        );
+      `);
+    } catch (createErr: any) {
+      if (
+        !createErr.message.includes('already exists') &&
+        !createErr.message.includes('Not supported')
+      ) {
+        throw createErr;
+      }
+    }
 
-  // Migration 1: Core trading tables
-  const migration1Applied = await query('SELECT id FROM schema_migrations WHERE id = 1');
-  if (migration1Applied.rowCount === 0) {
-    await withTransaction(async (client) => {
+    // Migration 1: Core trading tables
+    const migration1Applied = await client.query('SELECT id FROM schema_migrations WHERE id = $1', ['1']);
+    if (migration1Applied.rowCount === 0) {
       // System State
       await client.query(`
         CREATE TABLE IF NOT EXISTS system_state (
@@ -474,13 +613,12 @@ export async function initializePostgresSchema(): Promise<void> {
       `);
 
       await client.query(
-        'INSERT INTO schema_migrations (id, name) VALUES (1, $1)',
-        ['001_initial_schema']
+        'INSERT INTO schema_migrations (id, name, applied_at) VALUES ($1, $2, $3)',
+        ['1', '001_initial_schema', Date.now()]
       );
-    });
-
-    Logger.info('PAPER', 'DATABASE', 'Applied migration 001_initial_schema successfully.');
-  }
+      Logger.info('PAPER', 'DATABASE', 'Applied migration 001_initial_schema successfully.');
+    }
+  });
 }
 
 // --------------------------------------------------------------------------
