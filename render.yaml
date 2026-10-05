@@ -7,17 +7,13 @@ services:
     buildCommand: npm install && npm run build
     startCommand: npm start
     healthCheckPath: /health
-    disk:
-      name: trader-data
-      mountPath: /data
-      sizeGB: 1
     envVars:
       - key: NODE_ENV
         value: production
       - key: PORT
         value: 10000
-      - key: DATA_DIR
-        value: /data
+      - key: DATABASE_URL
+        sync: false
       - key: LIVE_TRADING_ENABLED
         value: "false"
       - key: TAKE_PROFIT_PERCENT
@@ -40,3 +36,4 @@ services:
         generateValue: true
       - key: BINANCE_API_BASE_URL
         value: https://api.binance.com
+
