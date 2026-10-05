@@ -1,47 +1,42 @@
-import 'dotenv/config';
 import express, { Request, Response } from 'express';
 import path from 'node:path';
 import fs from 'node:fs';
 import { apiApp } from './src/server/api-app.ts';
-import { Logger } from './src/server/logger.ts';
+import { Storage, DATA_DIR } from './src/server/storage.ts';
 import { AutoTradingEngine } from './src/server/auto-trading-engine.ts';
+import { Logger } from './src/server/logger.ts';
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 const isProduction = process.env.NODE_ENV === 'production';
 
-// 1. Mount API Router with all /api/*, /health, /ready routes
-app.use(apiApp);
-
-// 2. Reverse proxy for Firebase Auth helper files (eliminates third-party cookie/iframe blocking)
-app.use('/__/auth', async (req: Request, res: Response) => {
-  try {
-    const targetUrl = `https://powerful-utility-tsx2c.firebaseapp.com/__/auth${req.url}`;
-    const headers: Record<string, string> = {};
-    for (const [key, value] of Object.entries(req.headers)) {
-      if (key !== 'host' && typeof value === 'string') {
-        headers[key] = value;
-      }
-    }
-    const response = await fetch(targetUrl, {
-      method: req.method,
-      headers,
-    });
-
-    res.status(response.status);
-    response.headers.forEach((val, key) => {
-      if (key !== 'transfer-encoding' && key !== 'content-encoding') {
-        res.setHeader(key, val);
-      }
-    });
-    const buffer = Buffer.from(await response.arrayBuffer());
-    res.send(buffer);
-  } catch (err: any) {
-    res.status(500).send(`Auth proxy error: ${err.message}`);
-  }
+// 1. Health & Readiness endpoints at root level
+app.get('/health', (req: Request, res: Response) => {
+  res.status(200).json({
+    status: 'ok',
+    service: 'binance-5-minute-auto-trader',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+  });
 });
 
-// 3. Frontend delivery: Vite middleware in dev or static dist in production
+app.get('/ready', (req: Request, res: Response) => {
+  const isReady = Storage.isReady();
+  res.status(isReady ? 200 : 503).json({
+    ready: isReady,
+    server: true,
+    storage: isReady,
+    scanner: true,
+    dataDir: DATA_DIR,
+    liveTradingEnabled: process.env.LIVE_TRADING_ENABLED === 'true',
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// 2. Mount API Router
+app.use(apiApp);
+
+// 3. Frontend delivery
 async function startServer() {
   const distPath = path.resolve(process.cwd(), 'dist');
   const hasDist = fs.existsSync(distPath) && fs.existsSync(path.join(distPath, 'index.html'));
@@ -56,7 +51,6 @@ async function startServer() {
   } else {
     app.use(express.static(distPath));
     app.get('*', (req: Request, res: Response) => {
-      // Guard: Never serve HTML for /api, /health, or /ready routes
       if (req.path.startsWith('/api') || req.path === '/health' || req.path === '/ready') {
         return res.status(404).json({ success: false, error: `Route not found: ${req.path}` });
       }
@@ -65,23 +59,43 @@ async function startServer() {
   }
 
   const server = app.listen(PORT, '0.0.0.0', () => {
-    Logger.info('PAPER', 'INFO', `🚀 Binance 2m Scanner & Auto Trader listening on http://0.0.0.0:${PORT}`);
+    Logger.info(
+      'PAPER',
+      'INFO',
+      `🚀 Binance 5m Scanner & 24/7 Auto Trader running on 0.0.0.0:${PORT} [ENV: ${process.env.NODE_ENV || 'development'}] [DATA_DIR: ${DATA_DIR}] [LIVE: ${process.env.LIVE_TRADING_ENABLED === 'true' ? 'ENABLED' : 'DISABLED'}]`
+    );
   });
 
   // Graceful shutdown handling
-  const handleShutdown = (signal: string) => {
-    Logger.info('PAPER', 'SYSTEM', `Received ${signal}. Shutting down server and trading scheduler gracefully...`);
+  let isShuttingDown = false;
+  const gracefulShutdown = (signal: string) => {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+    Logger.info('PAPER', 'INFO', `Received ${signal}. Performing graceful shutdown...`);
+
+    // Stop background scanner & timers
     AutoTradingEngine.getInstance().stopScheduler();
+
+    // Flush pending persistent database state to disk
+    Storage.flush();
+
     server.close(() => {
-      Logger.info('PAPER', 'SYSTEM', 'HTTP server closed. Exiting process.');
+      Logger.info('PAPER', 'INFO', 'HTTP server closed cleanly. Process exiting.');
       process.exit(0);
     });
+
+    // Force terminate if graceful shutdown hangs
+    setTimeout(() => {
+      console.error('Graceful shutdown timed out. Force exiting.');
+      process.exit(1);
+    }, 8000);
   };
 
-  process.on('SIGTERM', () => handleShutdown('SIGTERM'));
-  process.on('SIGINT', () => handleShutdown('SIGINT'));
+  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+  process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 }
 
 startServer().catch(err => {
-  console.error('Fatal server start error:', err);
+  console.error('Fatal server startup error:', err);
+  process.exit(1);
 });

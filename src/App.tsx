@@ -29,11 +29,17 @@ import {
   EmergencyStopModal,
   ResetPaperWalletModal,
   ManualSellModal,
+  AdminUnlockModal,
 } from './components/Modals.tsx';
 
 export default function App() {
   const [currentTab, setCurrentTab] = useState<string>('dashboard');
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
+  const [sessionToken, setSessionToken] = useState<string>(() => {
+    return sessionStorage.getItem('admin_session_token') || '';
+  });
+  const [isAdminModalOpen, setIsAdminModalOpen] = useState(false);
+  const [authRequired, setAuthRequired] = useState(false);
 
   // Core App State
   const [settings, setSettings] = useState<TradingSettings>({
@@ -209,39 +215,81 @@ export default function App() {
     };
   }, [refreshState]);
 
+  // Authenticated fetch helper
+  const authFetch = async (url: string, options: RequestInit = {}) => {
+    try {
+      const headers = new Headers(options.headers || {});
+      if (sessionToken) {
+        headers.set('X-Session-Token', sessionToken);
+      }
+      const response = await fetch(url, { ...options, headers });
+      if (response.status === 401) {
+        setIsAdminModalOpen(true);
+      }
+      return response;
+    } catch (err) {
+      console.warn(`Request failed for ${url}:`, err);
+      return new Response(JSON.stringify({ success: false, error: 'Network request error' }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+  };
+
+  const handleLoginSuccess = (token: string) => {
+    setSessionToken(token);
+    sessionStorage.setItem('admin_session_token', token);
+    refreshState();
+  };
+
   // Actions
   const handleUpdateSettings = async (newSettings: Partial<TradingSettings>) => {
-    const res = await fetch('/api/trading/settings', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(newSettings),
-    });
-    const json = await res.json();
-    if (!json.success) throw new Error(json.error);
-    setSettings(json.data);
-    await refreshState();
+    try {
+      const res = await authFetch('/api/trading/settings', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(newSettings),
+      });
+      if (res.status === 401) return;
+      const json = await res.json();
+      if (!json.success) {
+        console.error(json.error);
+        return;
+      }
+      setSettings(json.data);
+      await refreshState();
+    } catch (err: any) {
+      console.error('Settings update error:', err);
+    }
   };
 
   const handleToggleAutoTrading = async () => {
-    if (settings.autoTrading) {
-      await fetch('/api/trading/stop', { method: 'POST' });
-    } else {
-      const res = await fetch('/api/trading/start', { method: 'POST' });
-      const json = await res.json();
-      if (!json.success) {
-        alert(json.error || 'Failed to start auto trading');
-        return;
+    try {
+      if (settings.autoTrading) {
+        const res = await authFetch('/api/trading/stop', { method: 'POST' });
+        if (res.status === 401) return;
+      } else {
+        const res = await authFetch('/api/trading/start', { method: 'POST' });
+        if (res.status === 401) return;
+        const json = await res.json();
+        if (!json.success) {
+          alert(json.error || 'Failed to start auto trading');
+          return;
+        }
       }
+      await refreshState();
+    } catch (err: any) {
+      console.error('Toggle auto trading error:', err);
     }
-    await refreshState();
   };
 
   const handleRunScan = async () => {
     setIsScanning(true);
     try {
-      await fetch('/api/scanner/run', { method: 'POST' });
+      const res = await authFetch('/api/scanner/run', { method: 'POST' });
+      if (res.status === 401) return;
       await refreshState();
-    } catch (err) {
+    } catch (err: any) {
       console.error('Scan trigger error:', err);
     } finally {
       setIsScanning(false);
@@ -262,7 +310,8 @@ export default function App() {
   const handleEmergencyStopConfirm = async () => {
     setModalLoading(true);
     try {
-      await fetch('/api/trading/emergency-stop', { method: 'POST' });
+      const res = await authFetch('/api/trading/emergency-stop', { method: 'POST' });
+      if (res.status === 401) return;
       setIsEmergencyStopped(true);
       setIsEmergencyStopModalOpen(false);
       await refreshState();
@@ -274,7 +323,8 @@ export default function App() {
   const handleResetPaperConfirm = async () => {
     setModalLoading(true);
     try {
-      await fetch('/api/wallet/reset-paper', { method: 'POST' });
+      const res = await authFetch('/api/wallet/reset-paper', { method: 'POST' });
+      if (res.status === 401) return;
       setIsResetPaperModalOpen(false);
       await refreshState();
     } finally {
@@ -286,7 +336,8 @@ export default function App() {
     if (!sellPositionTarget) return;
     setModalLoading(true);
     try {
-      const res = await fetch(`/api/positions/${sellPositionTarget.id}/sell`, { method: 'POST' });
+      const res = await authFetch(`/api/positions/${sellPositionTarget.id}/sell`, { method: 'POST' });
+      if (res.status === 401) return;
       const json = await res.json();
       if (!json.success) {
         alert(json.error || 'Failed to sell position');
@@ -300,29 +351,44 @@ export default function App() {
   };
 
   const handleSyncWallet = async () => {
-    await fetch('/api/wallet/sync', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode: settings.mode }),
-    });
-    await refreshState();
+    try {
+      const res = await authFetch('/api/wallet/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: settings.mode }),
+      });
+      if (res.status === 401) return;
+      await refreshState();
+    } catch (err: any) {
+      console.error('Sync wallet error:', err);
+    }
   };
 
   const handleConnectBinanceApi = async (apiKey: string, apiSecret: string) => {
-    const res = await fetch('/api/binance/connect', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ apiKey, apiSecret }),
-    });
-    const json = await res.json();
-    if (!json.success) throw new Error(json.error);
-    await refreshState();
+    try {
+      const res = await authFetch('/api/binance/connect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ apiKey, apiSecret }),
+      });
+      if (res.status === 401) return;
+      const json = await res.json();
+      if (!json.success) throw new Error(json.error);
+      await refreshState();
+    } catch (err: any) {
+      alert(err.message || 'Failed to connect Binance API');
+    }
   };
 
   const handleDisconnectBinanceApi = async () => {
     if (!confirm('Are you sure you want to remove your Binance Spot API credentials?')) return;
-    await fetch('/api/binance/disconnect', { method: 'POST' });
-    await refreshState();
+    try {
+      const res = await authFetch('/api/binance/disconnect', { method: 'POST' });
+      if (res.status === 401) return;
+      await refreshState();
+    } catch (err: any) {
+      console.error('Disconnect API error:', err);
+    }
   };
 
   const handleSelectSymbol = (symbol: string) => {
@@ -453,6 +519,7 @@ export default function App() {
           <SettingsView
             settings={settings}
             onUpdateSettings={handleUpdateSettings}
+            authFetch={authFetch}
           />
         )}
 
@@ -498,6 +565,12 @@ export default function App() {
         onConfirm={handleManualSellConfirm}
         position={sellPositionTarget}
         loading={modalLoading}
+      />
+
+      <AdminUnlockModal
+        isOpen={isAdminModalOpen}
+        onClose={() => setIsAdminModalOpen(false)}
+        onSuccess={handleLoginSuccess}
       />
     </div>
   );

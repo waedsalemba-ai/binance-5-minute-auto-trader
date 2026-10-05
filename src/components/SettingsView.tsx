@@ -1,17 +1,61 @@
-import React, { useState } from 'react';
-import { Sliders, Save, CheckCircle2, AlertTriangle, Shield, Info } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { Sliders, Save, CheckCircle2, AlertTriangle, Database, HardDrive, Download, RefreshCw } from 'lucide-react';
 import { TradingSettings } from '../types/index.ts';
 
 interface SettingsViewProps {
   settings: TradingSettings;
   onUpdateSettings: (newSettings: Partial<TradingSettings>) => Promise<void>;
+  authFetch?: (url: string, options?: RequestInit) => Promise<Response>;
 }
 
-export const SettingsView: React.FC<SettingsViewProps> = ({ settings, onUpdateSettings }) => {
+export const SettingsView: React.FC<SettingsViewProps> = ({ settings, onUpdateSettings, authFetch }) => {
   const [form, setForm] = useState<TradingSettings>({ ...settings });
   const [saving, setSaving] = useState(false);
   const [success, setSuccess] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Database stats state
+  const [dbStats, setDbStats] = useState<any>(null);
+  const [backingUp, setBackingUp] = useState(false);
+  const [backupMessage, setBackupMessage] = useState<string | null>(null);
+
+  const fetchDbStats = async () => {
+    try {
+      const res = await fetch('/api/db/stats');
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success) {
+          setDbStats(data.data);
+        }
+      }
+    } catch {
+      // Ignore background stats failure
+    }
+  };
+
+  useEffect(() => {
+    fetchDbStats();
+  }, []);
+
+  const handleBackup = async () => {
+    setBackingUp(true);
+    setBackupMessage(null);
+    try {
+      const fetcher = authFetch || fetch;
+      const res = await fetcher('/api/db/backup', { method: 'POST' });
+      const data = await res.json();
+      if (data.success) {
+        setBackupMessage(`Backup successfully created! Size: ${(data.data.sizeBytes / 1024).toFixed(1)} KB`);
+        fetchDbStats();
+      } else {
+        setBackupMessage(`Backup failed: ${data.error}`);
+      }
+    } catch (err: any) {
+      setBackupMessage(`Backup error: ${err.message}`);
+    } finally {
+      setBackingUp(false);
+    }
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -269,6 +313,89 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ settings, onUpdateSe
           </button>
         </div>
       </form>
+
+      {/* Database Storage & Persistence Health Card */}
+      <div className="bg-[#0f172a] border border-slate-800 rounded-2xl p-6 space-y-5">
+        <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+          <div className="flex items-center gap-2.5">
+            <div className="p-2 bg-amber-500/10 rounded-lg border border-amber-500/20 text-amber-400">
+              <Database className="w-5 h-5" />
+            </div>
+            <div>
+              <h3 className="text-sm font-bold text-slate-100">Server Database Storage & Persistence Health</h3>
+              <p className="text-xs text-slate-400">Crash-safe atomic storage engine with cold-restart rehydration.</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={fetchDbStats}
+              className="p-1.5 text-slate-400 hover:text-slate-200 bg-slate-900 border border-slate-800 rounded-lg transition-colors"
+              title="Refresh database stats"
+            >
+              <RefreshCw className="w-4 h-4" />
+            </button>
+            <button
+              onClick={handleBackup}
+              disabled={backingUp}
+              className="px-3 py-1.5 text-xs font-semibold text-slate-200 hover:text-white bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg transition-all flex items-center gap-1.5"
+            >
+              <Download className="w-3.5 h-3.5 text-amber-400" />
+              {backingUp ? 'Creating Backup...' : 'Backup Snapshot'}
+            </button>
+          </div>
+        </div>
+
+        {backupMessage && (
+          <div className="p-3 bg-slate-900 border border-slate-700 rounded-xl text-xs text-amber-300 flex items-center gap-2 font-mono">
+            <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+            <span>{backupMessage}</span>
+          </div>
+        )}
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4 text-xs font-mono">
+          <div className="bg-slate-900/80 border border-slate-800/80 p-3 rounded-xl">
+            <span className="text-[10px] text-slate-500 uppercase tracking-wider block">Storage Status</span>
+            <span className="text-emerald-400 font-bold flex items-center gap-1.5 mt-1">
+              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+              {dbStats?.isReady ? 'HEALTHY / READY' : 'INITIALIZING'}
+            </span>
+          </div>
+
+          <div className="bg-slate-900/80 border border-slate-800/80 p-3 rounded-xl">
+            <span className="text-[10px] text-slate-500 uppercase tracking-wider block">Open / Total Positions</span>
+            <span className="text-slate-100 font-bold text-sm mt-1 block">
+              {dbStats?.openPositionsCount ?? 0} <span className="text-slate-500 font-normal">/ {dbStats?.positionsCount ?? 0}</span>
+            </span>
+          </div>
+
+          <div className="bg-slate-900/80 border border-slate-800/80 p-3 rounded-xl">
+            <span className="text-[10px] text-slate-500 uppercase tracking-wider block">Trade & Order History</span>
+            <span className="text-slate-100 font-bold text-sm mt-1 block">
+              {dbStats?.tradesCount ?? 0} trades <span className="text-slate-500 font-normal">({dbStats?.ordersCount ?? 0} orders)</span>
+            </span>
+          </div>
+
+          <div className="bg-slate-900/80 border border-slate-800/80 p-3 rounded-xl">
+            <span className="text-[10px] text-slate-500 uppercase tracking-wider block">Database File Size</span>
+            <span className="text-slate-100 font-bold text-sm mt-1 block">
+              {dbStats?.fileSizeBytes ? `${(dbStats.fileSizeBytes / 1024).toFixed(1)} KB` : 'Active'}
+            </span>
+          </div>
+        </div>
+
+        <div className="bg-slate-900/60 border border-slate-800 p-4 rounded-xl space-y-2 text-xs">
+          <div className="flex items-center gap-2 text-slate-300 font-mono">
+            <HardDrive className="w-4 h-4 text-amber-400" />
+            <span className="font-semibold text-slate-200">Active Mount Directory:</span>
+            <span className="px-2 py-0.5 bg-slate-800 border border-slate-700 rounded text-amber-300 text-[11px]">
+              {dbStats?.dataDir || '/data'}
+            </span>
+          </div>
+          <p className="text-slate-400 text-[11px] leading-relaxed">
+            Persistent storage is enabled via <code className="text-amber-300">DATA_DIR</code>. When deploying on Render or Docker, mount a Persistent Disk at <code className="text-amber-300">/data</code> to guarantee that all trade logs, open positions, and account balances survive container redeployments and restarts without loss.
+          </p>
+        </div>
+      </div>
     </div>
   );
 };

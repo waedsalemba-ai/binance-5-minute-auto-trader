@@ -12,6 +12,8 @@ import {
   TradingSettings,
   WalletBalance,
   Position,
+  Order,
+  Trade,
   SymbolFilterRules,
 } from '../src/types/index.ts';
 import {
@@ -21,6 +23,13 @@ import {
   evaluateExitDecision,
 } from '../src/server/exit-decision-engine.ts';
 import { evaluateEntryEligibility } from '../src/server/entry-decision-engine.ts';
+import {
+  verifyAdminToken,
+  verifyAdminSessionToken,
+  createAdminSessionToken,
+  encryptSecret,
+  decryptSecret,
+} from '../src/server/security.ts';
 
 function createMockCandles(count = 60, startPrice = 100, trend = 'up'): Candle[] {
   const candles: Candle[] = [];
@@ -127,6 +136,7 @@ async function runAllTests() {
   // -------------------------------------------------------------
   console.log('\n3. Fixed Trade Amount Invariant Rules:');
   test('Fixed trade amount invariant: BUY must equal configuredFixedTradeAmount', () => {
+    Storage.resetPaperAccount();
     const defaultSettings: TradingSettings = {
       mode: 'PAPER',
       autoTrading: true,
@@ -790,6 +800,284 @@ async function runAllTests() {
 
     assert.strictEqual(decision.eligible, false, 'Emergency stop must block all BUYs');
     assert.ok(decision.reason.includes('Emergency stop'));
+  });
+
+  // -------------------------------------------------------------
+  // 11. Production Security, Authentication & Session Verification
+  // -------------------------------------------------------------
+  console.log('\n11. Production Security & Authentication Verification:');
+
+  test('AUTH TEST 1: Admin token validation and timing-safe comparison', () => {
+    const originalEnvToken = process.env.ADMIN_TOKEN;
+    const originalAccessToken = process.env.ADMIN_ACCESS_TOKEN;
+    try {
+      delete process.env.ADMIN_ACCESS_TOKEN;
+      process.env.ADMIN_TOKEN = 'secret_production_admin_token_xyz987';
+      assert.strictEqual(verifyAdminToken('secret_production_admin_token_xyz987'), true);
+      assert.strictEqual(verifyAdminToken('wrong_token'), false);
+      assert.strictEqual(verifyAdminToken(''), false);
+    } finally {
+      process.env.ADMIN_TOKEN = originalEnvToken;
+      process.env.ADMIN_ACCESS_TOKEN = originalAccessToken;
+    }
+  });
+
+  test('AUTH TEST 2: HMAC Session token issuance, verification, and tamper resistance', () => {
+    const sessionToken = createAdminSessionToken();
+    assert.ok(typeof sessionToken === 'string' && sessionToken.includes('.'));
+    assert.strictEqual(verifyAdminSessionToken(sessionToken), true);
+
+    // Tampered token must fail
+    const tampered = sessionToken + 'tamper';
+    assert.strictEqual(verifyAdminSessionToken(tampered), false);
+
+    // Empty or corrupted tokens must fail
+    assert.strictEqual(verifyAdminSessionToken(''), false);
+    assert.strictEqual(verifyAdminSessionToken('corrupt.payload'), false);
+  });
+
+  test('AUTH TEST 3: AES-256-GCM Credential encryption and roundtrip decryption at rest', () => {
+    const secretApiKey = 'my_binance_secret_key_1234567890abcdef';
+    const encrypted = encryptSecret(secretApiKey);
+    assert.ok(encrypted.iv && encrypted.tag && encrypted.data);
+    assert.notStrictEqual(encrypted.data, secretApiKey);
+
+    const decrypted = decryptSecret(encrypted);
+    assert.strictEqual(decrypted, secretApiKey);
+  });
+
+  // -------------------------------------------------------------
+  // 12. Persistent Storage & Crash-Safe Flush
+  // -------------------------------------------------------------
+  console.log('\n12. Persistent Storage & Cold Restart Verification:');
+
+  test('PERSISTENCE TEST 1: Storage flush writes synchronously and verifies DB readiness', () => {
+    Storage.flush();
+    assert.strictEqual(Storage.isReady(), true);
+    assert.ok(Storage.getDataDir().length > 0);
+    const stats = Storage.getDatabaseStats();
+    assert.ok(stats.fileSizeBytes > 0);
+  });
+
+  test('PERSISTENCE TEST 2: Trade, open position, custom wallet balance, settings & emergency stop survive simulated cold server restart', () => {
+    const testPositionId = `POS-PERSIST-${Date.now()}`;
+    const testOrderId = `ORD-PERSIST-${Date.now()}`;
+    const testTradeId = `TRD-PERSIST-${Date.now()}`;
+
+    // 1. Create and save active position
+    const samplePosition: Position = {
+      id: testPositionId,
+      accountId: 'paper-default',
+      symbol: 'SOLUSDT',
+      mode: 'PAPER',
+      status: 'OPEN',
+      entryPrice: 155.50,
+      quantity: 1.5,
+      remainingQuantity: 1.5,
+      entryQuoteAmount: 233.25,
+      entryFees: 0.233,
+      entryScore: 84,
+      entryState: 'STRONG_BULLISH',
+      entryReason: 'Strong Bullish Auto Entry',
+      currentPrice: 158.20,
+      currentScore: 84,
+      currentState: 'STRONG_BULLISH',
+      grossPnL: 4.05,
+      unrealizedPnL: 4.05,
+      unrealizedPnLPercent: 1.74,
+      estimatedNetPnL: 3.58,
+      estimatedNetPnLPercent: 1.53,
+      breakEvenPrice: 155.81,
+      takeProfitPrice: 158.92,
+      stopLossPrice: 150.83,
+      openedAt: Date.now() - 60000,
+      updatedAt: Date.now(),
+      entryOrderId: testOrderId,
+    };
+    Storage.savePosition(samplePosition);
+
+    // 2. Save order
+    const sampleOrder: Order = {
+      id: testOrderId,
+      clientOrderId: `CLIENT-${testOrderId}`,
+      accountId: 'paper-default',
+      mode: 'PAPER',
+      symbol: 'SOLUSDT',
+      side: 'BUY',
+      status: 'FILLED',
+      requestedQuoteAmount: 233.25,
+      executedQuantity: 1.5,
+      executedQuoteAmount: 233.25,
+      executionPrice: 155.50,
+      fee: 0.233,
+      feeAsset: 'USDT',
+      reason: 'Strong Bullish Auto Entry',
+      strategyState: 'STRONG_BULLISH',
+      technicalScore: 84,
+      createdAt: Date.now() - 60000,
+      updatedAt: Date.now() - 60000,
+      fills: [{ price: 155.50, qty: 1.5, commission: 0.233, commissionAsset: 'USDT', tradeId: 99991 }],
+    };
+    Storage.saveOrder(sampleOrder);
+
+    // 3. Save trade
+    const sampleTrade: Trade = {
+      id: testTradeId,
+      accountId: 'paper-default',
+      entryOrderId: testOrderId,
+      exitOrderId: 'ORD-EXIT-TEST',
+      symbol: 'SOLUSDT',
+      mode: 'PAPER',
+      entryPrice: 155.50,
+      exitPrice: 158.20,
+      quantity: 1.5,
+      entryQuoteAmount: 233.25,
+      exitQuoteAmount: 237.30,
+      entryFees: 0.233,
+      exitFees: 0.237,
+      grossPnL: 4.05,
+      netPnL: 3.58,
+      netPnLPercent: 1.53,
+      entryScore: 84,
+      exitScore: 84,
+      entryReason: 'Strong Bullish Auto Entry',
+      exitReason: 'Test Target Exit',
+      openedAt: Date.now() - 60000,
+      closedAt: Date.now(),
+      durationMs: 60000,
+    };
+    Storage.saveTrade(sampleTrade);
+
+    // 4. Update wallet balance with custom non-default amount
+    const customWallet: WalletBalance = {
+      mode: 'PAPER',
+      usdtAvailable: 766.52,
+      usdtLocked: 233.25,
+      usdtTotal: 999.77,
+      accountAssetValue: 237.30,
+      totalEquity: 1003.82,
+      startingBalance: 1000,
+      realizedPnL: 12.50,
+      unrealizedPnL: 3.58,
+      totalFeesPaid: 0.233,
+      assets: [{ asset: 'SOL', symbol: 'SOLUSDT', free: 1.5, locked: 0, total: 1.5, price: 158.20, valueUsdt: 237.30, isExternal: false }],
+      lastReconciledAt: Date.now(),
+      reconciliationStatus: 'OK',
+    };
+    Storage.saveWallet(customWallet);
+
+    // 5. Update settings and emergency stop
+    Storage.updateSettings({ fixedTradeAmount: 250, takeProfitPercent: 3.5 });
+    Storage.setEmergencyStopped(true);
+
+    // 6. Flush atomically to disk
+    Storage.flush();
+
+    // 7. SIMULATE COLD SERVER REBOOT / CONTAINER RESTART: reload fresh from disk
+    Storage.reloadFromDisk();
+
+    // 8. VERIFY all state is 100% preserved
+    const reloadedPosition = Storage.getPositionById(testPositionId);
+    assert.ok(reloadedPosition, 'Saved position must survive server reboot');
+    assert.strictEqual(reloadedPosition.symbol, 'SOLUSDT');
+    assert.strictEqual(reloadedPosition.status, 'OPEN');
+    assert.strictEqual(reloadedPosition.entryPrice, 155.50);
+    assert.strictEqual(reloadedPosition.quantity, 1.5);
+    assert.strictEqual(reloadedPosition.estimatedNetPnLPercent, 1.53);
+
+    const reloadedOrder = Storage.getOrderById(testOrderId);
+    assert.ok(reloadedOrder, 'Saved order must survive server reboot');
+    assert.strictEqual(reloadedOrder.executedQuantity, 1.5);
+
+    const reloadedTrades = Storage.getTrades('PAPER', 'SOLUSDT');
+    const matchedTrade = reloadedTrades.find(t => t.id === testTradeId);
+    assert.ok(matchedTrade, 'Saved trade history must survive server reboot');
+    assert.strictEqual(matchedTrade.entryQuoteAmount, 233.25);
+
+    const reloadedWallet = Storage.getWallet('PAPER');
+    assert.strictEqual(reloadedWallet.usdtAvailable, 766.52, 'Paper balance must NOT be reset on reboot');
+    assert.strictEqual(reloadedWallet.totalEquity, 1003.82);
+    assert.strictEqual(reloadedWallet.realizedPnL, 12.50);
+
+    const reloadedSettings = Storage.getSettings();
+    assert.strictEqual(reloadedSettings.fixedTradeAmount, 250, 'Settings must survive server reboot');
+    assert.strictEqual(reloadedSettings.takeProfitPercent, 3.5);
+
+    assert.strictEqual(Storage.isEmergencyStopped(), true, 'Emergency stop state must survive server reboot');
+
+    // Clean up test emergency stop state
+    Storage.setEmergencyStopped(false);
+    Storage.flush();
+  });
+
+  test('PERSISTENCE TEST 3: Database backup snapshot generation', () => {
+    const backup = Storage.backupDatabase();
+    assert.strictEqual(backup.success, true);
+    assert.ok(backup.sizeBytes > 0);
+    assert.ok(backup.backupPath.includes('database-backup'));
+  });
+
+  // -------------------------------------------------------------
+  // 13. Live Trading Safety Guard (LIVE_TRADING_ENABLED)
+  // -------------------------------------------------------------
+  console.log('\n13. Live Trading Execution Guard Verification:');
+
+  test('GUARD TEST 1: REAL order execution is strictly blocked when LIVE_TRADING_ENABLED != true', () => {
+    const originalLiveTradingEnv = process.env.LIVE_TRADING_ENABLED;
+    try {
+      process.env.LIVE_TRADING_ENABLED = 'false';
+
+      const filter: SymbolFilterRules = {
+        minNotional: 5,
+        minQty: 0.0001,
+        maxQty: 999999,
+        stepSize: 0.0001,
+        tickSize: 0.01,
+        minPrice: 0.01,
+        maxPrice: 1000000,
+      };
+
+      const realWallet: WalletBalance = {
+        mode: 'REAL',
+        usdtAvailable: 500,
+        usdtLocked: 0,
+        usdtTotal: 500,
+        accountAssetValue: 0,
+        totalEquity: 500,
+        startingBalance: 0,
+        realizedPnL: 0,
+        unrealizedPnL: 0,
+        totalFeesPaid: 0,
+        assets: [],
+        lastReconciledAt: Date.now(),
+        reconciliationStatus: 'OK',
+      };
+
+      const safetyResult = SafetyGate.validateBuy(
+        {
+          symbol: 'BTCUSDT',
+          side: 'BUY',
+          quoteAmount: 100,
+          reason: 'Test Real Buy',
+          strategyState: 'STRONG_BULLISH',
+          technicalScore: 90,
+          clientOrderId: 'test-guard-1',
+        },
+        'REAL',
+        { ...baseSettings, autoTrading: true, fixedTradeAmount: 100 },
+        realWallet,
+        [],
+        filter,
+        50000,
+        false
+      );
+
+      assert.strictEqual(safetyResult.allowed, false);
+      assert.strictEqual(safetyResult.code, 'LIVE_TRADING_DISABLED_BY_CONFIG');
+      assert.ok(safetyResult.reason?.includes('LIVE_TRADING_ENABLED'));
+    } finally {
+      process.env.LIVE_TRADING_ENABLED = originalLiveTradingEnv;
+    }
   });
 
   console.log(`\n==============================================`);

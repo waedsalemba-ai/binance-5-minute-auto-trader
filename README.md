@@ -1,131 +1,140 @@
-# Binance 5-Minute Crypto Scanner & Auto Trader
+# Binance 5-Minute Crypto Scanner & 24/7 Auto Trader (Production Web Application)
 
-A production-structured web application combining Binance Spot market scanning, multi-timeframe technical indicator analysis, automatic PRE_BULLISH entry and WEAKENING exit strategy execution, persistent Paper Trading wallet, and live Binance Spot auto-trading with strict risk safety controls.
-
----
-
-## 🌟 Key Features
-
-1. **Binance Spot Market Scanner**
-   - Continuously scans active, liquid USDT pairs on Binance every 5 minutes.
-   - Computes closed 5m, 15m, 1h, and 4h candles.
-2. **Complete Technical Indicators Suite**
-   - EMA (9, 21, 50, 200) & SMA (20, 50, 200)
-   - RSI (14 with Wilder smoothing)
-   - MACD (12, 26, 9)
-   - Bollinger Bands (20, 2)
-   - ATR (14) & VWAP
-   - Volume SMA (20) & Volume Ratio
-3. **Candlestick Patterns & Market Structure**
-   - Detects Doji, Hammer, Inverted Hammer, Shooting Star, Bullish/Bearish Engulfing, Harami, Morning Star, Evening Star, Three White Soldiers, Three Black Crows.
-   - Evaluates Swing Highs/Lows, Support & Resistance clusters, Higher Highs/Higher Lows, and Breakout/Breakdown states.
-4. **Deterministic 0–100 Technical Setup Score**
-   - Multi-timeframe trend alignment, momentum, volume ratio, EMA stacks, RSI context, MACD structure, market structure, candle patterns, and breakout volatility.
-5. **Fixed Trade Amount Invariant (`requestedQuoteAmount === currentFixedTradeAmount`)**
-   - Every single new automated BUY strictly utilizes your exact configured fixed USDT amount (e.g. `100.00 USDT`).
-   - Sizing never scales dynamically with wallet growth, compounding, or losses.
-6. **Isolated Paper & Real Trading Engines**
-   - **Paper Mode**: Real Binance market prices + configurable slippage (5 bps) + 0.1% fees, starting with a persistent 1000 USDT paper wallet.
-   - **Real Mode**: Connects to Binance Spot via encrypted API keys (AES-256-GCM at rest), placing real market orders with lot size and min notional checks.
-   - Paper data, positions, orders, and ledger remain completely isolated from Real Binance data.
-7. **Risk Safety Gate & Emergency Stop**
-   - Server-enforced safety checks before every buy/sell: reserve preservation, max position limit (default 5), 30m symbol re-entry cooldown, clock drift sync, and duplicate order prevention.
-   - Emergency Stop halts automatic trading instantly without liquidating existing holdings.
-8. **Wallet Reconciliation & External Holdings Protection**
-   - Mismatches trigger automatic auto-trading pause.
-   - Pre-existing cryptocurrency balances on Binance are tagged as `EXTERNAL HOLDINGS` and never automatically liquidated.
+A hardened, 24/7 production web application combining Binance Spot market scanning, multi-timeframe technical indicator analysis, centralized bullish entry execution (`PRE_BULLISH` & `STRONG_BULLISH`), authoritative Net PnL exit architecture (`Take-Profit`, `Stop-Loss`, and `Technical Profit Exit`), persistent Paper Trading wallet, and live Binance Spot auto-trading with server-side security.
 
 ---
 
-## 🛠️ Architecture
+## 🌟 Production Architecture (24/7 Server-Authoritative)
 
 ```text
-React SPA (Vite + Tailwind CSS + Canvas Charts)
-       │
-       ▼  REST API + Server-Sent Events (SSE)
-Express Node.js Backend (server.ts)
-       │
-       ├── AutoTradingEngine (5m scheduler & scan loop)
-       ├── StrategyEngine (Multi-timeframe scoring & state transitions)
-       ├── SafetyGate (Server-side risk & invariant verification)
-       ├── PaperTradingExecutor (Simulated ledger against live Binance data)
-       ├── RealBinanceTradingExecutor (Signed Binance Spot REST API)
-       ├── BinanceRequestManager (Rate limiter, concurrency queue, backoff)
-       └── Storage (Thread-safe JSON atomic persistence & AES-256-GCM encryption)
+                    INTERNET
+                       │
+                       ▼  HTTPS / TLS
+              React/Vite Frontend (SPA Dashboard)
+                       │
+                       │  REST API + Server-Sent Events (SSE)
+                       ▼
+             Node.js / Express Server (server.ts)
+                       │
+       ┌───────────────┼───────────────┐
+       ▼               ▼               ▼
+ 2m Scanner      Trading Engine  Position Engine
+       │               │               │
+       └───────────────┼───────────────┘
+                       │
+                       ▼
+                Binance Spot API
+                       │
+                       ▼
+            Persistent Storage (/data)
+           ├── database.json (atomic)
+           └── master.key (0600 mode)
 ```
+
+The browser acts **strictly as an administrative dashboard**. Closing the browser, turning off your computer, or disconnecting does **NOT** interrupt market scanning, automated entry execution, TP/SL monitoring, or trade tracking.
 
 ---
 
-## ⚙️ Environment Variables
+## 🚀 Render 24/7 Deployment Step-by-Step Guide
 
-Copy `.env.example` to `.env` or configure the following variables:
+### Step 1: Push Code to GitHub
+Ensure all files including `render.yaml`, `package.json`, and source code are committed to your GitHub repository.
 
+### Step 2: Create a Web Service on Render
+1. Log in to your [Render Dashboard](https://dashboard.render.com).
+2. Click **New +** and select **Web Service**.
+3. Connect your GitHub repository containing this project.
+
+### Step 3: Configure Build & Start Commands
+- **Runtime**: `Node`
+- **Build Command**: `npm install && npm run build`
+- **Start Command**: `npm start`
+- **Health Check Path**: `/health`
+
+### Step 4: Attach a Persistent Disk
+1. In your Render Web Service settings, scroll down to **Disks**.
+2. Click **Add Disk**.
+3. Set:
+   - **Name**: `trader-data`
+   - **Mount Path**: `/data`
+   - **Size**: `1 GB` (Standard)
+
+### Step 5: Configure Environment Variables
+In the **Environment** tab, set:
 ```bash
-# Server & Runtime
-PORT=3000
 NODE_ENV=production
+PORT=10000
+DATA_DIR=/data
+APP_ORIGIN=https://YOUR-APP.onrender.com
+ALLOWED_ORIGINS=https://YOUR-APP.onrender.com
 
-# Binance API Base URL
-BINANCE_API_BASE_URL=https://api.binance.com
+# Administrative Auth & Encryption
+ADMIN_TOKEN=GENERATE_A_LONG_RANDOM_SECRET_KEY
+CREDENTIAL_ENCRYPTION_KEY=GENERATE_32_BYTE_HEX_OR_PASSPHRASE
 
-# 5-Minute Scanner Settings
-SCAN_INTERVAL_MS=300000
-DEFAULT_INTERVAL=5m
-MAX_SYMBOLS_PER_SCAN=100
-MIN_24H_VOLUME=1000000
-CANDLE_LIMIT=250
-REQUEST_CONCURRENCY=8
+# Live Trading Protection Guard (Default: false)
+LIVE_TRADING_ENABLED=false
 
-# Paper Trading Defaults
-PAPER_STARTING_BALANCE=1000
-PAPER_FEE_RATE=0.001
-PAPER_SLIPPAGE_BPS=5
+# Exit Architecture Parameters
+TAKE_PROFIT_PERCENT=2.0
+STOP_LOSS_PERCENT=3.0
+MIN_PROFIT_TO_TECHNICAL_EXIT_PERCENT=0.20
+MAX_EXIT_PRICE_AGE_MS=5000
 
-# Fixed Trade Sizing & Risk Controls
-DEFAULT_FIXED_TRADE_AMOUNT=100
-MAX_TRADE_AMOUNT=10000
-MAX_OPEN_POSITIONS=5
-MIN_USDT_RESERVE=100
-SYMBOL_COOLDOWN_MINUTES=30
-
-# Strategy Thresholds
+# Strategy Entry Parameters
 PRE_BULLISH_SCORE_MIN=65
 STRONG_BULLISH_SCORE_MIN=80
 WEAKENING_THRESHOLD=70
-
-# Security (AES-256-GCM key derivation)
-CREDENTIAL_ENCRYPTION_KEY=
 ```
+
+### Step 6: Deploy & Verify
+1. Click **Create Web Service** / **Deploy**.
+2. Test the public health endpoint:
+   ```bash
+   curl https://YOUR-APP.onrender.com/health
+   ```
+   Response: `{"status":"ok","service":"binance-5-minute-auto-trader","timestamp":"..."}`
+3. Test the readiness endpoint:
+   ```bash
+   curl https://YOUR-APP.onrender.com/ready
+   ```
+   Response: `{"ready":true,"server":true,"storage":true,"scanner":true,...}`
+4. Open `https://YOUR-APP.onrender.com` in your browser.
+5. Verify Paper Trading mode operations, scanning, and order triggers.
+6. Restart the Render Web Service and verify that positions, trade history, paper wallet, and settings are 100% preserved.
 
 ---
 
-## 🚀 Getting Started
+## 🔒 Security Architecture & Guarantees
 
-### Development
-```bash
-npm install
-npm run dev
-```
+1. **Zero Secret Exposure**:
+   - `ADMIN_TOKEN`, `BINANCE_API_SECRET`, and `CREDENTIAL_ENCRYPTION_KEY` never leak into frontend bundles, HTML, URL parameters, SSE logs, or client state.
+2. **Restricted CORS & Security Headers**:
+   - Strict origin validation in production matching `ALLOWED_ORIGINS`.
+   - `X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN`, `Referrer-Policy`.
+3. **Live Trading Guard (`LIVE_TRADING_ENABLED`)**:
+   - Live trading requires `LIVE_TRADING_ENABLED=true` in server environment variables.
+   - Any attempt to submit real Binance orders while `LIVE_TRADING_ENABLED != true` is rejected by both `SafetyGate` and `RealBinanceTradingExecutor`.
+4. **Crash-Safe Atomic Storage**:
+   - Database writes are executed via temporary files, disk fsync (`fs.fsyncSync`), and atomic file renames to prevent corruption during unexpected shutdowns.
 
-### Running Automated Tests
+---
+
+## 📊 Exit Engine & Risk Rules
+
+| Rule | Trigger Condition | Resulting Action |
+|---|---|---|
+| **Take-Profit (TP)** | Net PnL $\ge$ `TAKE_PROFIT_PERCENT` (+2.0%) | **SELL** (Full profit locked) |
+| **Stop-Loss (SL)** | Net PnL $\le$ `-STOP_LOSS_PERCENT` (-3.0%) | **SELL** (Loss capped) |
+| **Technical Weakening (Profitable)** | State `WEAKENING`/`EXIT` & Net PnL $\ge$ `+0.20%` | **SELL** (Technical Profit Exit) |
+| **Technical Weakening (Losing)** | State `WEAKENING`/`EXIT` & Net PnL $<$ `+0.20%` | **HOLD** (Never sell at a loss) |
+| **Emergency Stop** | User triggered | **HALT** all automated buying |
+
+---
+
+## 🧪 Automated Test Suite
+
+Run the full automated test suite covering all indicators, entry engine, exit architecture, storage, and authentication contracts:
 ```bash
 npm test
 ```
-
-### Production Build & Run
-```bash
-npm run build
-npm start
-```
-
----
-
-## 🔐 Binance API Security Guidelines
-
-1. In Binance API Management, create an API Key.
-2. Enable permissions:
-   - **Enable Reading**
-   - **Enable Spot & Margin Trading**
-3. **DO NOT enable Withdrawals** (the application requires only Spot trading permissions and will show a prominent security warning if withdrawal is enabled).
-4. Restrict IP access to your server's trusted static IP when hosting in production.
-5. All credentials saved via the application are encrypted at rest using authenticated **AES-256-GCM** encryption. Secrets are never exposed to the frontend browser runtime or log outputs.

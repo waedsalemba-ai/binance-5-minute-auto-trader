@@ -15,7 +15,6 @@ import {
   RotateCcw,
 } from 'lucide-react';
 import { TradingMode } from '../types/index.ts';
-import { FirebaseAuthButton } from './FirebaseAuthButton.tsx';
 
 interface NavbarProps {
   currentTab: string;
@@ -146,9 +145,6 @@ export const Navbar: React.FC<NavbarProps> = ({
               <ShieldAlert className="w-4 h-4" />
               <span className="hidden sm:inline">EMERGENCY STOP</span>
             </button>
-
-            {/* Firebase Auth Account Button */}
-            <FirebaseAuthButton />
           </div>
         </div>
 

@@ -65,11 +65,11 @@ export class AutoTradingEngine {
   }
 
   public isEmergencyStopActive(): boolean {
-    return this.isEmergencyStopped;
+    return Storage.isEmergencyStopped();
   }
 
   public setEmergencyStop(active: boolean): void {
-    this.isEmergencyStopped = active;
+    Storage.setEmergencyStopped(active);
     if (active) {
       // Turn off auto-trading in settings
       Storage.updateSettings({ autoTrading: false });
@@ -85,7 +85,7 @@ export class AutoTradingEngine {
         'Emergency stop cleared by user.'
       );
     }
-    this.broadcast('emergency_stop_changed', { isEmergencyStopped: this.isEmergencyStopped });
+    this.broadcast('emergency_stop_changed', { isEmergencyStopped: active });
   }
 
   public startScheduler(): void {
@@ -505,7 +505,7 @@ export class AutoTradingEngine {
       strategyState: analysis.strategyState,
       technicalScore: analysis.score,
       settings,
-      isEmergencyStopped: this.isEmergencyStopped,
+      isEmergencyStopped: this.isEmergencyStopActive(),
     });
 
     // 3. Update Position state with enriched metrics
@@ -562,7 +562,7 @@ export class AutoTradingEngine {
         orderRequest,
         position,
         mode,
-        this.isEmergencyStopped
+        this.isEmergencyStopActive()
       );
 
       if (!safetyResult.allowed) {
@@ -590,7 +590,7 @@ export class AutoTradingEngine {
             strategyState: analysis.strategyState,
             technicalScore: analysis.score,
             settings,
-            isEmergencyStopped: this.isEmergencyStopped,
+            isEmergencyStopped: this.isEmergencyStopActive(),
           });
 
           if (!reCheckDecision.shouldSell) {

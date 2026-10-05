@@ -3,27 +3,40 @@ services:
     name: binance-5-minute-auto-trader
     env: node
     plan: starter
+    region: oregon
     buildCommand: npm install && npm run build
     startCommand: npm start
     healthCheckPath: /health
     disk:
-      name: trading-data
-      mountPath: /var/data
+      name: trader-data
+      mountPath: /data
       sizeGB: 1
     envVars:
       - key: NODE_ENV
         value: production
+      - key: PORT
+        value: 10000
       - key: DATA_DIR
-        value: /var/data
-      - key: SCAN_INTERVAL_MS
-        value: "300000"
-      - key: CREDENTIAL_ENCRYPTION_KEY
-        generateValue: true
+        value: /data
+      - key: LIVE_TRADING_ENABLED
+        value: "false"
+      - key: TAKE_PROFIT_PERCENT
+        value: "2.0"
+      - key: STOP_LOSS_PERCENT
+        value: "3.0"
+      - key: MIN_PROFIT_TO_TECHNICAL_EXIT_PERCENT
+        value: "0.20"
+      - key: MAX_EXIT_PRICE_AGE_MS
+        value: "5000"
+      - key: PRE_BULLISH_SCORE_MIN
+        value: "65"
+      - key: STRONG_BULLISH_SCORE_MIN
+        value: "80"
+      - key: WEAKENING_THRESHOLD
+        value: "70"
       - key: ADMIN_TOKEN
         generateValue: true
-      - key: BINANCE_API_KEY
-        sync: false
-      - key: BINANCE_API_SECRET
-        sync: false
-      - key: APP_ORIGIN
-        sync: false
+      - key: CREDENTIAL_ENCRYPTION_KEY
+        generateValue: true
+      - key: BINANCE_API_BASE_URL
+        value: https://api.binance.com

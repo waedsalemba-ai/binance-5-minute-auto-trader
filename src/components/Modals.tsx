@@ -10,12 +10,7 @@ interface ModalProps {
 }
 
 export const SwitchToRealModal: React.FC<ModalProps> = ({ isOpen, onClose, onConfirm, loading }) => {
-  const [confirmationInput, setConfirmationInput] = useState('');
-  const REQUIRED_PHRASE = 'I UNDERSTAND THIS USES REAL BINANCE FUNDS';
-  const isPhraseValid = confirmationInput.trim() === REQUIRED_PHRASE;
-
   if (!isOpen) return null;
-
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
       <div className="relative w-full max-w-lg bg-[#0f172a] border-2 border-amber-500/50 rounded-2xl p-6 shadow-2xl">
@@ -33,27 +28,14 @@ export const SwitchToRealModal: React.FC<ModalProps> = ({ isOpen, onClose, onCon
           </div>
         </div>
 
-        <div className="space-y-3 text-sm text-slate-300 mb-4 bg-slate-900/60 p-4 rounded-xl border border-slate-800">
-          <p className="text-amber-300 font-semibold">⚠️ Mandatory Security Verification:</p>
+        <div className="space-y-3 text-sm text-slate-300 mb-6 bg-slate-900/60 p-4 rounded-xl border border-slate-800">
+          <p className="text-amber-300 font-semibold">⚠️ Important Notice:</p>
           <ul className="list-disc list-inside space-y-1.5 text-xs text-slate-300">
             <li>Future automatic BUY and SELL orders will execute on your real Binance Spot account using <strong>real USDT</strong>.</li>
             <li>Paper balances and open paper positions will <strong>NOT</strong> be transferred to real trading.</li>
             <li>Each new BUY will strictly use your configured fixed trade amount.</li>
-            <li>Existing Binance assets are isolated and protected from auto-liquidation.</li>
+            <li>Ensure you have validated your Binance API credentials and set appropriate risk parameters.</li>
           </ul>
-        </div>
-
-        <div className="mb-6 space-y-2">
-          <label className="text-xs text-slate-400 block">
-            Type <strong className="text-amber-400 font-mono select-all">I UNDERSTAND THIS USES REAL BINANCE FUNDS</strong> below to unlock:
-          </label>
-          <input
-            type="text"
-            value={confirmationInput}
-            onChange={e => setConfirmationInput(e.target.value)}
-            placeholder="Type confirmation phrase..."
-            className="w-full px-3.5 py-2 bg-slate-950 border border-slate-700 rounded-xl text-xs font-mono text-amber-300 focus:outline-none focus:border-amber-500"
-          />
         </div>
 
         <div className="flex items-center justify-end gap-3">
@@ -65,17 +47,9 @@ export const SwitchToRealModal: React.FC<ModalProps> = ({ isOpen, onClose, onCon
             Cancel
           </button>
           <button
-            onClick={() => {
-              if (isPhraseValid) {
-                onConfirm();
-              }
-            }}
-            disabled={loading || !isPhraseValid}
-            className={`px-5 py-2 text-sm font-bold rounded-lg transition-all flex items-center gap-2 ${
-              isPhraseValid
-                ? 'text-slate-900 bg-amber-400 hover:bg-amber-300 shadow-lg shadow-amber-500/20'
-                : 'text-slate-500 bg-slate-800 cursor-not-allowed border border-slate-700'
-            }`}
+            onClick={onConfirm}
+            disabled={loading}
+            className="px-5 py-2 text-sm font-bold text-slate-900 bg-amber-400 hover:bg-amber-300 rounded-lg shadow-lg shadow-amber-500/20 transition-all flex items-center gap-2"
           >
             {loading ? 'Switching...' : 'Yes, Switch to REAL Mode'}
           </button>
@@ -147,7 +121,7 @@ export const EmergencyStopModal: React.FC<ModalProps> = ({ isOpen, onClose, onCo
         </div>
 
         <p className="text-sm text-slate-200 mb-6">
-          This will immediately stop all automatic trading, lock all future BUY executions in persistent storage, and pause the safety gate.
+          This will immediately stop all automatic trading, cancel queued buy/sell executions, and lock the safety gate.
           <br /><br />
           <span className="text-xs text-rose-300 font-semibold">
             Existing Binance Spot positions will remain safely on Binance and will NOT be market dumped.
@@ -168,45 +142,6 @@ export const EmergencyStopModal: React.FC<ModalProps> = ({ isOpen, onClose, onCo
           >
             <Power className="w-4 h-4" />
             {loading ? 'Halting...' : 'CONFIRM EMERGENCY STOP'}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-};
-
-export const ResetEmergencyStopModal: React.FC<ModalProps> = ({ isOpen, onClose, onConfirm, loading }) => {
-  if (!isOpen) return null;
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
-      <div className="relative w-full max-w-md bg-[#0f172a] border border-emerald-500/50 rounded-2xl p-6 shadow-2xl">
-        <div className="flex items-center gap-3 text-emerald-400 mb-4">
-          <div className="p-3 bg-emerald-500/10 rounded-xl border border-emerald-500/30">
-            <CheckCircle2 className="w-7 h-7" />
-          </div>
-          <div>
-            <h3 className="text-lg font-bold text-slate-100">Reset Emergency Stop</h3>
-            <span className="text-xs text-emerald-400 font-mono">Unlock Safety Gate</span>
-          </div>
-        </div>
-
-        <p className="text-sm text-slate-300 mb-6">
-          Are you sure you want to reset the Emergency Stop? This will unlock the safety gate and allow you to resume automated trading when ready.
-        </p>
-
-        <div className="flex items-center justify-end gap-3">
-          <button
-            onClick={onClose}
-            className="px-4 py-2 text-sm font-medium text-slate-400 hover:text-slate-200 bg-slate-800 rounded-lg"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={onConfirm}
-            disabled={loading}
-            className="px-5 py-2 text-sm font-bold text-slate-900 bg-emerald-400 hover:bg-emerald-300 rounded-lg shadow-lg shadow-emerald-500/20"
-          >
-            {loading ? 'Resetting...' : 'Yes, Reset Emergency Stop'}
           </button>
         </div>
       </div>
@@ -325,7 +260,7 @@ export const ManualSellModal: React.FC<ManualSellModalProps> = ({ isOpen, onClos
 
         {isReal && (
           <p className="text-xs text-amber-400 font-semibold mb-6">
-            ⚠️ This will submit an immediate live MARKET SELL order to Binance Spot subject to central SafetyGate validation.
+            ⚠️ This will submit an immediate live MARKET SELL order to Binance Spot.
           </p>
         )}
 
@@ -348,3 +283,107 @@ export const ManualSellModal: React.FC<ManualSellModalProps> = ({ isOpen, onClos
     </div>
   );
 };
+
+interface AdminUnlockModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  onSuccess: (token: string) => void;
+}
+
+export const AdminUnlockModal: React.FC<AdminUnlockModalProps> = ({ isOpen, onClose, onSuccess }) => {
+  const [tokenInput, setTokenInput] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  if (!isOpen) return null;
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!tokenInput.trim()) {
+      setError('Please enter your Admin Access Token.');
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ adminToken: tokenInput.trim() }),
+      });
+      const data = await res.json();
+      if (data.success && data.token) {
+        onSuccess(data.token);
+        onClose();
+      } else {
+        setError(data.error || 'Authentication failed.');
+      }
+    } catch (err: any) {
+      setError(err.message || 'Network error during login.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 backdrop-blur-md p-4">
+      <div className="relative w-full max-w-md bg-[#0f172a] border border-slate-700 rounded-2xl p-6 shadow-2xl">
+        <button onClick={onClose} className="absolute top-4 right-4 text-slate-400 hover:text-slate-200">
+          <X className="w-5 h-5" />
+        </button>
+
+        <div className="flex items-center gap-3 text-amber-400 mb-4">
+          <div className="p-3 bg-amber-500/10 rounded-xl border border-amber-500/30">
+            <ShieldAlert className="w-7 h-7" />
+          </div>
+          <div>
+            <h3 className="text-lg font-bold text-slate-100">Admin Control Access</h3>
+            <span className="text-xs text-slate-400 font-mono">Authenticate to manage server settings</span>
+          </div>
+        </div>
+
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div>
+            <label className="block text-xs font-semibold text-slate-300 mb-1.5">
+              ADMIN ACCESS TOKEN
+            </label>
+            <input
+              type="password"
+              value={tokenInput}
+              onChange={e => setTokenInput(e.target.value)}
+              placeholder="Enter ADMIN_TOKEN configured on server"
+              className="w-full bg-slate-900 border border-slate-700 rounded-xl px-4 py-2.5 text-sm text-slate-100 focus:outline-none focus:border-amber-500"
+              autoFocus
+            />
+          </div>
+
+          {error && (
+            <div className="p-3 bg-rose-500/10 border border-rose-500/30 rounded-xl text-xs text-rose-400 font-medium">
+              {error}
+            </div>
+          )}
+
+          <div className="flex items-center justify-end gap-3 pt-2">
+            <button
+              type="button"
+              onClick={onClose}
+              className="px-4 py-2 text-sm font-medium text-slate-400 hover:text-slate-200 bg-slate-800 rounded-lg"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={loading}
+              className="px-5 py-2 text-sm font-bold text-slate-900 bg-amber-400 hover:bg-amber-300 rounded-lg shadow-lg shadow-amber-500/20"
+            >
+              {loading ? 'Authenticating...' : 'Unlock Controls'}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+};
+

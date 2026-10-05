@@ -37,7 +37,8 @@ export type LogCategory =
   | 'WALLET'
   | 'RECONCILIATION'
   | 'BINANCE'
-  | 'SECURITY';
+  | 'SECURITY'
+  | 'DATABASE';
 
 export interface Candle {
   timestamp: number; // Open time ms

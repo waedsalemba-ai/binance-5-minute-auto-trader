@@ -551,6 +551,10 @@ export class RealBinanceTradingExecutor implements TradingExecutor {
   }
 
   public async buy(request: OrderRequest): Promise<ExecutionResult> {
+    if (process.env.LIVE_TRADING_ENABLED !== 'true') {
+      throw new Error('Live Binance trading is disabled. Set LIVE_TRADING_ENABLED=true in server environment variables to enable real order placement.');
+    }
+
     const { apiKey, apiSecret } = this.getCredentials();
     const settings = Storage.getSettings();
     const fixedAmount = settings.fixedTradeAmount;
@@ -658,6 +662,10 @@ export class RealBinanceTradingExecutor implements TradingExecutor {
   }
 
   public async sell(request: OrderRequest, positionId?: string): Promise<ExecutionResult> {
+    if (process.env.LIVE_TRADING_ENABLED !== 'true') {
+      throw new Error('Live Binance trading is disabled. Set LIVE_TRADING_ENABLED=true in server environment variables to enable real order placement.');
+    }
+
     const { apiKey, apiSecret } = this.getCredentials();
     const position = positionId
       ? Storage.getPositionById(positionId)

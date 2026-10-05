@@ -9,14 +9,9 @@ import {
 } from '../types/index.ts';
 import { Storage } from './storage.ts';
 import { BinanceTimeService } from './binance-time.ts';
-import { floorToStep, meetsMinNotional } from './decimal-utils.ts';
 import { Logger } from './logger.ts';
-import { AuditLogger } from './audit-logger.ts';
 
 export class SafetyGate {
-  /**
-   * Central Authoritative Validation for ALL BUY orders (Automatic, Manual, Retry).
-   */
   public static validateBuy(
     request: OrderRequest,
     mode: TradingMode,
@@ -25,18 +20,10 @@ export class SafetyGate {
     openPositions: Position[],
     symbolFilter: SymbolFilterRules,
     currentPrice: number,
-    isEmergencyStopped: boolean,
-    idempotencyKey?: string
+    isEmergencyStopped: boolean
   ): SafetyCheckResult {
-    // 1. Emergency Stop Check - Strictly blocks all BUY entries
-    if (isEmergencyStopped || Storage.isEmergencyStopActive()) {
-      AuditLogger.log({
-        eventType: 'BUY_REJECTED',
-        mode,
-        symbol: request.symbol,
-        side: 'BUY',
-        reason: 'Emergency stop is active. Automated buying is locked.',
-      });
+    // 1. Emergency Stop Check
+    if (isEmergencyStopped) {
       return {
         allowed: false,
         code: 'EMERGENCY_STOP_ACTIVE',
@@ -53,22 +40,13 @@ export class SafetyGate {
       };
     }
 
-    // 3. Idempotency Key Validation (Prevent Duplicate Submissions)
-    if (idempotencyKey && Storage.hasIdempotencyKey(idempotencyKey)) {
-      return {
-        allowed: false,
-        code: 'DUPLICATE_ORDER_ATTEMPT',
-        reason: `Duplicate order rejected: Signal/Idempotency key (${idempotencyKey}) already executed.`,
-      };
-    }
-
-    // 4. Mode Isolation & Real Credentials / Time Sync Check
+    // 3. Mode Isolation & Credentials Check
     if (mode === 'REAL') {
-      if (!Storage.isRealModeConfirmed()) {
+      if (process.env.LIVE_TRADING_ENABLED !== 'true') {
         return {
           allowed: false,
-          code: 'REAL_MODE_NOT_CONFIRMED',
-          reason: 'REAL mode has not been explicitly confirmed via server-side disclaimer verification.',
+          code: 'LIVE_TRADING_DISABLED_BY_CONFIG',
+          reason: 'Real live Binance trading is disabled by server configuration (LIVE_TRADING_ENABLED is not set to true).',
         };
       }
 
@@ -89,17 +67,16 @@ export class SafetyGate {
       }
 
       // Time Sync check
-      const timeService = BinanceTimeService.getInstance();
-      if (!timeService.isSafeDrift()) {
+      if (!BinanceTimeService.getInstance().isSafeDrift()) {
         return {
           allowed: false,
           code: 'CLOCK_DRIFT_UNSAFE',
-          reason: `Binance clock drift is unsafe or stale (${timeService.getOffset()}ms offset). Synchronization required before live trading.`,
+          reason: `Binance clock drift is unsafe (${BinanceTimeService.getInstance().getOffset()}ms). Re-synchronization required.`,
         };
       }
     }
 
-    // 5. Wallet Reconciliation Status Check
+    // 4. Wallet Reconciliation Status Check
     if (wallet.reconciliationStatus === 'MISMATCH' || wallet.reconciliationStatus === 'ERROR') {
       return {
         allowed: false,
@@ -108,7 +85,7 @@ export class SafetyGate {
       };
     }
 
-    // 6. Fixed Trade Amount Invariant Validation
+    // 5. Fixed Trade Amount Invariant Validation
     const fixedAmount = settings.fixedTradeAmount;
     if (!fixedAmount || isNaN(fixedAmount) || !isFinite(fixedAmount) || fixedAmount <= 0) {
       return {
@@ -134,7 +111,7 @@ export class SafetyGate {
       };
     }
 
-    // 7. Max Open Positions Check
+    // 6. Max Open Positions Check
     const activePositions = openPositions.filter(p => p.mode === mode && p.status === 'OPEN');
     if (activePositions.length >= settings.maxOpenPositions) {
       return {
@@ -144,7 +121,7 @@ export class SafetyGate {
       };
     }
 
-    // 8. Single Position Per Symbol Rule
+    // 7. Single Position Per Symbol Rule
     const existingPosition = activePositions.find(p => p.symbol === request.symbol);
     if (existingPosition) {
       return {
@@ -154,7 +131,7 @@ export class SafetyGate {
       };
     }
 
-    // 9. Symbol Cooldown Check
+    // 8. Symbol Cooldown Check
     const cooldown = Storage.isSymbolInCooldown(request.symbol, mode);
     if (cooldown.inCooldown) {
       return {
@@ -164,7 +141,7 @@ export class SafetyGate {
       };
     }
 
-    // 10. Available Balance & Minimum Reserve Check
+    // 9. Available Balance & Reserve Check
     const feeRate = mode === 'PAPER' ? settings.paperFeeRate : 0.001; // ~0.1% spot fee
     const estimatedFee = fixedAmount * feeRate;
     const requiredTotal = fixedAmount + estimatedFee;
@@ -174,7 +151,7 @@ export class SafetyGate {
       return {
         allowed: false,
         code: 'INSUFFICIENT_AVAILABLE_USDT',
-        reason: `BUY BLOCKED. Required: ${requiredTotal.toFixed(2)} USDT (Trade: ${fixedAmount} + Fee: ${estimatedFee.toFixed(2)}), Available: ${wallet.usdtAvailable.toFixed(2)} USDT. Insufficient available USDT.`,
+        reason: `BUY BLOCKED. Required: ${requiredTotal.toFixed(2)} USDT (Trade: ${fixedAmount} + Fee: ${estimatedFee.toFixed(2)}), Available: ${wallet.usdtAvailable.toFixed(2)} USDT. Reason: Insufficient available USDT.`,
       };
     }
 
@@ -186,60 +163,38 @@ export class SafetyGate {
       };
     }
 
-    // 11. Exchange Filters & Min Notional Validation
+    // 10. Exchange Filters & Min Notional Validation
     if (fixedAmount < symbolFilter.minNotional) {
       return {
         allowed: false,
         code: 'MIN_NOTIONAL_NOT_MET',
-        reason: `BUY BLOCKED. Trade amount: ${fixedAmount} USDT. Minimum notional required for ${request.symbol}: ${symbolFilter.minNotional} USDT. Increase fixed trade amount.`,
+        reason: `BUY BLOCKED. Trade amount: ${fixedAmount} USDT. Minimum notional required for ${request.symbol}: ${symbolFilter.minNotional} USDT. Increase the fixed trade amount.`,
       };
     }
 
+    // Quantity estimate and stepSize check
     if (currentPrice > 0) {
       const estimatedQty = fixedAmount / currentPrice;
-      const roundedQty = floorToStep(estimatedQty, symbolFilter.stepSize);
-      if (roundedQty < symbolFilter.minQty) {
+      if (estimatedQty < symbolFilter.minQty) {
         return {
           allowed: false,
           code: 'MIN_QUANTITY_NOT_MET',
-          reason: `BUY BLOCKED. Estimated quantity ${roundedQty} is below minimum exchange quantity ${symbolFilter.minQty}.`,
+          reason: `BUY BLOCKED. Estimated quantity ${estimatedQty.toFixed(6)} is below minimum exchange quantity ${symbolFilter.minQty}.`,
         };
       }
     }
 
-    AuditLogger.log({
-      eventType: 'BUY_AUTHORIZED',
-      mode,
-      symbol: request.symbol,
-      side: 'BUY',
-      quantity: currentPrice > 0 ? floorToStep(fixedAmount / currentPrice, symbolFilter.stepSize) : undefined,
-      price: currentPrice,
-      reason: request.reason,
-    });
-
     return { allowed: true, code: 'PASSED' };
   }
 
-  /**
-   * Central Authoritative Validation for ALL SELL orders (Automatic, Take Profit, Stop Loss, Manual Sell).
-   */
   public static validateSell(
     request: OrderRequest,
     position: Position,
     mode: TradingMode,
-    isEmergencyStopped: boolean,
-    symbolFilter?: SymbolFilterRules,
-    currentPrice?: number
+    isEmergencyStopped: boolean
   ): SafetyCheckResult {
-    // 1. Mode isolation
+    // Mode isolation
     if (position.mode !== mode) {
-      AuditLogger.log({
-        eventType: 'SELL_REJECTED',
-        mode,
-        symbol: position.symbol,
-        side: 'SELL',
-        reason: `Mode mismatch: position mode ${position.mode} != execution mode ${mode}.`,
-      });
       return {
         allowed: false,
         code: 'MODE_MISMATCH',
@@ -247,7 +202,6 @@ export class SafetyGate {
       };
     }
 
-    // 2. Position Status Validation
     if (position.status !== 'OPEN') {
       return {
         allowed: false,
@@ -256,63 +210,21 @@ export class SafetyGate {
       };
     }
 
-    // 3. Symbol Matching Validation
-    if (request.symbol !== position.symbol) {
-      return {
-        allowed: false,
-        code: 'SYMBOL_MISMATCH',
-        reason: `Request symbol ${request.symbol} does not match position symbol ${position.symbol}.`,
-      };
-    }
-
-    // 4. Quantity Validation
-    if (!request.quantity || isNaN(request.quantity) || request.quantity <= 0) {
+    if (!request.quantity || request.quantity <= 0) {
       return {
         allowed: false,
         code: 'INVALID_SELL_QUANTITY',
-        reason: 'SELL quantity must be a strictly positive number.',
+        reason: 'SELL quantity must be a positive number.',
       };
     }
 
-    // Ensure quantity does not exceed position remaining quantity
-    if (request.quantity > position.remainingQuantity * 1.00001) {
+    if (request.quantity > position.remainingQuantity * 1.0001) {
       return {
         allowed: false,
         code: 'EXCEEDS_POSITION_QUANTITY',
         reason: `Requested SELL quantity (${request.quantity}) exceeds position remaining quantity (${position.remainingQuantity}).`,
       };
     }
-
-    // 5. Exchange Filter Step Size / Min Qty Validation (if filter provided)
-    if (symbolFilter) {
-      if (request.quantity < symbolFilter.minQty) {
-        return {
-          allowed: false,
-          code: 'BELOW_MIN_QTY',
-          reason: `SELL quantity ${request.quantity} is below exchange minimum quantity ${symbolFilter.minQty}.`,
-        };
-      }
-
-      if (currentPrice && currentPrice > 0) {
-        if (!meetsMinNotional(currentPrice, request.quantity, symbolFilter.minNotional)) {
-          return {
-            allowed: false,
-            code: 'MIN_NOTIONAL_NOT_MET',
-            reason: `SELL value (~${(currentPrice * request.quantity).toFixed(2)} USDT) is below minimum notional ${symbolFilter.minNotional} USDT.`,
-          };
-        }
-      }
-    }
-
-    AuditLogger.log({
-      eventType: 'SELL_AUTHORIZED',
-      mode,
-      symbol: position.symbol,
-      side: 'SELL',
-      quantity: request.quantity,
-      price: currentPrice || position.currentPrice,
-      reason: request.reason,
-    });
 
     return { allowed: true, code: 'PASSED' };
   }

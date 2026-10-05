@@ -15,7 +15,6 @@ import {
 } from 'lucide-react';
 import { Candle, TechnicalAnalysis, Position, TradingMode } from '../types/index.ts';
 import { CandleChart } from './CandleChart.tsx';
-import { useFirebase } from '../firebase/context.tsx';
 
 interface TokenDetailViewProps {
   symbol: string;
@@ -34,8 +33,26 @@ export const TokenDetailView: React.FC<TokenDetailViewProps> = ({
   onBack,
   onOpenSellModal,
 }) => {
-  const { watchlist, toggleWatchlist } = useFirebase();
-  const isStarred = watchlist.some(w => w.symbol === symbol);
+  const [watchlist, setWatchlist] = useState<string[]>(() => {
+    try {
+      const stored = localStorage.getItem('binance_scanner_watchlist');
+      return stored ? JSON.parse(stored) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  const toggleWatchlist = (sym: string) => {
+    setWatchlist(prev => {
+      const next = prev.includes(sym) ? prev.filter(s => s !== sym) : [...prev, sym];
+      try {
+        localStorage.setItem('binance_scanner_watchlist', JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+  };
+
+  const isStarred = watchlist.includes(symbol);
   const [interval, setIntervalState] = useState<'5m' | '15m' | '1h' | '4h'>('5m');
   const [candles, setCandles] = useState<Candle[]>([]);
   const [loading, setLoading] = useState(false);

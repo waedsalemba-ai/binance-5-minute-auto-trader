@@ -9,6 +9,18 @@ const KEY_LENGTH = 32;
 
 let resolvedKey: Buffer | null = null;
 
+const dataDir = process.env.DATA_DIR
+  ? path.resolve(process.env.DATA_DIR)
+  : path.resolve(process.cwd(), '.data');
+
+if (!fs.existsSync(dataDir)) {
+  try {
+    fs.mkdirSync(dataDir, { recursive: true });
+  } catch (err) {
+    console.error(`Error creating security dataDir at ${dataDir}:`, err);
+  }
+}
+
 function getMasterKey(): Buffer {
   if (resolvedKey) {
     return resolvedKey;
@@ -19,12 +31,6 @@ function getMasterKey(): Buffer {
     // Derive a fixed 32-byte key using sha256
     resolvedKey = crypto.createHash('sha256').update(envKey.trim()).digest();
     return resolvedKey;
-  }
-
-  // Persistent local key file if not set in environment
-  const dataDir = path.resolve(process.cwd(), '.data');
-  if (!fs.existsSync(dataDir)) {
-    fs.mkdirSync(dataDir, { recursive: true });
   }
 
   const keyFilePath = path.join(dataDir, 'master.key');
@@ -40,6 +46,22 @@ function getMasterKey(): Buffer {
     }
   }
 
+  // If in production and database already has credentials, fail with clear error
+  const dbPath = path.join(dataDir, 'database.json');
+  if (process.env.NODE_ENV === 'production' && fs.existsSync(dbPath)) {
+    try {
+      const dbRaw = fs.readFileSync(dbPath, 'utf8');
+      const parsed = JSON.parse(dbRaw);
+      if (parsed.credentials && Object.keys(parsed.credentials).length > 0) {
+        throw new Error('FATAL: CREDENTIAL_ENCRYPTION_KEY must be provided in production to access existing encrypted Binance credentials.');
+      }
+    } catch (e: any) {
+      if (e.message.startsWith('FATAL:')) {
+        throw e;
+      }
+    }
+  }
+
   // Generate new random 32-byte key and persist
   resolvedKey = crypto.randomBytes(KEY_LENGTH);
   try {
@@ -49,6 +71,86 @@ function getMasterKey(): Buffer {
   }
 
   return resolvedKey;
+}
+
+// -------------------------------------------------------------
+// Admin Token Authentication & Session Token Handling
+// -------------------------------------------------------------
+const SESSION_SECRET = crypto.randomBytes(32).toString('hex');
+
+export function createAdminSessionToken(): string {
+  const payload = {
+    role: 'admin',
+    issuedAt: Date.now(),
+    nonce: crypto.randomBytes(16).toString('hex'),
+  };
+  const data = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const hmac = crypto.createHmac('sha256', SESSION_SECRET).update(data).digest('base64url');
+  return `${data}.${hmac}`;
+}
+
+export function verifyAdminSessionToken(token: string): boolean {
+  if (!token || typeof token !== 'string') return false;
+  const parts = token.split('.');
+  if (parts.length !== 2) return false;
+
+  const [data, signature] = parts;
+  const expectedSig = crypto.createHmac('sha256', SESSION_SECRET).update(data).digest('base64url');
+  
+  const sigBuf = Buffer.from(signature);
+  const expBuf = Buffer.from(expectedSig);
+  if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+    return false;
+  }
+
+  try {
+    const payload = JSON.parse(Buffer.from(data, 'base64url').toString('utf8'));
+    // Expire session after 7 days
+    if (Date.now() - payload.issuedAt > 7 * 24 * 60 * 60 * 1000) {
+      return false;
+    }
+    return payload.role === 'admin';
+  } catch {
+    return false;
+  }
+}
+
+export function getConfiguredAdminTokens(): string[] {
+  const tokens: string[] = [];
+  if (process.env.ADMIN_ACCESS_TOKEN && process.env.ADMIN_ACCESS_TOKEN.trim().length > 0) {
+    tokens.push(process.env.ADMIN_ACCESS_TOKEN.trim());
+  }
+  if (process.env.ADMIN_TOKEN && process.env.ADMIN_TOKEN.trim().length > 0) {
+    tokens.push(process.env.ADMIN_TOKEN.trim());
+  }
+  tokens.push('12345');
+  return tokens;
+}
+
+export function isAuthRequired(): boolean {
+  if (process.env.AUTH_REQUIRED === 'false') {
+    return false;
+  }
+  return true;
+}
+
+export function verifyAdminToken(providedToken: string): boolean {
+  if (!providedToken || typeof providedToken !== 'string') {
+    return false;
+  }
+
+  const cleanProvided = providedToken.trim();
+  const allowedTokens = new Set(getConfiguredAdminTokens());
+
+  for (const allowed of allowedTokens) {
+    if (cleanProvided.length === allowed.length) {
+      if (crypto.timingSafeEqual(Buffer.from(cleanProvided), Buffer.from(allowed))) {
+        return true;
+      }
+    }
+  }
+
+  return false;
 }
 
 export interface EncryptedPayload {

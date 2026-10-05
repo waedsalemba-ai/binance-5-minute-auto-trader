@@ -14,16 +14,24 @@ import {
 import { EncryptedPayload, encryptSecret, decryptSecret, maskApiKey } from './security.ts';
 import { Logger } from './logger.ts';
 
-const DATA_DIR = path.resolve(process.cwd(), '.data');
+export const DATA_DIR = process.env.DATA_DIR
+  ? path.resolve(process.env.DATA_DIR)
+  : path.resolve(process.cwd(), '.data');
+
 if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  } catch (err) {
+    console.error(`Error creating DATA_DIR at ${DATA_DIR}:`, err);
+  }
 }
 
-const DB_FILE = path.join(DATA_DIR, 'database.json');
+export const DB_FILE = path.join(DATA_DIR, 'database.json');
 
 export interface DatabaseSchema {
   version: number;
   settings: TradingSettings;
+  isEmergencyStopped: boolean;
   accounts: Record<string, TradingAccount>;
   credentials: Record<string, { apiKey: string; secretPayload: EncryptedPayload }>;
   positions: Position[];
@@ -34,6 +42,7 @@ export interface DatabaseSchema {
   latestAnalysis: Record<string, TechnicalAnalysis>;
   symbolCooldowns: Record<string, { symbol: string; mode: TradingMode; until: number }>;
   scannerSummary: ScannerSummary;
+  lastPersistedAt?: number;
 }
 
 const DEFAULT_SETTINGS: TradingSettings = {
@@ -102,6 +111,7 @@ function getInitialDb(): DatabaseSchema {
   return {
     version: 2,
     settings: { ...DEFAULT_SETTINGS },
+    isEmergencyStopped: false,
     accounts: {
       [paperAccId]: {
         id: paperAccId,
@@ -145,6 +155,7 @@ function getInitialDb(): DatabaseSchema {
       nextScanTime: Date.now() + DEFAULT_SETTINGS.scanIntervalMs,
       isScanning: false,
     },
+    lastPersistedAt: Date.now(),
   };
 }
 
@@ -194,8 +205,16 @@ class StorageEngine {
 
   private saveImmediate(): void {
     try {
-      const tempPath = `${DB_FILE}.tmp.${Date.now()}`;
-      fs.writeFileSync(tempPath, JSON.stringify(this.db, null, 2), 'utf8');
+      const tempPath = `${DB_FILE}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 6)}`;
+      const serialized = JSON.stringify(this.db, null, 2);
+      
+      // Write and fsync temporary file to ensure disk persistence
+      const fd = fs.openSync(tempPath, 'w', 0o600);
+      fs.writeSync(fd, serialized, 0, 'utf8');
+      fs.fsyncSync(fd);
+      fs.closeSync(fd);
+
+      // Atomic rename replaces target database file safely
       fs.renameSync(tempPath, DB_FILE);
     } catch (err) {
       Logger.error('PAPER', 'ERROR', `Atomic database save error: ${err}`);
@@ -209,6 +228,22 @@ class StorageEngine {
     this.saveTimeout = setTimeout(() => {
       this.saveImmediate();
     }, 50);
+  }
+
+  public flush(): void {
+    if (this.saveTimeout) {
+      clearTimeout(this.saveTimeout);
+      this.saveTimeout = null;
+    }
+    this.saveImmediate();
+  }
+
+  public isReady(): boolean {
+    return fs.existsSync(DATA_DIR) && this.db !== undefined;
+  }
+
+  public getDataDir(): string {
+    return DATA_DIR;
   }
 
   // --- Settings ---
@@ -387,6 +422,10 @@ class StorageEngine {
     return mode === 'PAPER' ? { ...this.db.paperWallet } : { ...this.db.realWallet };
   }
 
+  public saveWallet(wallet: WalletBalance): WalletBalance {
+    return this.updateWallet(wallet.mode, wallet);
+  }
+
   public updateWallet(mode: TradingMode, updates: Partial<WalletBalance>): WalletBalance {
     if (mode === 'PAPER') {
       this.db.paperWallet = {
@@ -524,6 +563,83 @@ class StorageEngine {
     }
     delete this.db.symbolCooldowns[key];
     return { inCooldown: false, remainingMinutes: 0 };
+  }
+
+  // --- Emergency Stop Persistence ---
+  public isEmergencyStopped(): boolean {
+    return Boolean(this.db.isEmergencyStopped);
+  }
+
+  public setEmergencyStopped(val: boolean): void {
+    this.db.isEmergencyStopped = Boolean(val);
+    this.save();
+  }
+
+  // --- Database Stats & Diagnostics ---
+  public getDatabaseStats() {
+    let fileSize = 0;
+    let fileModifiedAt = 0;
+    try {
+      if (fs.existsSync(DB_FILE)) {
+        const stat = fs.statSync(DB_FILE);
+        fileSize = stat.size;
+        fileModifiedAt = stat.mtimeMs;
+      }
+    } catch {
+      // Ignore stat error
+    }
+
+    return {
+      dataDir: DATA_DIR,
+      dbFile: DB_FILE,
+      fileSizeBytes: fileSize,
+      fileModifiedAt,
+      isReady: this.isReady(),
+      positionsCount: this.db.positions.length,
+      openPositionsCount: this.db.positions.filter(p => p.status === 'OPEN').length,
+      ordersCount: this.db.orders.length,
+      tradesCount: this.db.trades.length,
+      paperBalance: this.db.paperWallet.usdtAvailable,
+      paperEquity: this.db.paperWallet.totalEquity,
+      isEmergencyStopped: this.isEmergencyStopped(),
+      tradingMode: this.db.settings.mode,
+      autoTrading: this.db.settings.autoTrading,
+      version: this.db.version,
+      lastPersistedAt: this.db.lastPersistedAt || fileModifiedAt,
+    };
+  }
+
+  // --- Backup & Snapshots ---
+  public backupDatabase(customPath?: string): { success: boolean; backupPath: string; timestamp: number; sizeBytes: number } {
+    this.flush();
+    const timestamp = Date.now();
+    const backupFileName = `database-backup-${new Date(timestamp).toISOString().replace(/[:.]/g, '-')}.json`;
+    const targetPath = customPath || path.join(DATA_DIR, 'backups', backupFileName);
+
+    try {
+      const backupDir = path.dirname(targetPath);
+      if (!fs.existsSync(backupDir)) {
+        fs.mkdirSync(backupDir, { recursive: true });
+      }
+
+      fs.copyFileSync(DB_FILE, targetPath);
+      const stat = fs.statSync(targetPath);
+      Logger.info('PAPER', 'DATABASE', `Database backup successfully created at ${targetPath} (${stat.size} bytes).`);
+      return {
+        success: true,
+        backupPath: targetPath,
+        timestamp,
+        sizeBytes: stat.size,
+      };
+    } catch (err: any) {
+      Logger.error('PAPER', 'DATABASE', `Failed to create database backup: ${err.message}`);
+      throw new Error(`Backup failed: ${err.message}`);
+    }
+  }
+
+  // --- Cold Reboot Rehydration ---
+  public reloadFromDisk(): void {
+    this.db = this.loadDb();
   }
 
   // --- Analysis & Scanner ---

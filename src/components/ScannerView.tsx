@@ -11,7 +11,6 @@ import {
   Star,
 } from 'lucide-react';
 import { TechnicalAnalysis, StrategyState, Position, TradingMode } from '../types/index.ts';
-import { useFirebase } from '../firebase/context.tsx';
 
 interface ScannerViewProps {
   analyses: TechnicalAnalysis[];
@@ -30,14 +29,32 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
   onRunScan,
   isScanning,
 }) => {
-  const { watchlist, toggleWatchlist, user } = useFirebase();
+  const [watchlist, setWatchlist] = useState<string[]>(() => {
+    try {
+      const stored = localStorage.getItem('binance_scanner_watchlist');
+      return stored ? JSON.parse(stored) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  const toggleWatchlist = (symbol: string) => {
+    setWatchlist(prev => {
+      const next = prev.includes(symbol) ? prev.filter(s => s !== symbol) : [...prev, symbol];
+      try {
+        localStorage.setItem('binance_scanner_watchlist', JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+  };
+
   const [searchTerm, setSearchTerm] = useState('');
   const [stateFilter, setStateFilter] = useState<string>('ALL');
   const [sortBy, setSortBy] = useState<'score' | 'change' | 'volume' | 'price'>('score');
   const [sortAsc, setSortAsc] = useState(false);
 
   const watchlistSymbolSet = useMemo(() => {
-    return new Set(watchlist.map(w => w.symbol));
+    return new Set(watchlist);
   }, [watchlist]);
 
   const activeSymbolSet = useMemo(() => {
@@ -210,7 +227,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
                               e.stopPropagation();
                               toggleWatchlist(item.symbol);
                             }}
-                            title={watchlistSymbolSet.has(item.symbol) ? 'Remove from Firebase Watchlist' : 'Add to Firebase Watchlist'}
+                            title={watchlistSymbolSet.has(item.symbol) ? 'Remove from Watchlist' : 'Add to Watchlist'}
                             className={`p-1 rounded hover:bg-slate-700/60 transition-colors ${
                               watchlistSymbolSet.has(item.symbol) ? 'text-amber-400' : 'text-slate-600 hover:text-slate-400'
                             }`}
