@@ -377,28 +377,33 @@ export async function initializePostgresSchema(): Promise<void> {
   Logger.info('PAPER', 'DATABASE', 'Checking and applying PostgreSQL database schema migrations...');
 
   await withTransaction(async (client) => {
-    try {
-      await client.query(`
-        CREATE TABLE IF NOT EXISTS schema_migrations (
-          id VARCHAR(32) PRIMARY KEY,
-          name VARCHAR(128) NOT NULL,
-          applied_at BIGINT NOT NULL
-        );
-      `);
-    } catch (createErr: any) {
-      if (
-        !createErr.message.includes('already exists') &&
-        !createErr.message.includes('Not supported')
-      ) {
-        throw createErr;
+    const safeExec = async (sql: string, params?: any[]) => {
+      try {
+        return await client.query(sql, params);
+      } catch (err: any) {
+        if (
+          err.message?.includes('already exists') ||
+          err.message?.includes('Not supported')
+        ) {
+          return { rowCount: 0, rows: [] } as any;
+        }
+        throw err;
       }
-    }
+    };
+
+    await safeExec(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        id VARCHAR(32) PRIMARY KEY,
+        name VARCHAR(128) NOT NULL,
+        applied_at BIGINT NOT NULL
+      );
+    `);
 
     // Migration 1: Core trading tables
-    const migration1Applied = await client.query('SELECT id FROM schema_migrations WHERE id = $1', ['1']);
+    const migration1Applied = await safeExec('SELECT id FROM schema_migrations WHERE id = $1', ['1']);
     if (migration1Applied.rowCount === 0) {
       // System State
-      await client.query(`
+      await safeExec(`
         CREATE TABLE IF NOT EXISTS system_state (
           key VARCHAR(64) PRIMARY KEY,
           value JSONB NOT NULL,
@@ -407,7 +412,7 @@ export async function initializePostgresSchema(): Promise<void> {
       `);
 
       // Trading Settings
-      await client.query(`
+      await safeExec(`
         CREATE TABLE IF NOT EXISTS trading_settings (
           id VARCHAR(32) PRIMARY KEY DEFAULT 'current',
           mode VARCHAR(16) NOT NULL DEFAULT 'PAPER',
@@ -435,7 +440,7 @@ export async function initializePostgresSchema(): Promise<void> {
       `);
 
       // Wallets
-      await client.query(`
+      await safeExec(`
         CREATE TABLE IF NOT EXISTS wallets (
           mode VARCHAR(16) PRIMARY KEY,
           usdt_available NUMERIC NOT NULL,
@@ -455,7 +460,7 @@ export async function initializePostgresSchema(): Promise<void> {
       `);
 
       // Positions
-      await client.query(`
+      await safeExec(`
         CREATE TABLE IF NOT EXISTS positions (
           id VARCHAR(64) PRIMARY KEY,
           account_id VARCHAR(64) NOT NULL,
@@ -493,12 +498,12 @@ export async function initializePostgresSchema(): Promise<void> {
           realized_net_pnl_percent NUMERIC,
           exit_fees NUMERIC DEFAULT 0
         );
-        CREATE INDEX IF NOT EXISTS idx_positions_mode_status ON positions(mode, status);
-        CREATE INDEX IF NOT EXISTS idx_positions_symbol_mode_status ON positions(symbol, mode, status);
       `);
+      await safeExec(`CREATE INDEX IF NOT EXISTS idx_positions_mode_status ON positions(mode, status);`);
+      await safeExec(`CREATE INDEX IF NOT EXISTS idx_positions_symbol_mode_status ON positions(symbol, mode, status);`);
 
       // Orders
-      await client.query(`
+      await safeExec(`
         CREATE TABLE IF NOT EXISTS orders (
           id VARCHAR(64) PRIMARY KEY,
           client_order_id VARCHAR(64) UNIQUE NOT NULL,
@@ -522,12 +527,12 @@ export async function initializePostgresSchema(): Promise<void> {
           created_at BIGINT NOT NULL,
           updated_at BIGINT NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_orders_mode_symbol ON orders(mode, symbol);
-        CREATE INDEX IF NOT EXISTS idx_orders_client_id ON orders(client_order_id);
       `);
+      await safeExec(`CREATE INDEX IF NOT EXISTS idx_orders_mode_symbol ON orders(mode, symbol);`);
+      await safeExec(`CREATE INDEX IF NOT EXISTS idx_orders_client_id ON orders(client_order_id);`);
 
       // Trades
-      await client.query(`
+      await safeExec(`
         CREATE TABLE IF NOT EXISTS trades (
           id VARCHAR(64) PRIMARY KEY,
           account_id VARCHAR(64) NOT NULL,
@@ -553,11 +558,11 @@ export async function initializePostgresSchema(): Promise<void> {
           closed_at BIGINT NOT NULL,
           duration_ms BIGINT NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_trades_mode_symbol ON trades(mode, symbol);
       `);
+      await safeExec(`CREATE INDEX IF NOT EXISTS idx_trades_mode_symbol ON trades(mode, symbol);`);
 
       // Trade Decisions (Audit log)
-      await client.query(`
+      await safeExec(`
         CREATE TABLE IF NOT EXISTS trade_decisions (
           id VARCHAR(64) PRIMARY KEY,
           symbol VARCHAR(32) NOT NULL,
@@ -570,11 +575,11 @@ export async function initializePostgresSchema(): Promise<void> {
           details JSONB,
           timestamp BIGINT NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_decisions_symbol ON trade_decisions(symbol, timestamp);
       `);
+      await safeExec(`CREATE INDEX IF NOT EXISTS idx_decisions_symbol ON trade_decisions(symbol, timestamp);`);
 
       // Accounts
-      await client.query(`
+      await safeExec(`
         CREATE TABLE IF NOT EXISTS accounts (
           id VARCHAR(64) PRIMARY KEY,
           name VARCHAR(128) NOT NULL,
@@ -591,7 +596,7 @@ export async function initializePostgresSchema(): Promise<void> {
       `);
 
       // Credentials (AES-256-GCM encrypted payload)
-      await client.query(`
+      await safeExec(`
         CREATE TABLE IF NOT EXISTS credentials (
           account_id VARCHAR(64) PRIMARY KEY,
           api_key TEXT NOT NULL,
@@ -603,7 +608,7 @@ export async function initializePostgresSchema(): Promise<void> {
       `);
 
       // Symbol Cooldowns
-      await client.query(`
+      await safeExec(`
         CREATE TABLE IF NOT EXISTS symbol_cooldowns (
           key VARCHAR(64) PRIMARY KEY,
           symbol VARCHAR(32) NOT NULL,
@@ -612,7 +617,7 @@ export async function initializePostgresSchema(): Promise<void> {
         );
       `);
 
-      await client.query(
+      await safeExec(
         'INSERT INTO schema_migrations (id, name, applied_at) VALUES ($1, $2, $3)',
         ['1', '001_initial_schema', Date.now()]
       );

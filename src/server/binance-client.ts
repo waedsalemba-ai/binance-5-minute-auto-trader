@@ -1,6 +1,8 @@
 import crypto from 'node:crypto';
 import { Candle, SymbolFilterRules } from '../types/index.ts';
 import { BinanceTimeService } from './binance-time.ts';
+import { BinanceSymbolNormalizer } from './symbol-normalizer.ts';
+import { BinanceSymbolValidator } from './symbol-validator.ts';
 import { Logger } from './logger.ts';
 import { sanitizeLogMessage } from './security.ts';
 

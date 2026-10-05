@@ -407,3 +407,43 @@ export interface ReconciliationResult {
   correctedCount: number;
   timestamp: number;
 }
+
+// --- Binance Symbol Validation & Migration Types ---
+export type MarketType = 'SPOT' | 'USDM_FUTURES';
+
+export interface SymbolNormalizationResult {
+  originalSymbol: string;
+  normalizedSymbol: string;
+  baseAsset: string;
+  quoteAsset: string;
+  mappingApplied: boolean;
+  mappingReason: string | null;
+}
+
+export interface SymbolValidationResult {
+  requestedSymbol: string;
+  normalizedSymbol: string;
+  market: MarketType;
+  exists: boolean;
+  status: string | null; // e.g. 'TRADING', 'BREAK', 'HALT', 'DELISTED', null
+  tradable: boolean;
+  reason: string | null;
+  baseAsset?: string;
+  quoteAsset?: string;
+  filters?: SymbolFilterRules;
+  lastUpdated?: number;
+}
+
+export interface SymbolAuditRecord {
+  timestamp: number;
+  requestedSymbol: string;
+  normalizedSymbol: string;
+  market: MarketType;
+  side: OrderSide;
+  validationResult: boolean;
+  binanceStatus: string | null;
+  mappingApplied: boolean;
+  rejectionReason: string | null;
+  orderId?: string;
+}
+
