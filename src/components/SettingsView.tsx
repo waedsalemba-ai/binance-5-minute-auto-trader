@@ -376,9 +376,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ settings, onUpdateSe
           </div>
 
           <div className="bg-slate-900/80 border border-slate-800/80 p-3 rounded-xl">
-            <span className="text-[10px] text-slate-500 uppercase tracking-wider block">Database File Size</span>
-            <span className="text-slate-100 font-bold text-sm mt-1 block">
-              {dbStats?.fileSizeBytes ? `${(dbStats.fileSizeBytes / 1024).toFixed(1)} KB` : 'Active'}
+            <span className="text-[10px] text-slate-500 uppercase tracking-wider block">Storage Engine</span>
+            <span className="text-amber-400 font-bold text-sm mt-1 block">
+              {dbStats?.storageEngine || 'PostgreSQL'}
             </span>
           </div>
         </div>
@@ -386,13 +386,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ settings, onUpdateSe
         <div className="bg-slate-900/60 border border-slate-800 p-4 rounded-xl space-y-2 text-xs">
           <div className="flex items-center gap-2 text-slate-300 font-mono">
             <HardDrive className="w-4 h-4 text-amber-400" />
-            <span className="font-semibold text-slate-200">Active Mount Directory:</span>
-            <span className="px-2 py-0.5 bg-slate-800 border border-slate-700 rounded text-amber-300 text-[11px]">
-              {dbStats?.dataDir || '/data'}
+            <span className="font-semibold text-slate-200">Active PostgreSQL Target:</span>
+            <span className="px-2 py-0.5 bg-slate-800 border border-slate-700 rounded text-amber-300 text-[11px] truncate max-w-md">
+              {dbStats?.databaseUrlSanitized || 'PostgreSQL (Render)'}
             </span>
           </div>
           <p className="text-slate-400 text-[11px] leading-relaxed">
-            Persistent storage is enabled via <code className="text-amber-300">DATA_DIR</code>. When deploying on Render or Docker, mount a Persistent Disk at <code className="text-amber-300">/data</code> to guarantee that all trade logs, open positions, and account balances survive container redeployments and restarts without loss.
+            Persistent storage is powered by <code className="text-amber-300">DATABASE_URL</code> on PostgreSQL. All open positions, trade history, order executions, and paper wallet balances are persisted directly to relational tables with ACID transactions, surviving server restarts and redeployments.
           </p>
         </div>
       </div>

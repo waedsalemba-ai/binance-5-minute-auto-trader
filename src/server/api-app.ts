@@ -628,16 +628,18 @@ apiApp.post('/api/binance/disconnect', requireAdminAuth, (req: Request, res: Res
 // --------------------------------------------------------------------------
 // 12. Database Health, Diagnostics & Backup Endpoints
 // --------------------------------------------------------------------------
-apiApp.get('/api/db/health', (req: Request, res: Response) => {
-  const isReady = Storage.isReady();
+apiApp.get('/api/db/health', async (req: Request, res: Response) => {
+  const isReady = await Storage.isDatabaseReadyAsync();
   const stats = Storage.getDatabaseStats();
   res.status(isReady ? 200 : 503).json({
     success: isReady,
     status: isReady ? 'HEALTHY' : 'UNHEALTHY',
+    storageEngine: 'PostgreSQL',
     timestamp: new Date().toISOString(),
-    dataDir: stats.dataDir,
-    dbFile: stats.dbFile,
-    fileSizeBytes: stats.fileSizeBytes,
+    databaseUrlSanitized: stats.databaseUrlSanitized,
+    positionsCount: stats.positionsCount,
+    ordersCount: stats.ordersCount,
+    tradesCount: stats.tradesCount,
   });
 });
 

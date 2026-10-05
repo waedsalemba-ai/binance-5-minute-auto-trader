@@ -6,6 +6,7 @@ import { StrategyEngine } from '../src/server/strategy-engine.ts';
 import { SafetyGate } from '../src/server/safety-gate.ts';
 import { PaperTradingExecutor } from '../src/server/trading-executor.ts';
 import { Storage } from '../src/server/storage.ts';
+import { sanitizeDatabaseUrl } from '../src/server/postgres.ts';
 import { normalizeBinanceBaseUrl } from '../src/server/binance-client.ts';
 import {
   Candle,
@@ -64,32 +65,24 @@ function createMockCandles(count = 60, startPrice = 100, trend = 'up'): Candle[]
 
 async function runAllTests() {
   console.log('🧪 Starting Binance 5m Scanner & Auto Trader Automated Test Suite...\n');
+  await Storage.ensureReady();
 
   let passed = 0;
   let failed = 0;
+  let testQueue = Promise.resolve();
 
   function test(name: string, fn: () => void | Promise<void>) {
-    try {
-      const res = fn();
-      if (res instanceof Promise) {
-        return res
-          .then(() => {
-            console.log(`  ✓ ${name}`);
-            passed++;
-          })
-          .catch((err) => {
-            console.error(`  ✗ ${name}`);
-            console.error(`    ${err.message}`);
-            failed++;
-          });
+    testQueue = testQueue.then(async () => {
+      try {
+        await fn();
+        console.log(`  ✓ ${name}`);
+        passed++;
+      } catch (err: any) {
+        console.error(`  ✗ ${name}`);
+        console.error(`    ${err.message}`);
+        failed++;
       }
-      console.log(`  ✓ ${name}`);
-      passed++;
-    } catch (err: any) {
-      console.error(`  ✗ ${name}`);
-      console.error(`    ${err.message}`);
-      failed++;
-    }
+    });
   }
 
   // -------------------------------------------------------------
@@ -847,19 +840,21 @@ async function runAllTests() {
   });
 
   // -------------------------------------------------------------
-  // 12. Persistent Storage & Crash-Safe Flush
+  // 12. Persistent Storage & Cold Restart Verification (PostgreSQL)
   // -------------------------------------------------------------
-  console.log('\n12. Persistent Storage & Cold Restart Verification:');
+  console.log('\n12. Persistent Storage & Cold Restart Verification (PostgreSQL):');
 
-  test('PERSISTENCE TEST 1: Storage flush writes synchronously and verifies DB readiness', () => {
-    Storage.flush();
+  test('PERSISTENCE TEST 1: PostgreSQL connection and schema verification', async () => {
+    await Storage.ensureReady();
     assert.strictEqual(Storage.isReady(), true);
-    assert.ok(Storage.getDataDir().length > 0);
+    const isDbReady = await Storage.isDatabaseReadyAsync();
+    assert.strictEqual(isDbReady, true);
     const stats = Storage.getDatabaseStats();
-    assert.ok(stats.fileSizeBytes > 0);
+    assert.strictEqual(stats.storageEngine, 'PostgreSQL');
+    assert.strictEqual(stats.isReady, true);
   });
 
-  test('PERSISTENCE TEST 2: Trade, open position, custom wallet balance, settings & emergency stop survive simulated cold server restart', () => {
+  test('PERSISTENCE TEST 2: Trade, open position, custom wallet balance, settings & emergency stop survive simulated cold server restart', async () => {
     const testPositionId = `POS-PERSIST-${Date.now()}`;
     const testOrderId = `ORD-PERSIST-${Date.now()}`;
     const testTradeId = `TRD-PERSIST-${Date.now()}`;
@@ -970,11 +965,11 @@ async function runAllTests() {
     Storage.updateSettings({ fixedTradeAmount: 250, takeProfitPercent: 3.5 });
     Storage.setEmergencyStopped(true);
 
-    // 6. Flush atomically to disk
-    Storage.flush();
+    // 6. Give asynchronous persistence query a moment to settle
+    await new Promise(r => setTimeout(r, 80));
 
-    // 7. SIMULATE COLD SERVER REBOOT / CONTAINER RESTART: reload fresh from disk
-    Storage.reloadFromDisk();
+    // 7. SIMULATE COLD SERVER REBOOT / CONTAINER RESTART: reload fresh from PostgreSQL
+    await Storage.loadFromPostgres();
 
     // 8. VERIFY all state is 100% preserved
     const reloadedPosition = Storage.getPositionById(testPositionId);
@@ -1007,14 +1002,86 @@ async function runAllTests() {
 
     // Clean up test emergency stop state
     Storage.setEmergencyStopped(false);
-    Storage.flush();
   });
 
-  test('PERSISTENCE TEST 3: Database backup snapshot generation', () => {
+  test('PERSISTENCE TEST 3: Database atomic transaction & duplicate order prevention', async () => {
+    const dupOrderId = `ORD-DUP-${Date.now()}`;
+    const dupPosId = `POS-DUP-${Date.now()}`;
+    const pos: Position = {
+      id: dupPosId,
+      accountId: 'paper-default',
+      symbol: 'AVAXUSDT',
+      mode: 'PAPER',
+      status: 'OPEN',
+      entryPrice: 30.0,
+      quantity: 10,
+      remainingQuantity: 10,
+      entryQuoteAmount: 300,
+      entryFees: 0.3,
+      entryScore: 85,
+      entryState: 'STRONG_BULLISH',
+      entryReason: 'Tx Test',
+      currentPrice: 30.0,
+      currentScore: 85,
+      currentState: 'STRONG_BULLISH',
+      grossPnL: 0,
+      unrealizedPnL: 0,
+      unrealizedPnLPercent: 0,
+      estimatedNetPnL: 0,
+      estimatedNetPnLPercent: 0,
+      breakEvenPrice: 30.06,
+      takeProfitPrice: 30.6,
+      stopLossPrice: 29.1,
+      openedAt: Date.now(),
+      updatedAt: Date.now(),
+      entryOrderId: dupOrderId,
+    };
+    const ord: Order = {
+      id: dupOrderId,
+      clientOrderId: `CLIENT-${dupOrderId}`,
+      accountId: 'paper-default',
+      mode: 'PAPER',
+      symbol: 'AVAXUSDT',
+      side: 'BUY',
+      status: 'FILLED',
+      requestedQuoteAmount: 300,
+      executedQuantity: 10,
+      executedQuoteAmount: 300,
+      executionPrice: 30.0,
+      fee: 0.3,
+      feeAsset: 'USDT',
+      reason: 'Tx Test',
+      strategyState: 'STRONG_BULLISH',
+      technicalScore: 85,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      fills: [],
+    };
+    const wallet = Storage.getWallet('PAPER');
+    await Storage.openPositionTx({ position: pos, order: ord, wallet });
+
+    // Attempting to open same order again MUST reject with duplicate error
+    await assert.rejects(
+      async () => {
+        await Storage.openPositionTx({ position: pos, order: ord, wallet });
+      },
+      /Duplicate order prevented|Duplicate position prevented/
+    );
+  });
+
+  test('PERSISTENCE TEST 4: Database URL sanitization protects credentials from logs', () => {
+    const rawWithPass = 'postgresql://binance_trader:SecretPassword123@dpg-server-a.render.com/binance_trader';
+    const sanitized = sanitizeDatabaseUrl(rawWithPass);
+    assert.ok(!sanitized.includes('SecretPassword123'), 'Sanitized URL must NEVER contain database password');
+    assert.ok(sanitized.includes('binance_trader'), 'Sanitized URL preserves username and database target');
+    assert.ok(sanitized.includes('****'), 'Sanitized URL replaces password with asterisks');
+  });
+
+  test('PERSISTENCE TEST 5: Database backup snapshot generation', () => {
     const backup = Storage.backupDatabase();
     assert.strictEqual(backup.success, true);
     assert.ok(backup.sizeBytes > 0);
-    assert.ok(backup.backupPath.includes('database-backup'));
+    assert.ok(backup.backupPath.includes('pg-database-backup'));
   });
 
   // -------------------------------------------------------------
@@ -1079,6 +1146,8 @@ async function runAllTests() {
       process.env.LIVE_TRADING_ENABLED = originalLiveTradingEnv;
     }
   });
+
+  await testQueue;
 
   console.log(`\n==============================================`);
   console.log(`Test Results: ${passed} Passed, ${failed} Failed.`);

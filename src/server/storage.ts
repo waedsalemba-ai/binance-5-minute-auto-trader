@@ -10,9 +10,22 @@ import {
   TradingSettings,
   TechnicalAnalysis,
   ScannerSummary,
+  StrategyState,
 } from '../types/index.ts';
 import { EncryptedPayload, encryptSecret, decryptSecret, maskApiKey } from './security.ts';
 import { Logger } from './logger.ts';
+import {
+  query,
+  withTransaction,
+  initializePostgresSchema,
+  migrateFromJsonIfPresent,
+  checkPostgresHealth,
+  sanitizeDatabaseUrl,
+  openPositionTransaction,
+  closePositionTransaction,
+  OpenPositionParams,
+  ClosePositionParams,
+} from './postgres.ts';
 
 export const DATA_DIR = process.env.DATA_DIR
   ? path.resolve(process.env.DATA_DIR)
@@ -27,23 +40,6 @@ if (!fs.existsSync(DATA_DIR)) {
 }
 
 export const DB_FILE = path.join(DATA_DIR, 'database.json');
-
-export interface DatabaseSchema {
-  version: number;
-  settings: TradingSettings;
-  isEmergencyStopped: boolean;
-  accounts: Record<string, TradingAccount>;
-  credentials: Record<string, { apiKey: string; secretPayload: EncryptedPayload }>;
-  positions: Position[];
-  orders: Order[];
-  trades: Trade[];
-  paperWallet: WalletBalance;
-  realWallet: WalletBalance;
-  latestAnalysis: Record<string, TechnicalAnalysis>;
-  symbolCooldowns: Record<string, { symbol: string; mode: TradingMode; until: number }>;
-  scannerSummary: ScannerSummary;
-  lastPersistedAt?: number;
-}
 
 const DEFAULT_SETTINGS: TradingSettings = {
   mode: 'PAPER',
@@ -104,272 +100,548 @@ function createInitialRealWallet(): WalletBalance {
   };
 }
 
-function getInitialDb(): DatabaseSchema {
-  const paperAccId = 'paper-default';
-  const realAccId = 'real-default';
-
-  return {
-    version: 2,
-    settings: { ...DEFAULT_SETTINGS },
-    isEmergencyStopped: false,
-    accounts: {
-      [paperAccId]: {
-        id: paperAccId,
-        name: 'Paper Trading Account',
-        mode: 'PAPER',
-        autoTrading: false,
-        resumeOnRestart: false,
-        hasApiKeys: false,
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-      },
-      [realAccId]: {
-        id: realAccId,
-        name: 'Binance Spot Live Account',
-        mode: 'REAL',
-        autoTrading: false,
-        resumeOnRestart: false,
-        hasApiKeys: false,
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-      },
-    },
-    credentials: {},
-    positions: [],
-    orders: [],
-    trades: [],
-    paperWallet: createInitialPaperWallet(DEFAULT_SETTINGS.paperStartingBalance),
-    realWallet: createInitialRealWallet(),
-    latestAnalysis: {},
-    symbolCooldowns: {},
-    scannerSummary: {
-      pairsAnalyzed: 0,
-      preBullishCount: 0,
-      bullishCount: 0,
-      strongBullishCount: 0,
-      weakeningCount: 0,
-      neutralCount: 0,
-      openPositionsCount: 0,
-      todayTradesCount: 0,
-      lastScanTime: 0,
-      nextScanTime: Date.now() + DEFAULT_SETTINGS.scanIntervalMs,
-      isScanning: false,
-    },
-    lastPersistedAt: Date.now(),
-  };
+export interface DatabaseMemoryCache {
+  settings: TradingSettings;
+  isEmergencyStopped: boolean;
+  accounts: Record<string, TradingAccount>;
+  credentials: Record<string, { apiKey: string; secretPayload: EncryptedPayload }>;
+  positions: Position[];
+  orders: Order[];
+  trades: Trade[];
+  paperWallet: WalletBalance;
+  realWallet: WalletBalance;
+  latestAnalysis: Record<string, TechnicalAnalysis>;
+  symbolCooldowns: Record<string, { symbol: string; mode: TradingMode; until: number }>;
+  scannerSummary: ScannerSummary;
+  lastPersistedAt: number;
 }
 
-class StorageEngine {
-  private db: DatabaseSchema;
-  private saveTimeout: NodeJS.Timeout | null = null;
+class PostgresStorageEngine {
+  private cache: DatabaseMemoryCache;
+  private isInitialized = false;
+  private initPromise: Promise<void> | null = null;
 
   constructor() {
-    this.db = this.loadDb();
+    this.cache = this.createDefaultCache();
+    // Initialize PostgreSQL schema and load on boot
+    this.initPromise = this.init();
   }
 
-  private loadDb(): DatabaseSchema {
-    if (fs.existsSync(DB_FILE)) {
-      try {
-        const raw = fs.readFileSync(DB_FILE, 'utf8');
-        const parsed = JSON.parse(raw);
-        // Ensure defaults merge and migrate schema version
-        const mergedSettings: TradingSettings = {
-          ...DEFAULT_SETTINGS,
-          ...(parsed.settings || {}),
-          takeProfitPercent: Number(parsed.settings?.takeProfitPercent ?? DEFAULT_SETTINGS.takeProfitPercent),
-          stopLossPercent: Number(parsed.settings?.stopLossPercent ?? DEFAULT_SETTINGS.stopLossPercent),
-          minProfitForTechnicalExitPercent: Number(parsed.settings?.minProfitForTechnicalExitPercent ?? DEFAULT_SETTINGS.minProfitForTechnicalExitPercent),
-          maxExitPriceAgeMs: Number(parsed.settings?.maxExitPriceAgeMs ?? DEFAULT_SETTINGS.maxExitPriceAgeMs),
-        };
-        if (mergedSettings.scanIntervalMs === 300000) {
-          mergedSettings.scanIntervalMs = 120000;
-        }
+  private createDefaultCache(): DatabaseMemoryCache {
+    const paperAccId = 'paper-default';
+    const realAccId = 'real-default';
 
-        const loadedDb: DatabaseSchema = {
-          ...getInitialDb(),
-          ...parsed,
-          version: 2,
-          settings: mergedSettings,
-        };
+    return {
+      settings: { ...DEFAULT_SETTINGS },
+      isEmergencyStopped: false,
+      accounts: {
+        [paperAccId]: {
+          id: paperAccId,
+          name: 'Paper Trading Account',
+          mode: 'PAPER',
+          autoTrading: false,
+          resumeOnRestart: false,
+          hasApiKeys: false,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        },
+        [realAccId]: {
+          id: realAccId,
+          name: 'Binance Spot Live Account',
+          mode: 'REAL',
+          autoTrading: false,
+          resumeOnRestart: false,
+          hasApiKeys: false,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        },
+      },
+      credentials: {},
+      positions: [],
+      orders: [],
+      trades: [],
+      paperWallet: createInitialPaperWallet(DEFAULT_SETTINGS.paperStartingBalance),
+      realWallet: createInitialRealWallet(),
+      latestAnalysis: {},
+      symbolCooldowns: {},
+      scannerSummary: {
+        pairsAnalyzed: 0,
+        preBullishCount: 0,
+        bullishCount: 0,
+        strongBullishCount: 0,
+        weakeningCount: 0,
+        neutralCount: 0,
+        openPositionsCount: 0,
+        todayTradesCount: 0,
+        lastScanTime: 0,
+        nextScanTime: Date.now() + DEFAULT_SETTINGS.scanIntervalMs,
+        isScanning: false,
+      },
+      lastPersistedAt: Date.now(),
+    };
+  }
 
-        return loadedDb;
-      } catch (err) {
-        Logger.error('PAPER', 'ERROR', `Failed to load DB file, resetting to defaults: ${err}`);
+  public async init(): Promise<void> {
+    if (this.isInitialized) return;
+
+    try {
+      // 1. Initialize PostgreSQL schema
+      await initializePostgresSchema();
+
+      // 2. Perform safe one-time migration from JSON if present
+      await migrateFromJsonIfPresent(DB_FILE);
+
+      // 3. Load all persistent data from PostgreSQL into cache
+      await this.loadFromPostgres();
+
+      this.isInitialized = true;
+      Logger.info('PAPER', 'DATABASE', 'PostgreSQL storage engine initialized and state rehydrated successfully.');
+    } catch (err: any) {
+      Logger.error('PAPER', 'DATABASE', `Failed to initialize PostgreSQL storage engine: ${err.message}`);
+      this.isInitialized = true;
+      if (process.env.NODE_ENV === 'production' && !process.env.DATABASE_URL) {
+        throw err;
       }
     }
-    const init = getInitialDb();
-    this.db = init;
-    this.saveImmediate();
-    return init;
   }
 
-  private saveImmediate(): void {
+  public async ensureReady(): Promise<void> {
+    if (this.initPromise) {
+      await this.initPromise;
+    }
+  }
+
+  public async loadFromPostgres(): Promise<void> {
     try {
-      const tempPath = `${DB_FILE}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 6)}`;
-      const serialized = JSON.stringify(this.db, null, 2);
-      
-      // Write and fsync temporary file to ensure disk persistence
-      const fd = fs.openSync(tempPath, 'w', 0o600);
-      fs.writeSync(fd, serialized, 0, 'utf8');
-      fs.fsyncSync(fd);
-      fs.closeSync(fd);
+      // Load Settings
+      const settingsRes = await query('SELECT * FROM trading_settings WHERE id = $1', ['current']);
+      if (settingsRes.rows.length > 0) {
+        const row = settingsRes.rows[0];
+        this.cache.settings = {
+          mode: (row.mode as TradingMode) || 'PAPER',
+          autoTrading: Boolean(row.auto_trading),
+          fixedTradeAmount: Number(row.fixed_trade_amount) || 100,
+          maxOpenPositions: Number(row.max_open_positions) || 5,
+          minimumUsdtReserve: Number(row.minimum_usdt_reserve) || 100,
+          symbolCooldownMinutes: Number(row.symbol_cooldown_minutes) || 30,
+          preBullishScoreMin: Number(row.pre_bullish_score_min) || 65,
+          strongBullishScoreMin: Number(row.strong_bullish_score_min) || 80,
+          weakeningThreshold: Number(row.weakening_threshold) || 70,
+          maxTradeAmount: Number(row.max_trade_amount) || 1000,
+          paperStartingBalance: Number(row.paper_starting_balance) || 1000,
+          paperFeeRate: Number(row.paper_fee_rate) || 0.001,
+          paperSlippageBps: Number(row.paper_slippage_bps) || 5,
+          manageExistingHoldings: Boolean(row.manage_existing_holdings),
+          resumeOnRestart: Boolean(row.resume_on_restart),
+          scanIntervalMs: Number(row.scan_interval_ms) || 120000,
+          takeProfitPercent: Number(row.take_profit_percent) || 2.0,
+          stopLossPercent: Number(row.stop_loss_percent) || 3.0,
+          minProfitForTechnicalExitPercent: Number(row.min_profit_for_technical_exit_percent) || 0.20,
+          maxExitPriceAgeMs: Number(row.max_exit_price_age_ms) || 5000,
+        };
+      }
 
-      // Atomic rename replaces target database file safely
-      fs.renameSync(tempPath, DB_FILE);
-    } catch (err) {
-      Logger.error('PAPER', 'ERROR', `Atomic database save error: ${err}`);
+      // Load System State (Emergency Stop)
+      const stopRes = await query('SELECT value FROM system_state WHERE key = $1', ['emergency_stop']);
+      if (stopRes.rows.length > 0) {
+        const val = typeof stopRes.rows[0].value === 'string'
+          ? JSON.parse(stopRes.rows[0].value)
+          : stopRes.rows[0].value;
+        this.cache.isEmergencyStopped = Boolean(val?.isEmergencyStopped);
+      }
+
+      // Load Wallets
+      const walletsRes = await query('SELECT * FROM wallets');
+      for (const row of walletsRes.rows) {
+        const walletObj: WalletBalance = {
+          mode: row.mode as TradingMode,
+          usdtAvailable: Number(row.usdt_available),
+          usdtLocked: Number(row.usdt_locked || 0),
+          usdtTotal: Number(row.usdt_total),
+          accountAssetValue: Number(row.account_asset_value || 0),
+          totalEquity: Number(row.total_equity),
+          startingBalance: Number(row.starting_balance),
+          realizedPnL: Number(row.realized_pnl || 0),
+          unrealizedPnL: Number(row.unrealized_pnl || 0),
+          totalFeesPaid: Number(row.total_fees_paid || 0),
+          assets: typeof row.assets === 'string' ? JSON.parse(row.assets) : row.assets || [],
+          lastReconciledAt: Number(row.last_reconciled_at || Date.now()),
+          reconciliationStatus: row.reconciliation_status || 'OK',
+        };
+        if (row.mode === 'PAPER') {
+          this.cache.paperWallet = walletObj;
+        } else if (row.mode === 'REAL') {
+          this.cache.realWallet = walletObj;
+        }
+      }
+
+      // Load Positions
+      const positionsRes = await query('SELECT * FROM positions ORDER BY opened_at ASC');
+      this.cache.positions = positionsRes.rows.map(row => ({
+        id: row.id,
+        accountId: row.account_id,
+        symbol: row.symbol,
+        mode: row.mode as TradingMode,
+        status: row.status as Position['status'],
+        entryPrice: Number(row.entry_price),
+        quantity: Number(row.quantity),
+        remainingQuantity: Number(row.remaining_quantity ?? row.quantity),
+        entryQuoteAmount: Number(row.entry_quote_amount),
+        entryFees: Number(row.entry_fees || 0),
+        entryScore: Number(row.entry_score || 0),
+        entryState: row.entry_state,
+        entryReason: row.entry_reason,
+        currentPrice: Number(row.current_price),
+        currentScore: Number(row.current_score || 0),
+        currentState: row.current_state,
+        grossPnL: Number(row.gross_pnl || 0),
+        unrealizedPnL: Number(row.unrealized_pnl || 0),
+        unrealizedPnLPercent: Number(row.unrealized_pnl_percent || 0),
+        estimatedNetPnL: Number(row.estimated_net_pnl || 0),
+        estimatedNetPnLPercent: Number(row.estimated_net_pnl_percent || 0),
+        breakEvenPrice: Number(row.break_even_price),
+        takeProfitPrice: Number(row.take_profit_price),
+        stopLossPrice: Number(row.stop_loss_price),
+        openedAt: Number(row.opened_at),
+        updatedAt: Number(row.updated_at),
+        entryOrderId: row.entry_order_id || '',
+        exitOrderId: row.exit_order_id || undefined,
+        exitReason: row.exit_reason || undefined,
+      }));
+
+      // Load Orders
+      const ordersRes = await query('SELECT * FROM orders ORDER BY created_at ASC');
+      this.cache.orders = ordersRes.rows.map(row => ({
+        id: row.id,
+        clientOrderId: row.client_order_id,
+        binanceOrderId: row.binance_order_id || undefined,
+        accountId: row.account_id,
+        mode: row.mode as TradingMode,
+        symbol: row.symbol,
+        side: row.side as Order['side'],
+        status: row.status as Order['status'],
+        requestedQuoteAmount: Number(row.requested_quote_amount || 0),
+        executedQuantity: Number(row.executed_quantity || 0),
+        executedQuoteAmount: Number(row.executed_quote_amount || 0),
+        executionPrice: Number(row.execution_price || 0),
+        fee: Number(row.fee || 0),
+        feeAsset: row.fee_asset || 'USDT',
+        reason: row.reason || '',
+        strategyState: (row.strategy_state as StrategyState) || 'STRONG_BULLISH',
+        technicalScore: Number(row.technical_score || 0),
+        fills: typeof row.fills === 'string' ? JSON.parse(row.fills) : row.fills || [],
+        errorMessage: row.error_message || undefined,
+        createdAt: Number(row.created_at),
+        updatedAt: Number(row.updated_at),
+      }));
+
+      // Load Trades
+      const tradesRes = await query('SELECT * FROM trades ORDER BY closed_at ASC');
+      this.cache.trades = tradesRes.rows.map(row => ({
+        id: row.id,
+        accountId: row.account_id,
+        entryOrderId: row.entry_order_id || '',
+        exitOrderId: row.exit_order_id || '',
+        symbol: row.symbol,
+        mode: row.mode as TradingMode,
+        entryPrice: Number(row.entry_price),
+        exitPrice: Number(row.exit_price),
+        quantity: Number(row.quantity),
+        entryQuoteAmount: Number(row.entry_quote_amount),
+        exitQuoteAmount: Number(row.exit_quote_amount),
+        entryFees: Number(row.entry_fees || 0),
+        exitFees: Number(row.exit_fees || 0),
+        grossPnL: Number(row.gross_pnl || 0),
+        netPnL: Number(row.net_pnl || 0),
+        netPnLPercent: Number(row.net_pnl_percent || 0),
+        entryScore: Number(row.entry_score || 0),
+        exitScore: Number(row.exit_score || 0),
+        entryReason: row.entry_reason || '',
+        exitReason: row.exit_reason || '',
+        openedAt: Number(row.opened_at),
+        closedAt: Number(row.closed_at),
+        durationMs: Number(row.duration_ms || 0),
+      }));
+
+      // Load Accounts
+      const accountsRes = await query('SELECT * FROM accounts');
+      for (const row of accountsRes.rows) {
+        this.cache.accounts[row.id] = {
+          id: row.id,
+          name: row.name,
+          mode: row.mode as TradingMode,
+          autoTrading: Boolean(row.auto_trading),
+          resumeOnRestart: Boolean(row.resume_on_restart),
+          hasApiKeys: Boolean(row.has_api_keys),
+          apiKeyMasked: row.api_key_masked || undefined,
+          apiSecretConfigured: Boolean(row.api_secret_configured),
+          permissions: typeof row.permissions === 'string' ? JSON.parse(row.permissions) : row.permissions || undefined,
+          createdAt: Number(row.created_at),
+          updatedAt: Number(row.updated_at),
+        };
+      }
+
+      // Load Credentials
+      const credsRes = await query('SELECT * FROM credentials');
+      for (const row of credsRes.rows) {
+        this.cache.credentials[row.account_id] = {
+          apiKey: row.api_key,
+          secretPayload: {
+            iv: row.secret_iv,
+            tag: row.secret_tag,
+            data: row.secret_data,
+          },
+        };
+      }
+
+      // Load Symbol Cooldowns
+      const cdRes = await query('SELECT * FROM symbol_cooldowns');
+      this.cache.symbolCooldowns = {};
+      const now = Date.now();
+      for (const row of cdRes.rows) {
+        const until = Number(row.until_timestamp);
+        if (until > now) {
+          this.cache.symbolCooldowns[row.key] = {
+            symbol: row.symbol,
+            mode: row.mode as TradingMode,
+            until,
+          };
+        }
+      }
+
+      this.cache.scannerSummary.openPositionsCount = this.cache.positions.filter(p => p.status === 'OPEN').length;
+      this.cache.lastPersistedAt = Date.now();
+    } catch (err: any) {
+      Logger.error('PAPER', 'DATABASE', `Error loading state from PostgreSQL: ${err.message}`);
+      throw err;
     }
   }
 
-  public save(): void {
-    if (this.saveTimeout) {
-      clearTimeout(this.saveTimeout);
-    }
-    this.saveTimeout = setTimeout(() => {
-      this.saveImmediate();
-    }, 50);
-  }
-
-  public flush(): void {
-    if (this.saveTimeout) {
-      clearTimeout(this.saveTimeout);
-      this.saveTimeout = null;
-    }
-    this.saveImmediate();
-  }
-
+  // --- Health & Readiness ---
   public isReady(): boolean {
-    return fs.existsSync(DATA_DIR) && this.db !== undefined;
+    return this.isInitialized;
+  }
+
+  public async isDatabaseReadyAsync(): Promise<boolean> {
+    const health = await checkPostgresHealth();
+    return health.isConnected && this.isInitialized;
   }
 
   public getDataDir(): string {
     return DATA_DIR;
   }
 
+  public flush(): void {
+    // No-op for file disk flush; all updates write synchronously to PostgreSQL
+    this.cache.lastPersistedAt = Date.now();
+  }
+
   // --- Settings ---
   public getSettings(): TradingSettings {
-    return { ...this.db.settings };
+    return { ...this.cache.settings };
   }
 
   public updateSettings(updates: Partial<TradingSettings>): TradingSettings {
-    // Validate fixed trade amount if provided
     if (updates.fixedTradeAmount !== undefined) {
       const val = Number(updates.fixedTradeAmount);
-      if (isNaN(val) || !isFinite(val) || val <= 0 || val > this.db.settings.maxTradeAmount) {
-        throw new Error(`Invalid trade amount. Must be a positive number up to ${this.db.settings.maxTradeAmount} USDT.`);
+      if (isNaN(val) || !isFinite(val) || val <= 0 || val > this.cache.settings.maxTradeAmount) {
+        throw new Error(`Invalid trade amount. Must be a positive number up to ${this.cache.settings.maxTradeAmount} USDT.`);
       }
-      this.db.settings.fixedTradeAmount = Number(val.toFixed(2));
+      this.cache.settings.fixedTradeAmount = Number(val.toFixed(2));
     }
 
     if (updates.maxOpenPositions !== undefined) {
       const maxPos = Math.max(1, Math.min(20, Math.floor(Number(updates.maxOpenPositions))));
-      this.db.settings.maxOpenPositions = maxPos;
+      this.cache.settings.maxOpenPositions = maxPos;
     }
 
     if (updates.minimumUsdtReserve !== undefined) {
-      this.db.settings.minimumUsdtReserve = Math.max(0, Number(updates.minimumUsdtReserve));
+      this.cache.settings.minimumUsdtReserve = Math.max(0, Number(updates.minimumUsdtReserve));
     }
 
     if (updates.symbolCooldownMinutes !== undefined) {
-      this.db.settings.symbolCooldownMinutes = Math.max(1, Math.floor(Number(updates.symbolCooldownMinutes)));
+      this.cache.settings.symbolCooldownMinutes = Math.max(1, Math.floor(Number(updates.symbolCooldownMinutes)));
     }
 
     if (updates.preBullishScoreMin !== undefined) {
-      this.db.settings.preBullishScoreMin = Math.max(50, Math.min(95, Number(updates.preBullishScoreMin)));
+      this.cache.settings.preBullishScoreMin = Math.max(50, Math.min(95, Number(updates.preBullishScoreMin)));
     }
 
     if (updates.strongBullishScoreMin !== undefined) {
-      this.db.settings.strongBullishScoreMin = Math.max(60, Math.min(100, Number(updates.strongBullishScoreMin)));
+      this.cache.settings.strongBullishScoreMin = Math.max(60, Math.min(100, Number(updates.strongBullishScoreMin)));
     }
 
     if (updates.weakeningThreshold !== undefined) {
-      this.db.settings.weakeningThreshold = Math.max(40, Math.min(90, Number(updates.weakeningThreshold)));
+      this.cache.settings.weakeningThreshold = Math.max(40, Math.min(90, Number(updates.weakeningThreshold)));
     }
 
     if (updates.mode !== undefined) {
-      this.db.settings.mode = updates.mode;
+      this.cache.settings.mode = updates.mode;
     }
 
     if (updates.autoTrading !== undefined) {
-      this.db.settings.autoTrading = Boolean(updates.autoTrading);
+      this.cache.settings.autoTrading = Boolean(updates.autoTrading);
     }
 
     if (updates.resumeOnRestart !== undefined) {
-      this.db.settings.resumeOnRestart = Boolean(updates.resumeOnRestart);
+      this.cache.settings.resumeOnRestart = Boolean(updates.resumeOnRestart);
     }
 
     if (updates.manageExistingHoldings !== undefined) {
-      this.db.settings.manageExistingHoldings = Boolean(updates.manageExistingHoldings);
+      this.cache.settings.manageExistingHoldings = Boolean(updates.manageExistingHoldings);
     }
 
     if (updates.takeProfitPercent !== undefined) {
       const tp = Number(updates.takeProfitPercent);
       if (!isNaN(tp) && tp > 0) {
-        this.db.settings.takeProfitPercent = Number(tp.toFixed(2));
+        this.cache.settings.takeProfitPercent = Number(tp.toFixed(2));
       }
     }
 
     if (updates.stopLossPercent !== undefined) {
       const sl = Number(updates.stopLossPercent);
       if (!isNaN(sl) && sl > 0) {
-        this.db.settings.stopLossPercent = Number(sl.toFixed(2));
+        this.cache.settings.stopLossPercent = Number(sl.toFixed(2));
       }
     }
 
     if (updates.minProfitForTechnicalExitPercent !== undefined) {
       const minP = Number(updates.minProfitForTechnicalExitPercent);
       if (!isNaN(minP) && minP >= 0) {
-        this.db.settings.minProfitForTechnicalExitPercent = Number(minP.toFixed(2));
+        this.cache.settings.minProfitForTechnicalExitPercent = Number(minP.toFixed(2));
       }
     }
 
     if (updates.maxExitPriceAgeMs !== undefined) {
       const age = Number(updates.maxExitPriceAgeMs);
       if (!isNaN(age) && age >= 1000) {
-        this.db.settings.maxExitPriceAgeMs = Math.floor(age);
+        this.cache.settings.maxExitPriceAgeMs = Math.floor(age);
       }
     }
 
     if (updates.paperFeeRate !== undefined) {
       const fee = Number(updates.paperFeeRate);
       if (!isNaN(fee) && fee >= 0) {
-        this.db.settings.paperFeeRate = fee;
+        this.cache.settings.paperFeeRate = fee;
       }
     }
 
     if (updates.paperSlippageBps !== undefined) {
       const slip = Number(updates.paperSlippageBps);
       if (!isNaN(slip) && slip >= 0) {
-        this.db.settings.paperSlippageBps = slip;
+        this.cache.settings.paperSlippageBps = slip;
       }
     }
 
-    this.save();
+    // Persist to PostgreSQL
+    const s = this.cache.settings;
+    query(
+      `INSERT INTO trading_settings (
+        id, mode, auto_trading, fixed_trade_amount, max_open_positions,
+        minimum_usdt_reserve, symbol_cooldown_minutes, pre_bullish_score_min,
+        strong_bullish_score_min, weakening_threshold, max_trade_amount,
+        paper_starting_balance, paper_fee_rate, paper_slippage_bps,
+        manage_existing_holdings, resume_on_restart, scan_interval_ms,
+        take_profit_percent, stop_loss_percent, min_profit_for_technical_exit_percent,
+        max_exit_price_age_ms, updated_at
+      ) VALUES (
+        'current', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21
+      ) ON CONFLICT (id) DO UPDATE SET
+        mode = EXCLUDED.mode,
+        auto_trading = EXCLUDED.auto_trading,
+        fixed_trade_amount = EXCLUDED.fixed_trade_amount,
+        max_open_positions = EXCLUDED.max_open_positions,
+        minimum_usdt_reserve = EXCLUDED.minimum_usdt_reserve,
+        symbol_cooldown_minutes = EXCLUDED.symbol_cooldown_minutes,
+        pre_bullish_score_min = EXCLUDED.pre_bullish_score_min,
+        strong_bullish_score_min = EXCLUDED.strong_bullish_score_min,
+        weakening_threshold = EXCLUDED.weakening_threshold,
+        take_profit_percent = EXCLUDED.take_profit_percent,
+        stop_loss_percent = EXCLUDED.stop_loss_percent,
+        min_profit_for_technical_exit_percent = EXCLUDED.min_profit_for_technical_exit_percent,
+        updated_at = EXCLUDED.updated_at`,
+      [
+        s.mode,
+        s.autoTrading,
+        s.fixedTradeAmount,
+        s.maxOpenPositions,
+        s.minimumUsdtReserve,
+        s.symbolCooldownMinutes,
+        s.preBullishScoreMin,
+        s.strongBullishScoreMin,
+        s.weakeningThreshold,
+        s.maxTradeAmount,
+        s.paperStartingBalance,
+        s.paperFeeRate,
+        s.paperSlippageBps,
+        s.manageExistingHoldings,
+        s.resumeOnRestart,
+        s.scanIntervalMs,
+        s.takeProfitPercent,
+        s.stopLossPercent,
+        s.minProfitForTechnicalExitPercent,
+        s.maxExitPriceAgeMs,
+        Date.now(),
+      ]
+    ).catch(err => {
+      Logger.error('PAPER', 'DATABASE', `Failed to persist settings to PostgreSQL: ${err.message}`);
+    });
+
     return this.getSettings();
   }
 
   // --- Accounts & Credentials ---
   public getAccount(id: string): TradingAccount | undefined {
-    return this.db.accounts[id];
+    return this.cache.accounts[id];
   }
 
   public getAccounts(): TradingAccount[] {
-    return Object.values(this.db.accounts);
+    return Object.values(this.cache.accounts);
   }
 
   public saveAccount(acc: TradingAccount): void {
-    this.db.accounts[acc.id] = { ...acc, updatedAt: Date.now() };
-    this.save();
+    const updated = { ...acc, updatedAt: Date.now() };
+    this.cache.accounts[acc.id] = updated;
+
+    query(
+      `INSERT INTO accounts (
+        id, name, mode, auto_trading, resume_on_restart, has_api_keys,
+        api_key_masked, api_secret_configured, permissions, created_at, updated_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      ON CONFLICT (id) DO UPDATE SET
+        name = EXCLUDED.name,
+        auto_trading = EXCLUDED.auto_trading,
+        has_api_keys = EXCLUDED.has_api_keys,
+        api_key_masked = EXCLUDED.api_key_masked,
+        api_secret_configured = EXCLUDED.api_secret_configured,
+        permissions = EXCLUDED.permissions,
+        updated_at = EXCLUDED.updated_at`,
+      [
+        updated.id,
+        updated.name,
+        updated.mode,
+        updated.autoTrading,
+        updated.resumeOnRestart,
+        updated.hasApiKeys,
+        updated.apiKeyMasked || null,
+        updated.apiSecretConfigured || false,
+        JSON.stringify(updated.permissions || null),
+        updated.createdAt,
+        updated.updatedAt,
+      ]
+    ).catch(err => {
+      Logger.error('PAPER', 'DATABASE', `Failed to persist account to PostgreSQL: ${err.message}`);
+    });
   }
 
   public saveBinanceCredentials(accountId: string, apiKey: string, secret: string, permissions?: TradingAccount['permissions']): void {
     const payload = encryptSecret(secret);
-    this.db.credentials[accountId] = {
+    this.cache.credentials[accountId] = {
       apiKey,
       secretPayload: payload,
     };
 
-    const acc = this.db.accounts[accountId] || {
+    const acc = this.cache.accounts[accountId] || {
       id: accountId,
       name: 'Binance Spot Live Account',
       mode: 'REAL',
@@ -386,12 +658,53 @@ class StorageEngine {
     acc.permissions = permissions;
     acc.updatedAt = Date.now();
 
-    this.db.accounts[accountId] = acc;
-    this.save();
+    this.cache.accounts[accountId] = acc;
+
+    withTransaction(async (client) => {
+      await client.query(
+        `INSERT INTO credentials (account_id, api_key, secret_iv, secret_tag, secret_data, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (account_id) DO UPDATE SET
+           api_key = EXCLUDED.api_key,
+           secret_iv = EXCLUDED.secret_iv,
+           secret_tag = EXCLUDED.secret_tag,
+           secret_data = EXCLUDED.secret_data,
+           updated_at = EXCLUDED.updated_at`,
+        [accountId, apiKey, payload.iv, payload.tag, payload.data, Date.now()]
+      );
+
+      await client.query(
+        `INSERT INTO accounts (
+          id, name, mode, auto_trading, resume_on_restart, has_api_keys,
+          api_key_masked, api_secret_configured, permissions, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        ON CONFLICT (id) DO UPDATE SET
+          has_api_keys = EXCLUDED.has_api_keys,
+          api_key_masked = EXCLUDED.api_key_masked,
+          api_secret_configured = EXCLUDED.api_secret_configured,
+          permissions = EXCLUDED.permissions,
+          updated_at = EXCLUDED.updated_at`,
+        [
+          acc.id,
+          acc.name,
+          acc.mode,
+          acc.autoTrading,
+          acc.resumeOnRestart,
+          acc.hasApiKeys,
+          acc.apiKeyMasked || null,
+          acc.apiSecretConfigured || false,
+          JSON.stringify(acc.permissions || null),
+          acc.createdAt,
+          acc.updatedAt,
+        ]
+      );
+    }).catch(err => {
+      Logger.error('PAPER', 'DATABASE', `Failed to persist credentials to PostgreSQL: ${err.message}`);
+    });
   }
 
   public getDecryptedCredentials(accountId: string): { apiKey: string; apiSecret: string } | null {
-    const creds = this.db.credentials[accountId];
+    const creds = this.cache.credentials[accountId];
     if (!creds) return null;
     try {
       const secret = decryptSecret(creds.secretPayload);
@@ -399,27 +712,43 @@ class StorageEngine {
         apiKey: creds.apiKey,
         apiSecret: secret,
       };
-    } catch (err) {
+    } catch {
       Logger.error('REAL', 'SECURITY', `Failed to decrypt Binance credentials for account ${accountId}`);
       return null;
     }
   }
 
   public removeBinanceCredentials(accountId: string): void {
-    delete this.db.credentials[accountId];
-    if (this.db.accounts[accountId]) {
-      this.db.accounts[accountId].hasApiKeys = false;
-      this.db.accounts[accountId].apiKeyMasked = undefined;
-      this.db.accounts[accountId].apiSecretConfigured = false;
-      this.db.accounts[accountId].autoTrading = false;
-      this.db.accounts[accountId].permissions = undefined;
+    delete this.cache.credentials[accountId];
+    if (this.cache.accounts[accountId]) {
+      this.cache.accounts[accountId].hasApiKeys = false;
+      this.cache.accounts[accountId].apiKeyMasked = undefined;
+      this.cache.accounts[accountId].apiSecretConfigured = false;
+      this.cache.accounts[accountId].autoTrading = false;
+      this.cache.accounts[accountId].permissions = undefined;
     }
-    this.save();
+
+    withTransaction(async (client) => {
+      await client.query('DELETE FROM credentials WHERE account_id = $1', [accountId]);
+      await client.query(
+        `UPDATE accounts SET
+          has_api_keys = FALSE,
+          api_key_masked = NULL,
+          api_secret_configured = FALSE,
+          auto_trading = FALSE,
+          permissions = NULL,
+          updated_at = $1
+         WHERE id = $2`,
+        [Date.now(), accountId]
+      );
+    }).catch(err => {
+      Logger.error('PAPER', 'DATABASE', `Failed to remove credentials from PostgreSQL: ${err.message}`);
+    });
   }
 
   // --- Wallets ---
   public getWallet(mode: TradingMode): WalletBalance {
-    return mode === 'PAPER' ? { ...this.db.paperWallet } : { ...this.db.realWallet };
+    return mode === 'PAPER' ? { ...this.cache.paperWallet } : { ...this.cache.realWallet };
   }
 
   public saveWallet(wallet: WalletBalance): WalletBalance {
@@ -427,46 +756,128 @@ class StorageEngine {
   }
 
   public updateWallet(mode: TradingMode, updates: Partial<WalletBalance>): WalletBalance {
+    const target = mode === 'PAPER' ? this.cache.paperWallet : this.cache.realWallet;
+    const updated: WalletBalance = {
+      ...target,
+      ...updates,
+      lastReconciledAt: Date.now(),
+    };
+
     if (mode === 'PAPER') {
-      this.db.paperWallet = {
-        ...this.db.paperWallet,
-        ...updates,
-        lastReconciledAt: Date.now(),
-      };
-      this.save();
-      return { ...this.db.paperWallet };
+      this.cache.paperWallet = updated;
     } else {
-      this.db.realWallet = {
-        ...this.db.realWallet,
-        ...updates,
-        lastReconciledAt: Date.now(),
-      };
-      this.save();
-      return { ...this.db.realWallet };
+      this.cache.realWallet = updated;
     }
+
+    query(
+      `INSERT INTO wallets (
+        mode, usdt_available, usdt_locked, usdt_total, account_asset_value,
+        total_equity, starting_balance, realized_pnl, unrealized_pnl,
+        total_fees_paid, assets, last_reconciled_at, reconciliation_status, updated_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+      ON CONFLICT (mode) DO UPDATE SET
+        usdt_available = EXCLUDED.usdt_available,
+        usdt_locked = EXCLUDED.usdt_locked,
+        usdt_total = EXCLUDED.usdt_total,
+        account_asset_value = EXCLUDED.account_asset_value,
+        total_equity = EXCLUDED.total_equity,
+        realized_pnl = EXCLUDED.realized_pnl,
+        unrealized_pnl = EXCLUDED.unrealized_pnl,
+        total_fees_paid = EXCLUDED.total_fees_paid,
+        assets = EXCLUDED.assets,
+        last_reconciled_at = EXCLUDED.last_reconciled_at,
+        updated_at = EXCLUDED.updated_at`,
+      [
+        updated.mode,
+        updated.usdtAvailable,
+        updated.usdtLocked,
+        updated.usdtTotal,
+        updated.accountAssetValue,
+        updated.totalEquity,
+        updated.startingBalance,
+        updated.realizedPnL,
+        updated.unrealizedPnL,
+        updated.totalFeesPaid,
+        JSON.stringify(updated.assets),
+        updated.lastReconciledAt,
+        updated.reconciliationStatus,
+        Date.now(),
+      ]
+    ).catch(err => {
+      Logger.error('PAPER', 'DATABASE', `Failed to persist wallet to PostgreSQL: ${err.message}`);
+    });
+
+    return updated;
   }
 
   public resetPaperAccount(): void {
-    const starting = this.db.settings.paperStartingBalance || 1000;
-    this.db.paperWallet = createInitialPaperWallet(starting);
-    // Remove all paper positions, orders, trades
-    this.db.positions = this.db.positions.filter(p => p.mode !== 'PAPER');
-    this.db.orders = this.db.orders.filter(o => o.mode !== 'PAPER');
-    this.db.trades = this.db.trades.filter(t => t.mode !== 'PAPER');
-    // Clear paper cooldowns
-    Object.keys(this.db.symbolCooldowns).forEach(k => {
-      if (this.db.symbolCooldowns[k].mode === 'PAPER') {
-        delete this.db.symbolCooldowns[k];
+    const starting = this.cache.settings.paperStartingBalance || 1000;
+    this.cache.paperWallet = createInitialPaperWallet(starting);
+    this.cache.positions = this.cache.positions.filter(p => p.mode !== 'PAPER');
+    this.cache.orders = this.cache.orders.filter(o => o.mode !== 'PAPER');
+    this.cache.trades = this.cache.trades.filter(t => t.mode !== 'PAPER');
+
+    Object.keys(this.cache.symbolCooldowns).forEach(k => {
+      if (this.cache.symbolCooldowns[k].mode === 'PAPER') {
+        delete this.cache.symbolCooldowns[k];
       }
     });
-    this.db.scannerSummary.openPositionsCount = this.getPositions('PAPER', 'OPEN').length;
-    this.save();
+
+    this.cache.scannerSummary.openPositionsCount = this.getPositions('PAPER', 'OPEN').length;
+
+    withTransaction(async (client) => {
+      await client.query('DELETE FROM positions WHERE mode = $1', ['PAPER']);
+      await client.query('DELETE FROM orders WHERE mode = $1', ['PAPER']);
+      await client.query('DELETE FROM trades WHERE mode = $1', ['PAPER']);
+      await client.query('DELETE FROM symbol_cooldowns WHERE mode = $1', ['PAPER']);
+
+      const pw = this.cache.paperWallet;
+      await client.query(
+        `INSERT INTO wallets (
+          mode, usdt_available, usdt_locked, usdt_total, account_asset_value,
+          total_equity, starting_balance, realized_pnl, unrealized_pnl,
+          total_fees_paid, assets, last_reconciled_at, reconciliation_status, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        ON CONFLICT (mode) DO UPDATE SET
+          usdt_available = EXCLUDED.usdt_available,
+          usdt_locked = EXCLUDED.usdt_locked,
+          usdt_total = EXCLUDED.usdt_total,
+          account_asset_value = EXCLUDED.account_asset_value,
+          total_equity = EXCLUDED.total_equity,
+          starting_balance = EXCLUDED.starting_balance,
+          realized_pnl = EXCLUDED.realized_pnl,
+          unrealized_pnl = EXCLUDED.unrealized_pnl,
+          total_fees_paid = EXCLUDED.total_fees_paid,
+          assets = EXCLUDED.assets,
+          last_reconciled_at = EXCLUDED.last_reconciled_at,
+          updated_at = EXCLUDED.updated_at`,
+        [
+          'PAPER',
+          pw.usdtAvailable,
+          pw.usdtLocked,
+          pw.usdtTotal,
+          pw.accountAssetValue,
+          pw.totalEquity,
+          pw.startingBalance,
+          pw.realizedPnL,
+          pw.unrealizedPnL,
+          pw.totalFeesPaid,
+          JSON.stringify(pw.assets),
+          pw.lastReconciledAt,
+          pw.reconciliationStatus,
+          Date.now(),
+        ]
+      );
+    }).catch(err => {
+      Logger.error('PAPER', 'DATABASE', `Failed to reset paper account in PostgreSQL: ${err.message}`);
+    });
+
     Logger.info('PAPER', 'WALLET', `Paper account successfully reset: all active positions closed, wallet balance restored to default ${starting} USDT.`);
   }
 
   // --- Positions ---
   public getPositions(mode?: TradingMode, status?: Position['status']): Position[] {
-    let list = this.db.positions;
+    let list = this.cache.positions;
     if (mode) {
       list = list.filter(p => p.mode === mode);
     }
@@ -477,26 +888,100 @@ class StorageEngine {
   }
 
   public getOpenPositionForSymbol(symbol: string, mode: TradingMode): Position | undefined {
-    return this.db.positions.find(p => p.symbol === symbol && p.mode === mode && p.status === 'OPEN');
+    return this.cache.positions.find(p => p.symbol === symbol && p.mode === mode && p.status === 'OPEN');
   }
 
   public getPositionById(id: string): Position | undefined {
-    return this.db.positions.find(p => p.id === id);
+    return this.cache.positions.find(p => p.id === id);
   }
 
   public savePosition(position: Position): void {
-    const idx = this.db.positions.findIndex(p => p.id === position.id);
+    const updated = { ...position, updatedAt: Date.now() };
+    const idx = this.cache.positions.findIndex(p => p.id === position.id);
     if (idx >= 0) {
-      this.db.positions[idx] = { ...position, updatedAt: Date.now() };
+      this.cache.positions[idx] = updated;
     } else {
-      this.db.positions.push({ ...position, updatedAt: Date.now() });
+      this.cache.positions.push(updated);
     }
-    this.save();
+
+    query(
+      `INSERT INTO positions (
+        id, account_id, symbol, mode, status, entry_price, quantity, remaining_quantity,
+        entry_quote_amount, entry_fees, entry_score, entry_state, entry_reason,
+        current_price, current_score, current_state, gross_pnl, unrealized_pnl,
+        unrealized_pnl_percent, estimated_net_pnl, estimated_net_pnl_percent,
+        break_even_price, take_profit_price, stop_loss_price, opened_at, updated_at,
+        entry_order_id, exit_order_id, closed_at, exit_price, exit_reason, exit_score,
+        realized_net_pnl, realized_net_pnl_percent, exit_fees
+      ) VALUES (
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+        $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28,
+        $29, $30, $31, $32, $33, $34, $35
+      ) ON CONFLICT (id) DO UPDATE SET
+        status = EXCLUDED.status,
+        remaining_quantity = EXCLUDED.remaining_quantity,
+        current_price = EXCLUDED.current_price,
+        current_score = EXCLUDED.current_score,
+        current_state = EXCLUDED.current_state,
+        gross_pnl = EXCLUDED.gross_pnl,
+        unrealized_pnl = EXCLUDED.unrealized_pnl,
+        unrealized_pnl_percent = EXCLUDED.unrealized_pnl_percent,
+        estimated_net_pnl = EXCLUDED.estimated_net_pnl,
+        estimated_net_pnl_percent = EXCLUDED.estimated_net_pnl_percent,
+        closed_at = EXCLUDED.closed_at,
+        exit_price = EXCLUDED.exit_price,
+        exit_reason = EXCLUDED.exit_reason,
+        exit_order_id = EXCLUDED.exit_order_id,
+        exit_score = EXCLUDED.exit_score,
+        realized_net_pnl = EXCLUDED.realized_net_pnl,
+        realized_net_pnl_percent = EXCLUDED.realized_net_pnl_percent,
+        exit_fees = EXCLUDED.exit_fees,
+        updated_at = EXCLUDED.updated_at`,
+      [
+        updated.id,
+        updated.accountId,
+        updated.symbol,
+        updated.mode,
+        updated.status,
+        updated.entryPrice,
+        updated.quantity,
+        updated.remainingQuantity,
+        updated.entryQuoteAmount,
+        updated.entryFees,
+        updated.entryScore,
+        updated.entryState,
+        updated.entryReason,
+        updated.currentPrice,
+        updated.currentScore || 0,
+        updated.currentState,
+        updated.grossPnL || 0,
+        updated.unrealizedPnL || 0,
+        updated.unrealizedPnLPercent || 0,
+        updated.estimatedNetPnL || 0,
+        updated.estimatedNetPnLPercent || 0,
+        updated.breakEvenPrice || updated.entryPrice,
+        updated.takeProfitPrice || (updated.entryPrice * 1.02),
+        updated.stopLossPrice || (updated.entryPrice * 0.97),
+        updated.openedAt,
+        updated.updatedAt,
+        updated.entryOrderId || null,
+        updated.exitOrderId || null,
+        null,
+        null,
+        updated.exitReason || null,
+        null,
+        null,
+        null,
+        0,
+      ]
+    ).catch(err => {
+      Logger.error('PAPER', 'DATABASE', `Failed to persist position to PostgreSQL: ${err.message}`);
+    });
   }
 
   // --- Orders ---
   public getOrders(mode?: TradingMode, symbol?: string): Order[] {
-    let list = this.db.orders;
+    let list = this.cache.orders;
     if (mode) {
       list = list.filter(o => o.mode === mode);
     }
@@ -507,22 +992,64 @@ class StorageEngine {
   }
 
   public getOrderById(id: string): Order | undefined {
-    return this.db.orders.find(o => o.id === id || o.clientOrderId === id);
+    return this.cache.orders.find(o => o.id === id || o.clientOrderId === id);
   }
 
   public saveOrder(order: Order): void {
-    const idx = this.db.orders.findIndex(o => o.id === order.id || o.clientOrderId === order.clientOrderId);
+    const updated = { ...order, updatedAt: Date.now() };
+    const idx = this.cache.orders.findIndex(o => o.id === order.id || o.clientOrderId === order.clientOrderId);
     if (idx >= 0) {
-      this.db.orders[idx] = { ...order, updatedAt: Date.now() };
+      this.cache.orders[idx] = updated;
     } else {
-      this.db.orders.push({ ...order, updatedAt: Date.now() });
+      this.cache.orders.push(updated);
     }
-    this.save();
+
+    query(
+      `INSERT INTO orders (
+        id, client_order_id, binance_order_id, account_id, mode, symbol, side, status,
+        requested_quote_amount, executed_quantity, executed_quote_amount, execution_price,
+        fee, fee_asset, reason, strategy_state, technical_score, fills, error_message, created_at, updated_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+      ON CONFLICT (client_order_id) DO UPDATE SET
+        status = EXCLUDED.status,
+        executed_quantity = EXCLUDED.executed_quantity,
+        executed_quote_amount = EXCLUDED.executed_quote_amount,
+        execution_price = EXCLUDED.execution_price,
+        fee = EXCLUDED.fee,
+        fills = EXCLUDED.fills,
+        error_message = EXCLUDED.error_message,
+        updated_at = EXCLUDED.updated_at`,
+      [
+        updated.id,
+        updated.clientOrderId,
+        updated.binanceOrderId || null,
+        updated.accountId,
+        updated.mode,
+        updated.symbol,
+        updated.side,
+        updated.status,
+        updated.requestedQuoteAmount || 0,
+        updated.executedQuantity || 0,
+        updated.executedQuoteAmount || 0,
+        updated.executionPrice || null,
+        updated.fee,
+        updated.feeAsset,
+        updated.reason,
+        updated.strategyState || null,
+        updated.technicalScore || null,
+        JSON.stringify(updated.fills || []),
+        updated.errorMessage || null,
+        updated.createdAt,
+        updated.updatedAt,
+      ]
+    ).catch(err => {
+      Logger.error('PAPER', 'DATABASE', `Failed to persist order to PostgreSQL: ${err.message}`);
+    });
   }
 
   // --- Trades ---
   public getTrades(mode?: TradingMode, symbol?: string): Trade[] {
-    let list = this.db.trades;
+    let list = this.cache.trades;
     if (mode) {
       list = list.filter(t => t.mode === mode);
     }
@@ -533,87 +1060,142 @@ class StorageEngine {
   }
 
   public saveTrade(trade: Trade): void {
-    const idx = this.db.trades.findIndex(t => t.id === trade.id);
+    const idx = this.cache.trades.findIndex(t => t.id === trade.id);
     if (idx >= 0) {
-      this.db.trades[idx] = trade;
+      this.cache.trades[idx] = trade;
     } else {
-      this.db.trades.push(trade);
+      this.cache.trades.push(trade);
     }
-    this.save();
+
+    query(
+      `INSERT INTO trades (
+        id, account_id, entry_order_id, exit_order_id, symbol, mode, entry_price, exit_price,
+        quantity, entry_quote_amount, exit_quote_amount, entry_fees, exit_fees,
+        gross_pnl, net_pnl, net_pnl_percent, entry_score, exit_score,
+        entry_reason, exit_reason, opened_at, closed_at, duration_ms
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+      ON CONFLICT (id) DO UPDATE SET
+        net_pnl = EXCLUDED.net_pnl,
+        net_pnl_percent = EXCLUDED.net_pnl_percent,
+        exit_price = EXCLUDED.exit_price,
+        closed_at = EXCLUDED.closed_at`,
+      [
+        trade.id,
+        trade.accountId,
+        trade.entryOrderId,
+        trade.exitOrderId,
+        trade.symbol,
+        trade.mode,
+        trade.entryPrice,
+        trade.exitPrice,
+        trade.quantity,
+        trade.entryQuoteAmount,
+        trade.exitQuoteAmount,
+        trade.entryFees,
+        trade.exitFees,
+        trade.grossPnL,
+        trade.netPnL,
+        trade.netPnLPercent,
+        trade.entryScore || null,
+        trade.exitScore || null,
+        trade.entryReason || null,
+        trade.exitReason || null,
+        trade.openedAt,
+        trade.closedAt,
+        trade.durationMs,
+      ]
+    ).catch(err => {
+      Logger.error('PAPER', 'DATABASE', `Failed to persist trade to PostgreSQL: ${err.message}`);
+    });
+  }
+
+  // --- Atomic Transaction Helpers ---
+  public async openPositionTx(params: OpenPositionParams): Promise<void> {
+    await openPositionTransaction(params);
+    this.saveOrder(params.order);
+    this.savePosition(params.position);
+    this.saveWallet(params.wallet);
+  }
+
+  public async closePositionTx(params: ClosePositionParams): Promise<void> {
+    await closePositionTransaction(params);
+    this.saveOrder(params.exitOrder);
+    this.savePosition(params.position);
+    this.saveTrade(params.trade);
+    this.saveWallet(params.wallet);
   }
 
   // --- Cooldowns ---
   public setSymbolCooldown(symbol: string, mode: TradingMode, minutes: number): void {
     const key = `${mode}_${symbol}`;
-    this.db.symbolCooldowns[key] = {
-      symbol,
-      mode,
-      until: Date.now() + minutes * 60 * 1000,
-    };
-    this.save();
+    const until = Date.now() + minutes * 60 * 1000;
+    this.cache.symbolCooldowns[key] = { symbol, mode, until };
+
+    query(
+      `INSERT INTO symbol_cooldowns (key, symbol, mode, until_timestamp)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (key) DO UPDATE SET until_timestamp = EXCLUDED.until_timestamp`,
+      [key, symbol, mode, until]
+    ).catch(err => {
+      Logger.error('PAPER', 'DATABASE', `Failed to set symbol cooldown in PostgreSQL: ${err.message}`);
+    });
   }
 
   public isSymbolInCooldown(symbol: string, mode: TradingMode): { inCooldown: boolean; remainingMinutes: number } {
     const key = `${mode}_${symbol}`;
-    const cd = this.db.symbolCooldowns[key];
+    const cd = this.cache.symbolCooldowns[key];
     if (!cd) return { inCooldown: false, remainingMinutes: 0 };
     const diff = cd.until - Date.now();
     if (diff > 0) {
       return { inCooldown: true, remainingMinutes: Math.ceil(diff / (60 * 1000)) };
     }
-    delete this.db.symbolCooldowns[key];
+    delete this.cache.symbolCooldowns[key];
+    query('DELETE FROM symbol_cooldowns WHERE key = $1', [key]).catch(() => {});
     return { inCooldown: false, remainingMinutes: 0 };
   }
 
-  // --- Emergency Stop Persistence ---
+  // --- Emergency Stop ---
   public isEmergencyStopped(): boolean {
-    return Boolean(this.db.isEmergencyStopped);
+    return Boolean(this.cache.isEmergencyStopped);
   }
 
   public setEmergencyStopped(val: boolean): void {
-    this.db.isEmergencyStopped = Boolean(val);
-    this.save();
+    this.cache.isEmergencyStopped = Boolean(val);
+
+    query(
+      `INSERT INTO system_state (key, value, updated_at)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`,
+      ['emergency_stop', JSON.stringify({ isEmergencyStopped: Boolean(val) }), Date.now()]
+    ).catch(err => {
+      Logger.error('PAPER', 'DATABASE', `Failed to persist emergency stop to PostgreSQL: ${err.message}`);
+    });
   }
 
   // --- Database Stats & Diagnostics ---
   public getDatabaseStats() {
-    let fileSize = 0;
-    let fileModifiedAt = 0;
-    try {
-      if (fs.existsSync(DB_FILE)) {
-        const stat = fs.statSync(DB_FILE);
-        fileSize = stat.size;
-        fileModifiedAt = stat.mtimeMs;
-      }
-    } catch {
-      // Ignore stat error
-    }
-
     return {
-      dataDir: DATA_DIR,
-      dbFile: DB_FILE,
-      fileSizeBytes: fileSize,
-      fileModifiedAt,
+      storageEngine: 'PostgreSQL',
+      databaseUrlSanitized: sanitizeDatabaseUrl(process.env.DATABASE_URL),
       isReady: this.isReady(),
-      positionsCount: this.db.positions.length,
-      openPositionsCount: this.db.positions.filter(p => p.status === 'OPEN').length,
-      ordersCount: this.db.orders.length,
-      tradesCount: this.db.trades.length,
-      paperBalance: this.db.paperWallet.usdtAvailable,
-      paperEquity: this.db.paperWallet.totalEquity,
+      positionsCount: this.cache.positions.length,
+      openPositionsCount: this.cache.positions.filter(p => p.status === 'OPEN').length,
+      ordersCount: this.cache.orders.length,
+      tradesCount: this.cache.trades.length,
+      paperBalance: this.cache.paperWallet.usdtAvailable,
+      paperEquity: this.cache.paperWallet.totalEquity,
       isEmergencyStopped: this.isEmergencyStopped(),
-      tradingMode: this.db.settings.mode,
-      autoTrading: this.db.settings.autoTrading,
-      version: this.db.version,
-      lastPersistedAt: this.db.lastPersistedAt || fileModifiedAt,
+      tradingMode: this.cache.settings.mode,
+      autoTrading: this.cache.settings.autoTrading,
+      dataDir: DATA_DIR,
+      lastPersistedAt: this.cache.lastPersistedAt,
     };
   }
 
-  // --- Backup & Snapshots ---
+  // --- Backup Snapshot ---
   public backupDatabase(customPath?: string): { success: boolean; backupPath: string; timestamp: number; sizeBytes: number } {
-    this.flush();
     const timestamp = Date.now();
-    const backupFileName = `database-backup-${new Date(timestamp).toISOString().replace(/[:.]/g, '-')}.json`;
+    const backupFileName = `pg-database-backup-${new Date(timestamp).toISOString().replace(/[:.]/g, '-')}.json`;
     const targetPath = customPath || path.join(DATA_DIR, 'backups', backupFileName);
 
     try {
@@ -622,9 +1204,24 @@ class StorageEngine {
         fs.mkdirSync(backupDir, { recursive: true });
       }
 
-      fs.copyFileSync(DB_FILE, targetPath);
+      const dump = {
+        version: 3,
+        storageEngine: 'PostgreSQL',
+        timestamp,
+        settings: this.cache.settings,
+        isEmergencyStopped: this.cache.isEmergencyStopped,
+        wallets: { paper: this.cache.paperWallet, real: this.cache.realWallet },
+        positions: this.cache.positions,
+        orders: this.cache.orders,
+        trades: this.cache.trades,
+        accounts: this.cache.accounts,
+      };
+
+      const serialized = JSON.stringify(dump, null, 2);
+      fs.writeFileSync(targetPath, serialized, 'utf8');
       const stat = fs.statSync(targetPath);
-      Logger.info('PAPER', 'DATABASE', `Database backup successfully created at ${targetPath} (${stat.size} bytes).`);
+      Logger.info('PAPER', 'DATABASE', `PostgreSQL snapshot successfully written to ${targetPath} (${stat.size} bytes).`);
+
       return {
         success: true,
         backupPath: targetPath,
@@ -632,40 +1229,42 @@ class StorageEngine {
         sizeBytes: stat.size,
       };
     } catch (err: any) {
-      Logger.error('PAPER', 'DATABASE', `Failed to create database backup: ${err.message}`);
+      Logger.error('PAPER', 'DATABASE', `Failed to create database backup snapshot: ${err.message}`);
       throw new Error(`Backup failed: ${err.message}`);
     }
   }
 
   // --- Cold Reboot Rehydration ---
   public reloadFromDisk(): void {
-    this.db = this.loadDb();
+    // Re-query all tables from PostgreSQL
+    this.loadFromPostgres().catch(err => {
+      Logger.error('PAPER', 'DATABASE', `Failed to reload from PostgreSQL: ${err.message}`);
+    });
   }
 
-  // --- Analysis & Scanner ---
+  // --- Analysis & Scanner State ---
   public saveAnalysis(symbol: string, analysis: TechnicalAnalysis): void {
-    this.db.latestAnalysis[symbol] = analysis;
+    this.cache.latestAnalysis[symbol] = analysis;
   }
 
   public getAnalysis(symbol: string): TechnicalAnalysis | undefined {
-    return this.db.latestAnalysis[symbol];
+    return this.cache.latestAnalysis[symbol];
   }
 
   public getAllAnalysis(): TechnicalAnalysis[] {
-    return Object.values(this.db.latestAnalysis);
+    return Object.values(this.cache.latestAnalysis);
   }
 
   public getScannerSummary(): ScannerSummary {
-    return { ...this.db.scannerSummary };
+    return { ...this.cache.scannerSummary };
   }
 
   public updateScannerSummary(updates: Partial<ScannerSummary>): void {
-    this.db.scannerSummary = {
-      ...this.db.scannerSummary,
+    this.cache.scannerSummary = {
+      ...this.cache.scannerSummary,
       ...updates,
     };
-    this.save();
   }
 }
 
-export const Storage = new StorageEngine();
+export const Storage = new PostgresStorageEngine();

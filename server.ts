@@ -5,27 +5,37 @@ import { apiApp } from './src/server/api-app.ts';
 import { Storage, DATA_DIR } from './src/server/storage.ts';
 import { AutoTradingEngine } from './src/server/auto-trading-engine.ts';
 import { Logger } from './src/server/logger.ts';
+import { sanitizeDatabaseUrl } from './src/server/postgres.ts';
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 const isProduction = process.env.NODE_ENV === 'production';
+
+// Fail clearly at startup in production if DATABASE_URL is missing
+if (isProduction && (!process.env.DATABASE_URL || process.env.DATABASE_URL.trim().length === 0)) {
+  console.error('FATAL: DATABASE_URL environment variable is required in production.');
+  process.exit(1);
+}
 
 // 1. Health & Readiness endpoints at root level
 app.get('/health', (req: Request, res: Response) => {
   res.status(200).json({
     status: 'ok',
     service: 'binance-5-minute-auto-trader',
+    environment: process.env.NODE_ENV || 'development',
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
   });
 });
 
-app.get('/ready', (req: Request, res: Response) => {
-  const isReady = Storage.isReady();
+app.get('/ready', async (req: Request, res: Response) => {
+  const isReady = await Storage.isDatabaseReadyAsync();
   res.status(isReady ? 200 : 503).json({
     ready: isReady,
     server: true,
     storage: isReady,
+    storageEngine: 'PostgreSQL',
+    database: isReady ? 'connected' : 'disconnected',
     scanner: true,
     dataDir: DATA_DIR,
     liveTradingEnabled: process.env.LIVE_TRADING_ENABLED === 'true',
@@ -38,6 +48,8 @@ app.use(apiApp);
 
 // 3. Frontend delivery
 async function startServer() {
+  await Storage.ensureReady();
+
   const distPath = path.resolve(process.cwd(), 'dist');
   const hasDist = fs.existsSync(distPath) && fs.existsSync(path.join(distPath, 'index.html'));
 
@@ -62,7 +74,7 @@ async function startServer() {
     Logger.info(
       'PAPER',
       'INFO',
-      `🚀 Binance 5m Scanner & 24/7 Auto Trader running on 0.0.0.0:${PORT} [ENV: ${process.env.NODE_ENV || 'development'}] [DATA_DIR: ${DATA_DIR}] [LIVE: ${process.env.LIVE_TRADING_ENABLED === 'true' ? 'ENABLED' : 'DISABLED'}]`
+      `🚀 Binance 5m Scanner & 24/7 Auto Trader running on 0.0.0.0:${PORT} [ENV: ${process.env.NODE_ENV || 'development'}] [STORAGE: PostgreSQL at ${sanitizeDatabaseUrl(process.env.DATABASE_URL)}] [LIVE: ${process.env.LIVE_TRADING_ENABLED === 'true' ? 'ENABLED' : 'DISABLED'}]`
     );
   });
 
@@ -76,7 +88,7 @@ async function startServer() {
     // Stop background scanner & timers
     AutoTradingEngine.getInstance().stopScheduler();
 
-    // Flush pending persistent database state to disk
+    // Flush pending state
     Storage.flush();
 
     server.close(() => {

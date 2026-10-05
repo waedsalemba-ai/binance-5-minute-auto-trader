@@ -1,6 +1,6 @@
-# Binance 5-Minute Crypto Scanner & 24/7 Auto Trader (Production Web Application)
+# Binance 5-Minute Crypto Scanner & 24/7 Auto Trader (PostgreSQL Production Architecture)
 
-A hardened, 24/7 production web application combining Binance Spot market scanning, multi-timeframe technical indicator analysis, centralized bullish entry execution (`PRE_BULLISH` & `STRONG_BULLISH`), authoritative Net PnL exit architecture (`Take-Profit`, `Stop-Loss`, and `Technical Profit Exit`), persistent Paper Trading wallet, and live Binance Spot auto-trading with server-side security.
+A hardened, 24/7 production web application combining Binance Spot market scanning, multi-timeframe technical indicator analysis, centralized bullish entry execution (`PRE_BULLISH` & `STRONG_BULLISH`), authoritative Net PnL exit architecture (`Take-Profit`, `Stop-Loss`, and `Technical Profit Exit`), persistent PostgreSQL relational storage, and live Binance Spot auto-trading with server-side security.
 
 ---
 
@@ -22,13 +22,20 @@ A hardened, 24/7 production web application combining Binance Spot market scanni
        │               │               │
        └───────────────┼───────────────┘
                        │
-                       ▼
-                Binance Spot API
+                       ├──► Binance Spot API
                        │
                        ▼
-            Persistent Storage (/data)
-           ├── database.json (atomic)
-           └── master.key (0600 mode)
+             Render PostgreSQL Database (DATABASE_URL)
+            ├── schema_migrations (Automated migrations)
+            ├── trading_settings
+            ├── system_state
+            ├── wallets (Paper & Real)
+            ├── positions (Open & Closed)
+            ├── orders (Fills & Statuses)
+            ├── trades (Realized PnL history)
+            ├── trade_decisions (Audit log)
+            ├── accounts & credentials (AES-256-GCM encrypted)
+            └── symbol_cooldowns
 ```
 
 The browser acts **strictly as an administrative dashboard**. Closing the browser, turning off your computer, or disconnecting does **NOT** interrupt market scanning, automated entry execution, TP/SL monitoring, or trade tracking.
@@ -37,86 +44,95 @@ The browser acts **strictly as an administrative dashboard**. Closing the browse
 
 ## 🚀 Render 24/7 Deployment Step-by-Step Guide
 
-### Step 1: Push Code to GitHub
-Ensure all files including `render.yaml`, `package.json`, and source code are committed to your GitHub repository.
+### Step 1: Create a PostgreSQL Database on Render
+1. In your [Render Dashboard](https://dashboard.render.com), click **New +** and select **PostgreSQL**.
+2. Set:
+   - **Name**: `binance-trader-db`
+   - **Database**: `binance_trader`
+   - **User**: `binance_trader`
+   - **Region**: Same region as your Web Service
+3. Copy the **Internal Database URL** (or External Database URL if deploying across accounts).
 
 ### Step 2: Create a Web Service on Render
-1. Log in to your [Render Dashboard](https://dashboard.render.com).
-2. Click **New +** and select **Web Service**.
-3. Connect your GitHub repository containing this project.
+1. Click **New +** and select **Web Service**.
+2. Connect your GitHub repository containing this project.
 
 ### Step 3: Configure Build & Start Commands
-- **Runtime**: `Node`
-- **Build Command**: `npm install && npm run build`
-- **Start Command**: `npm start`
+- **Runtime**: `Node` (or `Bun`)
+- **Build Command**: `bun install && bun run build` (or `npm install && npm run build`)
+- **Start Command**: `npm start` (runs `tsx server.ts`)
 - **Health Check Path**: `/health`
 
-### Step 4: Attach a Persistent Disk
-1. In your Render Web Service settings, scroll down to **Disks**.
-2. Click **Add Disk**.
-3. Set:
-   - **Name**: `trader-data`
-   - **Mount Path**: `/data`
-   - **Size**: `1 GB` (Standard)
+### Step 4: Configure Environment Variables
+In the **Environment** tab of your Render Web Service, set the following required variables:
 
-### Step 5: Configure Environment Variables
-In the **Environment** tab, set:
 ```bash
+# 1. Database Connection (REQUIRED in Production)
+DATABASE_URL=postgresql://binance_trader:YOUR_PASSWORD@dpg-xxxxx-a.render.com/binance_trader
+
+# 2. Server Runtime
 NODE_ENV=production
 PORT=10000
-DATA_DIR=/data
+
+# 3. Administrative Authentication & Token
+ADMIN_ACCESS_TOKEN=12345
+ADMIN_TOKEN=12345
+CREDENTIAL_ENCRYPTION_KEY=GENERATE_A_32_BYTE_HEX_OR_PASSPHRASE
+
+# 4. Live Trading Protection Guard (Default: false)
+LIVE_TRADING_ENABLED=false
+
+# 5. Binance Spot API (Optional environment defaults; can also be configured in UI)
+BINANCE_API_KEY=
+BINANCE_API_SECRET=
+BINANCE_API_BASE_URL=https://api.binance.com
+
+# 6. CORS Origins
 APP_ORIGIN=https://YOUR-APP.onrender.com
 ALLOWED_ORIGINS=https://YOUR-APP.onrender.com
 
-# Administrative Auth & Encryption
-ADMIN_TOKEN=GENERATE_A_LONG_RANDOM_SECRET_KEY
-CREDENTIAL_ENCRYPTION_KEY=GENERATE_32_BYTE_HEX_OR_PASSPHRASE
-
-# Live Trading Protection Guard (Default: false)
-LIVE_TRADING_ENABLED=false
-
-# Exit Architecture Parameters
+# 7. Exit Architecture Parameters
 TAKE_PROFIT_PERCENT=2.0
 STOP_LOSS_PERCENT=3.0
 MIN_PROFIT_TO_TECHNICAL_EXIT_PERCENT=0.20
 MAX_EXIT_PRICE_AGE_MS=5000
 
-# Strategy Entry Parameters
+# 8. Strategy Entry Parameters
 PRE_BULLISH_SCORE_MIN=65
 STRONG_BULLISH_SCORE_MIN=80
 WEAKENING_THRESHOLD=70
 ```
 
-### Step 6: Deploy & Verify
-1. Click **Create Web Service** / **Deploy**.
+### Step 5: Deploy & Verify
+1. Click **Deploy Web Service**.
 2. Test the public health endpoint:
    ```bash
    curl https://YOUR-APP.onrender.com/health
    ```
-   Response: `{"status":"ok","service":"binance-5-minute-auto-trader","timestamp":"..."}`
-3. Test the readiness endpoint:
+   Response: `{"status":"ok","service":"binance-5-minute-auto-trader","environment":"production",...}`
+3. Test the database readiness endpoint:
    ```bash
    curl https://YOUR-APP.onrender.com/ready
    ```
-   Response: `{"ready":true,"server":true,"storage":true,"scanner":true,...}`
+   Response: `{"ready":true,"server":true,"storage":true,"storageEngine":"PostgreSQL","database":"connected",...}`
 4. Open `https://YOUR-APP.onrender.com` in your browser.
-5. Verify Paper Trading mode operations, scanning, and order triggers.
-6. Restart the Render Web Service and verify that positions, trade history, paper wallet, and settings are 100% preserved.
+5. Create a test trade, restart the Render Web Service, and verify that positions, orders, trade history, and balances are 100% preserved.
 
 ---
 
 ## 🔒 Security Architecture & Guarantees
 
 1. **Zero Secret Exposure**:
-   - `ADMIN_TOKEN`, `BINANCE_API_SECRET`, and `CREDENTIAL_ENCRYPTION_KEY` never leak into frontend bundles, HTML, URL parameters, SSE logs, or client state.
-2. **Restricted CORS & Security Headers**:
-   - Strict origin validation in production matching `ALLOWED_ORIGINS`.
-   - `X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN`, `Referrer-Policy`.
-3. **Live Trading Guard (`LIVE_TRADING_ENABLED`)**:
+   - `DATABASE_URL`, `ADMIN_TOKEN`, `BINANCE_API_SECRET`, and `CREDENTIAL_ENCRYPTION_KEY` are kept strictly server-side.
+   - Database passwords never appear in application logs or frontend responses.
+2. **PostgreSQL ACID Transactions**:
+   - Opening positions, executing orders, recording fills, and closing trades run within isolated PostgreSQL transactions (`withTransaction`), preventing duplicate executions during retries.
+3. **Automated Schema Migrations & Zero Dependency on JSON**:
+   - On startup, the server automatically initializes tables, constraints, and indexes.
+   - Any legacy `/data/database.json` file is safely migrated once into PostgreSQL and archived as `.migrated`.
+4. **Live Trading Guard (`LIVE_TRADING_ENABLED`)**:
    - Live trading requires `LIVE_TRADING_ENABLED=true` in server environment variables.
    - Any attempt to submit real Binance orders while `LIVE_TRADING_ENABLED != true` is rejected by both `SafetyGate` and `RealBinanceTradingExecutor`.
-4. **Crash-Safe Atomic Storage**:
-   - Database writes are executed via temporary files, disk fsync (`fs.fsyncSync`), and atomic file renames to prevent corruption during unexpected shutdowns.
 
 ---
 
@@ -132,9 +148,10 @@ WEAKENING_THRESHOLD=70
 
 ---
 
-## 🧪 Automated Test Suite
+## 🧪 Automated Testing
 
-Run the full automated test suite covering all indicators, entry engine, exit architecture, storage, and authentication contracts:
+Run the full automated test suite covering technical indicators, strategy transitions, execution invariants, risk gates, and PostgreSQL persistence:
+
 ```bash
-npm test
+bun test # or npm test
 ```
