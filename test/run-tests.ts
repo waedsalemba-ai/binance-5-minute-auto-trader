@@ -38,6 +38,7 @@ import {
   createAdminSessionToken,
   encryptSecret,
   decryptSecret,
+  isAuthRequired,
 } from '../src/server/security.ts';
 
 function createMockCandles(count = 60, startPrice = 100, trend = 'up'): Candle[] {
@@ -810,6 +811,30 @@ async function runAllTests() {
     assert.ok(decision.reason.includes('Emergency stop'));
   });
 
+  test('ENTRY TEST 11: PRE_BULLISH score 65 exact boundary -> MUST BE ELIGIBLE FOR BUY', () => {
+    const decision = evaluateEntryEligibility({
+      symbol: 'DOTUSDT',
+      strategyState: 'PRE_BULLISH',
+      technicalScore: 65,
+      hasOpenPosition: false,
+      settings: baseSettings,
+    });
+
+    assert.strictEqual(decision.eligible, true, 'Score 65 on PRE_BULLISH must be eligible for entry');
+  });
+
+  test('ENTRY TEST 12: STRONG_BULLISH score 80 exact boundary -> MUST BE ELIGIBLE FOR BUY', () => {
+    const decision = evaluateEntryEligibility({
+      symbol: 'LINKUSDT',
+      strategyState: 'STRONG_BULLISH',
+      technicalScore: 80,
+      hasOpenPosition: false,
+      settings: baseSettings,
+    });
+
+    assert.strictEqual(decision.eligible, true, 'Score 80 on STRONG_BULLISH must be eligible for entry');
+  });
+
   // -------------------------------------------------------------
   // 11. Production Security, Authentication & Session Verification
   // -------------------------------------------------------------
@@ -852,6 +877,29 @@ async function runAllTests() {
 
     const decrypted = decryptSecret(encrypted);
     assert.strictEqual(decrypted, secretApiKey);
+  });
+
+  test('AUTH TEST 4: Hardcoded default token "12345" is strictly rejected', () => {
+    const originalEnvToken = process.env.ADMIN_TOKEN;
+    try {
+      process.env.ADMIN_TOKEN = 'production_strong_secret_key_999';
+      assert.strictEqual(verifyAdminToken('12345'), false, '12345 must never authenticate as admin');
+    } finally {
+      process.env.ADMIN_TOKEN = originalEnvToken;
+    }
+  });
+
+  test('AUTH TEST 5: Production mode strictly enforces authentication and cannot be bypassed', () => {
+    const originalNodeEnv = process.env.NODE_ENV;
+    const originalAuthReq = process.env.AUTH_REQUIRED;
+    try {
+      process.env.NODE_ENV = 'production';
+      process.env.AUTH_REQUIRED = 'false';
+      assert.strictEqual(isAuthRequired(), true, 'Production must never allow disabling authentication');
+    } finally {
+      process.env.NODE_ENV = originalNodeEnv;
+      process.env.AUTH_REQUIRED = originalAuthReq;
+    }
   });
 
   // -------------------------------------------------------------

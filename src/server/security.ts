@@ -123,15 +123,18 @@ export function getConfiguredAdminTokens(): string[] {
   if (process.env.ADMIN_TOKEN && process.env.ADMIN_TOKEN.trim().length > 0) {
     tokens.push(process.env.ADMIN_TOKEN.trim());
   }
-  tokens.push('12345');
   return tokens;
 }
 
 export function isAuthRequired(): boolean {
+  if (process.env.NODE_ENV === 'production') {
+    return true;
+  }
   if (process.env.AUTH_REQUIRED === 'false') {
     return false;
   }
-  return true;
+  const tokens = getConfiguredAdminTokens();
+  return tokens.length > 0;
 }
 
 export function verifyAdminToken(providedToken: string): boolean {

@@ -125,12 +125,14 @@ export function requireAdminAuth(req: Request, res: Response, next: NextFunction
 // --------------------------------------------------------------------------
 // 4. Background Workers (Single authoritative instances)
 // --------------------------------------------------------------------------
-const autoTrader = AutoTradingEngine.getInstance();
-const binance = BinanceRequestManager.getInstance();
+export const autoTrader = AutoTradingEngine.getInstance();
+export const binance = BinanceRequestManager.getInstance();
 
-// Start 24/7 worker engine
-autoTrader.startScheduler();
-BinanceTimeService.getInstance().syncWithBinance();
+export function startBackgroundWorkers(): void {
+  // Start 24/7 worker engine only when invoked by server startup
+  autoTrader.startScheduler();
+  BinanceTimeService.getInstance().syncWithBinance();
+}
 
 // --------------------------------------------------------------------------
 // 5. Health & Readiness Endpoints

@@ -1,7 +1,7 @@
 import express, { Request, Response } from 'express';
 import path from 'node:path';
 import fs from 'node:fs';
-import { apiApp } from './src/server/api-app.ts';
+import { apiApp, startBackgroundWorkers } from './src/server/api-app.ts';
 import { Storage, DATA_DIR } from './src/server/storage.ts';
 import { AutoTradingEngine } from './src/server/auto-trading-engine.ts';
 import { Logger } from './src/server/logger.ts';
@@ -11,13 +11,31 @@ const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 const isProduction = process.env.NODE_ENV === 'production';
 
-// Fail clearly at startup in production if DATABASE_URL is missing
-if (isProduction && (!process.env.DATABASE_URL || process.env.DATABASE_URL.trim().length === 0)) {
-  console.error('FATAL: DATABASE_URL environment variable is required in production.');
-  process.exit(1);
+// --------------------------------------------------------------------------
+// 1. Strict Production Environment Validation
+// --------------------------------------------------------------------------
+if (isProduction) {
+  if (!process.env.DATABASE_URL || process.env.DATABASE_URL.trim().length === 0) {
+    console.error('FATAL: DATABASE_URL environment variable is required in production.');
+    process.exit(1);
+  }
+
+  const adminToken = process.env.ADMIN_TOKEN || process.env.ADMIN_ACCESS_TOKEN;
+  if (!adminToken || adminToken.trim().length === 0 || adminToken === '12345') {
+    console.error('FATAL: A strong ADMIN_TOKEN environment variable is required in production (cannot be empty or default).');
+    process.exit(1);
+  }
+
+  const encKey = process.env.CREDENTIAL_ENCRYPTION_KEY;
+  if (!encKey || encKey.trim().length === 0) {
+    console.error('FATAL: CREDENTIAL_ENCRYPTION_KEY environment variable is required in production for secure credential storage.');
+    process.exit(1);
+  }
 }
 
-// 1. Health & Readiness endpoints at root level
+// --------------------------------------------------------------------------
+// 2. Health & Readiness endpoints at root level
+// --------------------------------------------------------------------------
 app.get('/health', (req: Request, res: Response) => {
   res.status(200).json({
     status: 'ok',
@@ -30,26 +48,49 @@ app.get('/health', (req: Request, res: Response) => {
 
 app.get('/ready', async (req: Request, res: Response) => {
   const isReady = await Storage.isDatabaseReadyAsync();
+  const settings = Storage.getSettings();
+  const summary = Storage.getScannerSummary();
   res.status(isReady ? 200 : 503).json({
     ready: isReady,
     server: true,
     storage: isReady,
     storageEngine: 'PostgreSQL',
     database: isReady ? 'connected' : 'disconnected',
-    scanner: true,
+    scanner: !summary.error,
+    autoTrading: settings.autoTrading,
+    mode: settings.mode,
     dataDir: DATA_DIR,
     liveTradingEnabled: process.env.LIVE_TRADING_ENABLED === 'true',
     timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
   });
 });
 
-// 2. Mount API Router
+// --------------------------------------------------------------------------
+// 3. Mount API Router
+// --------------------------------------------------------------------------
 app.use(apiApp);
 
-// 3. Frontend delivery
+// --------------------------------------------------------------------------
+// 4. Production Startup Sequence
+// --------------------------------------------------------------------------
 async function startServer() {
-  await Storage.ensureReady();
+  Logger.info('PAPER', 'DATABASE', 'Beginning production startup sequence: initializing PostgreSQL storage and rehydrating state...');
 
+  // 1. Ensure PostgreSQL is connected, schema is initialized, and state is rehydrated
+  await Storage.ensureReady();
+  const isDbReady = await Storage.isDatabaseReadyAsync();
+
+  if (!isDbReady) {
+    const errMsg = 'FATAL: Authoritative PostgreSQL database failed to initialize or ping successfully.';
+    Logger.error('PAPER', 'DATABASE', errMsg);
+    if (isProduction) {
+      console.error(errMsg);
+      process.exit(1);
+    }
+  }
+
+  // 2. Setup Frontend delivery
   const distPath = path.resolve(process.cwd(), 'dist');
   const hasDist = fs.existsSync(distPath) && fs.existsSync(path.join(distPath, 'index.html'));
 
@@ -70,12 +111,19 @@ async function startServer() {
     });
   }
 
+  // 3. Start HTTP Server
   const server = app.listen(PORT, '0.0.0.0', () => {
     Logger.info(
       'PAPER',
       'INFO',
       `🚀 Binance 5m Scanner & 24/7 Auto Trader running on 0.0.0.0:${PORT} [ENV: ${process.env.NODE_ENV || 'development'}] [STORAGE: PostgreSQL at ${sanitizeDatabaseUrl(process.env.DATABASE_URL)}] [LIVE: ${process.env.LIVE_TRADING_ENABLED === 'true' ? 'ENABLED' : 'DISABLED'}]`
     );
+
+    // 4. ONLY AFTER successful database initialization & HTTP listen, start AutoTradingEngine and Binance sync
+    if (isDbReady) {
+      Logger.info('PAPER', 'INFO', 'Starting 24/7 server-side AutoTradingEngine and Binance time synchronization...');
+      startBackgroundWorkers();
+    }
   });
 
   // Graceful shutdown handling
