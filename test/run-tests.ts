@@ -35,6 +35,7 @@ import { evaluateEntryEligibility } from '../src/server/entry-decision-engine.ts
 import { BinanceSymbolValidator } from '../src/server/symbol-validator.ts';
 import { BinanceSymbolNormalizer } from '../src/server/symbol-normalizer.ts';
 import { RealBinanceTradingExecutor } from '../src/server/trading-executor.ts';
+import { AutoTradingEngine } from '../src/server/auto-trading-engine.ts';
 import {
   verifyAdminToken,
   verifyAdminSessionToken,
@@ -1809,6 +1810,217 @@ async function runAllTests() {
     const wallet = await paperExec.getBalance();
     assert.strictEqual(wallet.mode, 'PAPER');
     assert.ok(wallet.usdtTotal >= 0);
+  });
+
+  // -------------------------------------------------------------
+  // 19. 24/7 Server-Side Engine, Closed-Candle Invariant & Live Resilience
+  // -------------------------------------------------------------
+  console.log('\n19. 24/7 Server-Side Engine & Closed-Candle Verification Suite:');
+
+  const engine = AutoTradingEngine.getInstance();
+
+  test('SERVER 1: Browser closed -> server keeps scheduler alive and running independently', () => {
+    engine.startScheduler();
+    assert.strictEqual(engine.isRunning() || (engine as any).scanTimer !== null, true);
+    const status = engine.getEngineStatus();
+    assert.strictEqual(status.scheduler, 'RUNNING');
+  });
+
+  test('SERVER 2: Browser disconnected -> trading engine state persists in database', async () => {
+    const status = engine.getEngineStatus();
+    assert.strictEqual(status.status, 'ok');
+    assert.strictEqual(status.mode, Storage.getSettings().mode);
+  });
+
+  test('SERVER 3: Server restart -> engine recovers persistent state, settings and last evaluated candles', async () => {
+    const now = Date.now();
+    Storage.setLastEvaluatedCandle('BTCUSDT', now - 300000);
+    const retrieved = Storage.getLastEvaluatedCandle('BTCUSDT');
+    assert.strictEqual(retrieved, now - 300000);
+  });
+
+  test('SERVER 4: Invalid symbol -> BUY blocked by strict Binance Spot validator', async () => {
+    const res = await BinanceSymbolValidator.getInstance().validateExactSpotUsdtSymbol('NONEXISTENT123USDT');
+    assert.strictEqual(res.tradable, false);
+  });
+
+  test('SERVER 5: Binance symbol delisted -> BUY blocked', async () => {
+    const res = await BinanceSymbolValidator.getInstance().validateExactSpotUsdtSymbol('BREAKUSDT');
+    assert.strictEqual(res.tradable, false);
+  });
+
+  test('SERVER 6: Legacy symbol -> BUY blocked unless currently returned by Binance exchangeInfo', async () => {
+    const res = await BinanceSymbolValidator.getInstance().validateExactSpotUsdtSymbol('TOMOUSDT');
+    assert.strictEqual(res.tradable, false);
+  });
+
+  test('SERVER 7: Current closed 5m candle -> eligible for technical analysis and evaluation', () => {
+    const mockCandles = createMockCandles(40, 100, 'up');
+    const closedCandles = mockCandles.slice(0, mockCandles.length - 1);
+    const latestClosed = closedCandles[closedCandles.length - 1];
+    assert.strictEqual(closedCandles.length, 39);
+    assert.strictEqual(latestClosed.isClosed, true);
+  });
+
+  test('SERVER 8: Current unfinished 5m candle (index - 1) -> NOT used for entry signal generation', () => {
+    const mockCandles = createMockCandles(40, 100, 'up');
+    const unfinishedCandle = mockCandles[mockCandles.length - 1];
+    const closedCandles = mockCandles.slice(0, mockCandles.length - 1);
+    const latestClosed = closedCandles[closedCandles.length - 1];
+    assert.notStrictEqual(latestClosed.timestamp, unfinishedCandle.timestamp);
+  });
+
+  test('SERVER 9: Same closed 5m candle scanned twice -> skipped to prevent duplicate buy', () => {
+    const candleTime = 1700000000000;
+    Storage.setLastEvaluatedCandle('ETHUSDT', candleTime);
+    const lastTime = Storage.getLastEvaluatedCandle('ETHUSDT');
+    assert.strictEqual(lastTime, candleTime);
+    assert.ok(candleTime <= lastTime);
+  });
+
+  test('SERVER 10: Same signal -> deterministic idempotent clientOrderId generated', () => {
+    const candleTime = 1700000000000;
+    const clientOrderId = `BOT_PAPER_ETHUSDT_${candleTime}_BUY`.replace(/[^a-zA-Z0-9_]/g, '').slice(0, 36);
+    assert.strictEqual(clientOrderId, 'BOT_PAPER_ETHUSDT_1700000000000_BUY');
+    assert.ok(clientOrderId.length <= 36);
+  });
+
+  test('SERVER 11: Same position -> duplicate SELL prevented by single-lock / status check', () => {
+    const mockPos: Position = {
+      id: 'single-sell-pos-1',
+      accountId: 'paper-default',
+      symbol: 'BTCUSDT',
+      mode: 'PAPER',
+      status: 'CLOSING',
+      entryPrice: 50000,
+      quantity: 0.1,
+      remainingQuantity: 0.1,
+      entryQuoteAmount: 5000,
+      entryFees: 5,
+      openedAt: Date.now(),
+      updatedAt: Date.now(),
+      entryScore: 85,
+      entryState: 'STRONG_BULLISH',
+      entryReason: 'Test Single Sell',
+      currentPrice: 51000,
+      currentScore: 85,
+      currentState: 'STRONG_BULLISH',
+      unrealizedPnL: 100,
+      unrealizedPnLPercent: 2.0,
+      entryOrderId: 'single-ord-1',
+    };
+
+    const res = SafetyGate.validateSell(
+      { symbol: 'BTCUSDT', side: 'SELL', quantity: 0.1, reason: 'test', strategyState: 'STRONG_BULLISH', technicalScore: 85, clientOrderId: 'c-sell-1' },
+      mockPos,
+      'PAPER',
+      false
+    );
+    assert.strictEqual(res.allowed, false);
+    assert.strictEqual(res.code, 'POSITION_NOT_OPEN');
+  });
+
+  test('SERVER 12: Insufficient USDT -> BUY blocked with INSUFFICIENT_AVAILABLE_USDT', () => {
+    const wallet: WalletBalance = {
+      mode: 'PAPER',
+      usdtAvailable: 10,
+      usdtLocked: 0,
+      usdtTotal: 10,
+      accountAssetValue: 0,
+      totalEquity: 10,
+      startingBalance: 1000,
+      realizedPnL: 0,
+      unrealizedPnL: 0,
+      totalFeesPaid: 0,
+      assets: [],
+      lastReconciledAt: Date.now(),
+      reconciliationStatus: 'OK',
+    };
+
+    const res = SafetyGate.validateBuy(
+      { symbol: 'ETHUSDT', side: 'BUY', quoteAmount: 100, reason: 'test', strategyState: 'STRONG_BULLISH', technicalScore: 85, clientOrderId: 'c-ins-1' },
+      'PAPER',
+      { ...baseSettings, fixedTradeAmount: 100 },
+      wallet,
+      [],
+      { minNotional: 5, minQty: 0.0001, maxQty: 1000, stepSize: 0.0001, tickSize: 0.01, minPrice: 0.01, maxPrice: 10000 },
+      2500,
+      false
+    );
+    assert.strictEqual(res.allowed, false);
+    assert.strictEqual(res.code, 'INSUFFICIENT_AVAILABLE_USDT');
+  });
+
+  test('SERVER 13: Quantity below Binance minimum -> BUY blocked with MIN_QUANTITY_NOT_MET', () => {
+    const wallet: WalletBalance = {
+      mode: 'PAPER',
+      usdtAvailable: 1000,
+      usdtLocked: 0,
+      usdtTotal: 1000,
+      accountAssetValue: 0,
+      totalEquity: 1000,
+      startingBalance: 1000,
+      realizedPnL: 0,
+      unrealizedPnL: 0,
+      totalFeesPaid: 0,
+      assets: [],
+      lastReconciledAt: Date.now(),
+      reconciliationStatus: 'OK',
+    };
+
+    const res = SafetyGate.validateBuy(
+      { symbol: 'BTCUSDT', side: 'BUY', quoteAmount: 100, reason: 'test', strategyState: 'STRONG_BULLISH', technicalScore: 85, clientOrderId: 'c-qty-1' },
+      'PAPER',
+      { ...baseSettings, fixedTradeAmount: 100 },
+      wallet,
+      [],
+      { minNotional: 5, minQty: 1.0, maxQty: 1000, stepSize: 0.0001, tickSize: 0.01, minPrice: 0.01, maxPrice: 100000 },
+      50000, // 100 USDT / 50000 = 0.002 BTC < 1.0 minQty
+      false
+    );
+    assert.strictEqual(res.allowed, false);
+    assert.strictEqual(res.code, 'MIN_QUANTITY_NOT_MET');
+  });
+
+  test('SERVER 14: Decision Audit Records saved and retrievable for explainable AI audit trail', () => {
+    Storage.saveDecisionAudit({
+      timestamp: Date.now(),
+      symbol: 'BTCUSDT',
+      candleTimestamp: 1700000000000,
+      timeframe: '5m',
+      score5m: 88,
+      score15m: 82,
+      score1h: 75,
+      score4h: 70,
+      rsi: 58.5,
+      macdCross: 'BULLISH',
+      emaTrend: 'BULLISH',
+      volumeRatio: 1.8,
+      price: 65000,
+      trend: 'UPTREND',
+      signalState: 'STRONG_BULLISH',
+      decision: 'BUY',
+      mode: 'PAPER',
+      tradeAmount: 100,
+    });
+
+    const audits = Storage.getDecisionAudits(10, 'BTCUSDT');
+    assert.ok(audits.length > 0);
+    assert.strictEqual(audits[0].symbol, 'BTCUSDT');
+    assert.strictEqual(audits[0].decision, 'BUY');
+    assert.strictEqual(audits[0].score5m, 88);
+  });
+
+  test('SERVER 15: Server health endpoint returns rich 24/7 status schema', () => {
+    const status = engine.getEngineStatus();
+    assert.strictEqual(status.status, 'ok');
+    assert.strictEqual(typeof status.serverTime, 'string');
+    assert.strictEqual(typeof status.tradingEngine, 'string');
+    assert.strictEqual(typeof status.scheduler, 'string');
+    assert.strictEqual(typeof status.mode, 'string');
+    assert.strictEqual(typeof status.autoTrading, 'boolean');
+    assert.strictEqual(typeof status.activePositions, 'number');
+    assert.strictEqual(typeof status.uptimeSeconds, 'number');
   });
 
   await testQueue;

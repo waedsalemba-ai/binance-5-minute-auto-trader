@@ -131,19 +131,33 @@ export const binance = BinanceRequestManager.getInstance();
 
 export function startBackgroundWorkers(): void {
   // Start 24/7 worker engine only when invoked by server startup
-  autoTrader.startScheduler();
-  BinanceTimeService.getInstance().syncWithBinance();
+  autoTrader.start().catch(err => {
+    Logger.error('PAPER', 'SCAN', `Error starting AutoTradingEngine: ${err.message}`);
+  });
 }
 
 // --------------------------------------------------------------------------
 // 5. Health & Readiness Endpoints
 // --------------------------------------------------------------------------
 const healthHandler = (req: Request, res: Response) => {
+  const engineStatus = autoTrader.getEngineStatus();
   res.json({
-    status: 'ok',
-    service: 'binance-5-minute-auto-trader',
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
+    status: engineStatus.status,
+    serverTime: engineStatus.serverTime,
+    tradingEngine: engineStatus.tradingEngine,
+    scheduler: engineStatus.scheduler,
+    watchdog: engineStatus.watchdog,
+    mode: engineStatus.mode,
+    autoTrading: engineStatus.autoTrading,
+    isEmergencyStopped: engineStatus.isEmergencyStopped,
+    lastScanAt: engineStatus.lastScanAt,
+    lastSuccessfulScanAt: engineStatus.lastSuccessfulScanAt,
+    lastClosed5mCandleAt: engineStatus.lastClosed5mCandleAt,
+    lastEntryEvaluationAt: engineStatus.lastEntryEvaluationAt,
+    lastExitEvaluationAt: engineStatus.lastExitEvaluationAt,
+    activePositions: engineStatus.activePositions,
+    validBinanceSymbols: engineStatus.validBinanceSymbols,
+    uptimeSeconds: engineStatus.uptimeSeconds,
   });
 };
 
@@ -328,6 +342,43 @@ apiApp.get('/api/symbol/validate/:symbol', async (req: Request, res: Response) =
     const validator = BinanceSymbolValidator.getInstance();
     const result = await validator.validateSpotSymbol(symbol, forceRefresh);
     res.json({ success: true, data: result });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+apiApp.get('/api/engine/status', (req: Request, res: Response) => {
+  try {
+    const status = autoTrader.getEngineStatus();
+    res.json({ success: true, data: status });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+apiApp.get('/api/scanner/status', (req: Request, res: Response) => {
+  try {
+    const summary = Storage.getScannerSummary();
+    const engine = autoTrader.getEngineStatus();
+    res.json({
+      success: true,
+      data: {
+        ...summary,
+        summary,
+        engine,
+      },
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+apiApp.get('/api/audit/decisions', (req: Request, res: Response) => {
+  try {
+    const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 50));
+    const symbol = req.query.symbol as string | undefined;
+    const records = Storage.getDecisionAudits(limit, symbol ? symbol.toUpperCase() : undefined);
+    res.json({ success: true, data: records });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
   }

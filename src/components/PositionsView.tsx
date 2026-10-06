@@ -18,9 +18,9 @@ export const PositionsView: React.FC<PositionsViewProps> = ({
   onOpenResetModal,
 }) => {
   const currentPositions = positions.filter(p => p.mode === mode && p.status === 'OPEN');
-  const totalAllocated = currentPositions.reduce((sum, p) => sum + p.entryQuoteAmount, 0);
-  const totalCurrentValue = currentPositions.reduce((sum, p) => sum + p.currentPrice * p.remainingQuantity, 0);
-  const totalUnrealized = currentPositions.reduce((sum, p) => sum + p.unrealizedPnL, 0);
+  const totalAllocated = currentPositions.reduce((sum, p) => sum + (p.entryQuoteAmount || 0), 0);
+  const totalCurrentValue = currentPositions.reduce((sum, p) => sum + (p.currentPrice || 0) * (p.remainingQuantity || 0), 0);
+  const totalUnrealized = currentPositions.reduce((sum, p) => sum + (p.unrealizedPnL || 0), 0);
 
   const formatDuration = (openedAt: number) => {
     const diff = Math.max(0, Math.floor((Date.now() - openedAt) / 1000));
@@ -127,7 +127,7 @@ export const PositionsView: React.FC<PositionsViewProps> = ({
               {/* Fixed Trade Amount Banner */}
               <div className="p-2.5 bg-amber-500/10 border border-amber-500/20 rounded-xl flex justify-between items-center text-xs font-mono">
                 <span className="text-amber-400 font-medium">Fixed Trade Amount:</span>
-                <span className="text-slate-100 font-bold">{pos.entryQuoteAmount.toFixed(2)} USDT</span>
+                <span className="text-slate-100 font-bold">{(pos.entryQuoteAmount ?? 0).toFixed(2)} USDT</span>
               </div>
 
               {/* Data Rows */}

@@ -13,6 +13,8 @@ import {
   ScannerSummary,
   StrategyState,
   SymbolAuditRecord,
+  DecisionAuditRecord,
+  ServerEngineStatus,
 } from '../types/index.ts';
 import { EncryptedPayload, encryptSecret, decryptSecret, maskApiKey } from './security.ts';
 import { Logger } from './logger.ts';
@@ -117,6 +119,18 @@ export interface DatabaseMemoryCache {
   latestAnalysis: Record<string, TechnicalAnalysis>;
   symbolCooldowns: Record<string, { symbol: string; mode: TradingMode; until: number }>;
   symbolAudits: SymbolAuditRecord[];
+  decisionAudits: DecisionAuditRecord[];
+  lastEvaluatedCandles: Record<string, number>;
+  engineTelemetry: {
+    lastScanAt: number | null;
+    lastSuccessfulScanAt: number | null;
+    lastClosed5mCandleAt: number | null;
+    lastEntryEvaluationAt: number | null;
+    lastExitEvaluationAt: number | null;
+    engineStatus: 'RUNNING' | 'STOPPED' | 'PAUSED';
+    schedulerStatus: 'RUNNING' | 'STOPPED';
+    watchdogStatus: 'RUNNING' | 'STOPPED';
+  };
   scannerSummary: ScannerSummary;
   lastPersistedAt: number;
 }
@@ -174,6 +188,18 @@ class PostgresStorageEngine {
       latestAnalysis: {},
       symbolCooldowns: {},
       symbolAudits: [],
+      decisionAudits: [],
+      lastEvaluatedCandles: {},
+      engineTelemetry: {
+        lastScanAt: null,
+        lastSuccessfulScanAt: null,
+        lastClosed5mCandleAt: null,
+        lastEntryEvaluationAt: null,
+        lastExitEvaluationAt: null,
+        engineStatus: 'STOPPED',
+        schedulerStatus: 'STOPPED',
+        watchdogStatus: 'STOPPED',
+      },
       scannerSummary: {
         pairsAnalyzed: 0,
         preBullishCount: 0,
@@ -438,6 +464,46 @@ class PostgresStorageEngine {
         }));
       } catch {
         this.cache.symbolAudits = [];
+      }
+
+      // Load Evaluated 5m Candles
+      try {
+        const candlesRes = await query('SELECT symbol, candle_time FROM evaluated_candles');
+        this.cache.lastEvaluatedCandles = {};
+        for (const row of candlesRes.rows) {
+          this.cache.lastEvaluatedCandles[row.symbol] = Number(row.candle_time);
+        }
+      } catch {
+        this.cache.lastEvaluatedCandles = {};
+      }
+
+      // Load Decision Audit Records (most recent 200)
+      try {
+        const decRes = await query('SELECT * FROM decision_audit_records ORDER BY timestamp DESC LIMIT 200');
+        this.cache.decisionAudits = decRes.rows.map(row => ({
+          id: row.id,
+          timestamp: Number(row.timestamp),
+          symbol: row.symbol,
+          candleTimestamp: Number(row.candle_timestamp),
+          timeframe: row.timeframe,
+          score5m: Number(row.score_5m),
+          score15m: row.score_15m ? Number(row.score_15m) : undefined,
+          score1h: row.score_1h ? Number(row.score_1h) : undefined,
+          score4h: row.score_4h ? Number(row.score_4h) : undefined,
+          rsi: row.rsi ? Number(row.rsi) : undefined,
+          macdCross: row.macd_cross || undefined,
+          emaTrend: row.ema_trend || undefined,
+          volumeRatio: row.volume_ratio ? Number(row.volume_ratio) : undefined,
+          price: Number(row.price),
+          trend: row.trend,
+          signalState: row.signal_state as StrategyState,
+          decision: row.decision as 'BUY' | 'SELL' | 'HOLD' | 'REJECTED',
+          rejectionReason: row.rejection_reason || null,
+          mode: row.mode as TradingMode,
+          tradeAmount: Number(row.trade_amount),
+        }));
+      } catch {
+        this.cache.decisionAudits = [];
       }
 
       this.cache.scannerSummary.openPositionsCount = this.cache.positions.filter(p => p.status === 'OPEN').length;
@@ -1522,6 +1588,92 @@ class PostgresStorageEngine {
   public getSymbolAuditRecords(limit = 100): SymbolAuditRecord[] {
     return this.cache.symbolAudits.slice(0, limit);
   }
+
+  // --- 5-Minute Closed Candle Evaluation Tracking ---
+  public getLastEvaluatedCandle(symbol: string): number | undefined {
+    return this.cache.lastEvaluatedCandles[symbol];
+  }
+
+  public setLastEvaluatedCandle(symbol: string, candleTime: number): void {
+    this.cache.lastEvaluatedCandles[symbol] = candleTime;
+    query(
+      `INSERT INTO evaluated_candles (symbol, candle_time, updated_at)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (symbol) DO UPDATE SET
+         candle_time = EXCLUDED.candle_time,
+         updated_at = EXCLUDED.updated_at`,
+      [symbol, candleTime, Date.now()]
+    ).catch(err => {
+      Logger.error('PAPER', 'DATABASE', `Failed to persist evaluated candle for ${symbol}: ${err.message}`);
+    });
+  }
+
+  // --- Decision Audit Records (Explainable Audit Trail) ---
+  public saveDecisionAudit(record: DecisionAuditRecord): void {
+    const id = record.id || `dec-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+    const fullRecord: DecisionAuditRecord = {
+      ...record,
+      id,
+    };
+
+    this.cache.decisionAudits.unshift(fullRecord);
+    if (this.cache.decisionAudits.length > 500) {
+      this.cache.decisionAudits.pop();
+    }
+
+    query(
+      `INSERT INTO decision_audit_records (
+        id, timestamp, symbol, candle_timestamp, timeframe, score_5m,
+        score_15m, score_1h, score_4h, rsi, macd_cross, ema_trend,
+        volume_ratio, price, trend, signal_state, decision, rejection_reason, mode, trade_amount
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+      ON CONFLICT (id) DO NOTHING`,
+      [
+        fullRecord.id,
+        fullRecord.timestamp,
+        fullRecord.symbol,
+        fullRecord.candleTimestamp,
+        fullRecord.timeframe,
+        fullRecord.score5m,
+        fullRecord.score15m || null,
+        fullRecord.score1h || null,
+        fullRecord.score4h || null,
+        fullRecord.rsi || null,
+        fullRecord.macdCross || null,
+        fullRecord.emaTrend || null,
+        fullRecord.volumeRatio || null,
+        fullRecord.price,
+        fullRecord.trend,
+        fullRecord.signalState,
+        fullRecord.decision,
+        fullRecord.rejectionReason || null,
+        fullRecord.mode,
+        fullRecord.tradeAmount,
+      ]
+    ).catch(err => {
+      Logger.error('PAPER', 'DATABASE', `Failed to persist decision audit record: ${err.message}`);
+    });
+  }
+
+  public getDecisionAudits(limit = 100, symbol?: string): DecisionAuditRecord[] {
+    if (symbol) {
+      return this.cache.decisionAudits.filter(d => d.symbol === symbol).slice(0, limit);
+    }
+    return this.cache.decisionAudits.slice(0, limit);
+  }
+
+  // --- Engine & Server Telemetry ---
+  public updateEngineTelemetry(updates: Partial<typeof this.cache.engineTelemetry>): void {
+    this.cache.engineTelemetry = {
+      ...this.cache.engineTelemetry,
+      ...updates,
+    };
+  }
+
+  public getEngineTelemetry() {
+    return { ...this.cache.engineTelemetry };
+  }
 }
 
 export const Storage = new PostgresStorageEngine();
+

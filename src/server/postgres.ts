@@ -635,6 +635,42 @@ export async function initializePostgresSchema(): Promise<void> {
       `);
       await safeExec(`CREATE INDEX IF NOT EXISTS idx_audit_symbol ON symbol_audit_records(requested_symbol, timestamp);`);
 
+      // Evaluated 5m Candles (Persistence across restarts to prevent duplicate buys on same closed candle)
+      await safeExec(`
+        CREATE TABLE IF NOT EXISTS evaluated_candles (
+          symbol VARCHAR(32) PRIMARY KEY,
+          candle_time BIGINT NOT NULL,
+          updated_at BIGINT NOT NULL
+        );
+      `);
+
+      // Decision Audit Records (Explainable entry & exit logs with scores & indicators)
+      await safeExec(`
+        CREATE TABLE IF NOT EXISTS decision_audit_records (
+          id VARCHAR(64) PRIMARY KEY,
+          timestamp BIGINT NOT NULL,
+          symbol VARCHAR(32) NOT NULL,
+          candle_timestamp BIGINT NOT NULL,
+          timeframe VARCHAR(8) NOT NULL,
+          score_5m NUMERIC NOT NULL,
+          score_15m NUMERIC,
+          score_1h NUMERIC,
+          score_4h NUMERIC,
+          rsi NUMERIC,
+          macd_cross VARCHAR(32),
+          ema_trend VARCHAR(32),
+          volume_ratio NUMERIC,
+          price NUMERIC NOT NULL,
+          trend VARCHAR(32),
+          signal_state VARCHAR(32) NOT NULL,
+          decision VARCHAR(16) NOT NULL,
+          rejection_reason TEXT,
+          mode VARCHAR(16) NOT NULL,
+          trade_amount NUMERIC NOT NULL
+        );
+      `);
+      await safeExec(`CREATE INDEX IF NOT EXISTS idx_decision_symbol ON decision_audit_records(symbol, timestamp);`);
+
       await safeExec(
         'INSERT INTO schema_migrations (id, name, applied_at) VALUES ($1, $2, $3)',
         ['1', '001_initial_schema', Date.now()]

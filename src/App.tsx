@@ -172,8 +172,26 @@ export default function App() {
         setLogs(logsRes.value.data);
       }
       if (scannerStatusRes.status === 'fulfilled' && scannerStatusRes.value?.success) {
-        setSummary(scannerStatusRes.value.data);
-        setIsScanning(scannerStatusRes.value.data.isScanning);
+        const raw = scannerStatusRes.value.data;
+        const summaryData = raw?.pairsAnalyzed !== undefined ? raw : (raw?.summary || raw);
+        if (summaryData && typeof summaryData === 'object') {
+          setSummary(prev => ({
+            ...prev,
+            ...summaryData,
+            pairsAnalyzed: Number(summaryData.pairsAnalyzed ?? prev.pairsAnalyzed ?? 0),
+            preBullishCount: Number(summaryData.preBullishCount ?? prev.preBullishCount ?? 0),
+            bullishCount: Number(summaryData.bullishCount ?? prev.bullishCount ?? 0),
+            strongBullishCount: Number(summaryData.strongBullishCount ?? prev.strongBullishCount ?? 0),
+            weakeningCount: Number(summaryData.weakeningCount ?? prev.weakeningCount ?? 0),
+            neutralCount: Number(summaryData.neutralCount ?? prev.neutralCount ?? 0),
+            openPositionsCount: Number(summaryData.openPositionsCount ?? prev.openPositionsCount ?? 0),
+            todayTradesCount: Number(summaryData.todayTradesCount ?? prev.todayTradesCount ?? 0),
+            lastScanTime: Number(summaryData.lastScanTime ?? prev.lastScanTime ?? 0),
+            nextScanTime: Number(summaryData.nextScanTime ?? prev.nextScanTime ?? 0),
+            isScanning: Boolean(summaryData.isScanning),
+          }));
+          setIsScanning(Boolean(summaryData.isScanning));
+        }
       }
     } catch (err) {
       // Graceful fallback

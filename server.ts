@@ -133,8 +133,8 @@ async function startServer() {
     isShuttingDown = true;
     Logger.info('PAPER', 'INFO', `Received ${signal}. Performing graceful shutdown...`);
 
-    // Stop background scanner & timers
-    AutoTradingEngine.getInstance().stopScheduler();
+    // Stop background scanner & timers & watchdog
+    AutoTradingEngine.getInstance().stop();
 
     // Flush pending state
     Storage.flush();

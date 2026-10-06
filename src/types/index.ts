@@ -483,3 +483,46 @@ export interface SpotMarketStatusData {
   liveTradingEnabled: boolean;
 }
 
+export interface ServerEngineStatus {
+  status: 'ok' | 'degraded' | 'error';
+  serverTime: string;
+  tradingEngine: 'RUNNING' | 'STOPPED' | 'PAUSED';
+  scheduler: 'RUNNING' | 'STOPPED';
+  watchdog: 'RUNNING' | 'STOPPED';
+  mode: TradingMode;
+  autoTrading: boolean;
+  isEmergencyStopped: boolean;
+  lastScanAt: string | null;
+  lastSuccessfulScanAt: string | null;
+  lastClosed5mCandleAt: string | null;
+  lastEntryEvaluationAt: string | null;
+  lastExitEvaluationAt: string | null;
+  activePositions: number;
+  validBinanceSymbols: number;
+  uptimeSeconds: number;
+}
+
+export interface DecisionAuditRecord {
+  id?: string;
+  timestamp: number;
+  symbol: string;
+  candleTimestamp: number;
+  timeframe: string;
+  score5m: number;
+  score15m?: number;
+  score1h?: number;
+  score4h?: number;
+  rsi?: number;
+  macdCross?: string;
+  emaTrend?: string;
+  volumeRatio?: number;
+  price: number;
+  trend: string;
+  signalState: StrategyState;
+  decision: 'BUY' | 'SELL' | 'HOLD' | 'REJECTED';
+  rejectionReason?: string | null;
+  mode: TradingMode;
+  tradeAmount: number;
+}
+
+

@@ -16,6 +16,8 @@ import {
   Globe,
   CheckCircle2,
   XCircle,
+  Server,
+  Cpu,
 } from 'lucide-react';
 import {
   WalletBalance,
@@ -24,6 +26,7 @@ import {
   TechnicalAnalysis,
   TradingMode,
   SpotMarketStatusData,
+  ServerEngineStatus,
 } from '../types/index.ts';
 
 interface DashboardViewProps {
@@ -57,24 +60,38 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 }) => {
   const [secondsToNextScan, setSecondsToNextScan] = useState<number>(0);
   const [spotStatus, setSpotStatus] = useState<SpotMarketStatusData | null>(null);
+  const [engineStatus, setEngineStatus] = useState<ServerEngineStatus | null>(null);
+  const [isServerConnected, setIsServerConnected] = useState<boolean>(true);
 
-  const fetchSpotStatus = async () => {
+  const fetchTelemetry = async () => {
     try {
-      const res = await fetch('/api/market/spot-status');
-      if (res.ok) {
-        const json = await res.json();
+      const [spotRes, engineRes] = await Promise.allSettled([
+        fetch('/api/market/spot-status'),
+        fetch('/api/engine/status'),
+      ]);
+
+      if (spotRes.status === 'fulfilled' && spotRes.value.ok) {
+        const json = await spotRes.value.json();
         if (json.success && json.data) {
           setSpotStatus(json.data);
         }
       }
+
+      if (engineRes.status === 'fulfilled' && engineRes.value.ok) {
+        const json = await engineRes.value.json();
+        if (json.success && json.data) {
+          setEngineStatus(json.data);
+          setIsServerConnected(true);
+        }
+      }
     } catch {
-      // Ignore background telemetry errors
+      setIsServerConnected(false);
     }
   };
 
   useEffect(() => {
-    fetchSpotStatus();
-    const interval = setInterval(fetchSpotStatus, 15000);
+    fetchTelemetry();
+    const interval = setInterval(fetchTelemetry, 10000);
     return () => clearInterval(interval);
   }, []);
 
@@ -159,10 +176,10 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         <div className="bg-[#0f172a] border border-slate-800 rounded-2xl p-4">
           <span className="text-[11px] text-slate-400 font-medium">Total Equity</span>
           <div className="text-xl sm:text-2xl font-black font-mono text-slate-100 mt-1">
-            ${wallet.totalEquity.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            ${(wallet.totalEquity ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
           </div>
           <div className="text-[11px] text-slate-500 mt-1 font-mono">
-            Avail: ${wallet.usdtAvailable.toFixed(2)}
+            Avail: ${(wallet.usdtAvailable ?? 0).toFixed(2)}
           </div>
         </div>
 
@@ -170,18 +187,18 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         <div className="bg-[#0f172a] border border-slate-800 rounded-2xl p-4">
           <span className="text-[11px] text-slate-400 font-medium">Available USDT</span>
           <div className="text-xl sm:text-2xl font-black font-mono text-emerald-400 mt-1">
-            ${wallet.usdtAvailable.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            ${(wallet.usdtAvailable ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
           </div>
           <div className="text-[11px] text-slate-500 mt-1 font-mono">
-            Allocated: ${(wallet.accountAssetValue).toFixed(2)}
+            Allocated: ${(wallet.accountAssetValue ?? 0).toFixed(2)}
           </div>
         </div>
 
         {/* Unrealized PnL */}
         <div className="bg-[#0f172a] border border-slate-800 rounded-2xl p-4">
           <span className="text-[11px] text-slate-400 font-medium">Unrealized PnL</span>
-          <div className={`text-xl sm:text-2xl font-black font-mono mt-1 ${wallet.unrealizedPnL >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-            {wallet.unrealizedPnL >= 0 ? '+' : ''}${wallet.unrealizedPnL.toFixed(2)}
+          <div className={`text-xl sm:text-2xl font-black font-mono mt-1 ${(wallet.unrealizedPnL ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+            {(wallet.unrealizedPnL ?? 0) >= 0 ? '+' : ''}${(wallet.unrealizedPnL ?? 0).toFixed(2)}
           </div>
           <div className="text-[11px] text-slate-500 mt-1">
             Across {activePositions.length} active positions
@@ -191,11 +208,11 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         {/* Realized PnL */}
         <div className="bg-[#0f172a] border border-slate-800 rounded-2xl p-4">
           <span className="text-[11px] text-slate-400 font-medium">Realized PnL</span>
-          <div className={`text-xl sm:text-2xl font-black font-mono mt-1 ${wallet.realizedPnL >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-            {wallet.realizedPnL >= 0 ? '+' : ''}${wallet.realizedPnL.toFixed(2)}
+          <div className={`text-xl sm:text-2xl font-black font-mono mt-1 ${(wallet.realizedPnL ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+            {(wallet.realizedPnL ?? 0) >= 0 ? '+' : ''}${(wallet.realizedPnL ?? 0).toFixed(2)}
           </div>
           <div className="text-[11px] text-slate-500 mt-1">
-            Fees paid: ${wallet.totalFeesPaid.toFixed(2)}
+            Fees paid: ${(wallet.totalFeesPaid ?? 0).toFixed(2)}
           </div>
         </div>
 
@@ -221,6 +238,94 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           </div>
           <div className="text-[11px] text-slate-500 mt-1">
             2m interval sync
+          </div>
+        </div>
+      </div>
+
+      {/* 24/7 Server-Side Trading Engine & Scheduler Status Authority (Requirement 20) */}
+      <div className="bg-[#0f172a] border border-slate-800 rounded-2xl p-4 sm:p-5">
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-3 border-b border-slate-800/80 pb-3">
+          <div className="flex items-center gap-2.5">
+            <div className="p-2 rounded-lg bg-indigo-500/10 text-indigo-400">
+              <Server className="w-4 h-4" />
+            </div>
+            <div>
+              <h3 className="font-bold text-sm text-slate-100 flex items-center gap-2">
+                24/7 Server-Side Trading Engine & Scheduler Authority
+              </h3>
+              <p className="text-[11px] text-slate-400">
+                Independent backend process on Render. Continues scanning, candle evaluation, TP/SL exits, and execution 24/7 even when browser is closed.
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <span className={`text-[11px] font-mono px-2.5 py-1 rounded-lg font-bold flex items-center gap-1.5 ${
+              isServerConnected
+                ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
+                : 'bg-rose-500/20 text-rose-400 border border-rose-500/30'
+            }`}>
+              <span className={`w-2 h-2 rounded-full ${isServerConnected ? 'bg-emerald-400 animate-pulse' : 'bg-rose-400'}`} />
+              <span>SERVER: {isServerConnected ? 'CONNECTED' : 'DISCONNECTED'}</span>
+            </span>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-2.5 text-xs font-mono">
+          <div className="p-2.5 bg-slate-900/80 border border-slate-800/80 rounded-xl">
+            <div className="text-slate-500 text-[10px]">TRADING ENGINE</div>
+            <div className={`font-bold mt-0.5 ${engineStatus?.tradingEngine === 'RUNNING' ? 'text-emerald-400' : 'text-slate-400'}`}>
+              {engineStatus?.tradingEngine || 'RUNNING'}
+            </div>
+          </div>
+
+          <div className="p-2.5 bg-slate-900/80 border border-slate-800/80 rounded-xl">
+            <div className="text-slate-500 text-[10px]">SCHEDULER</div>
+            <div className={`font-bold mt-0.5 ${engineStatus?.scheduler === 'RUNNING' ? 'text-emerald-400' : 'text-slate-400'}`}>
+              {engineStatus?.scheduler || 'RUNNING'}
+            </div>
+          </div>
+
+          <div className="p-2.5 bg-slate-900/80 border border-slate-800/80 rounded-xl">
+            <div className="text-slate-500 text-[10px]">AUTO TRADING</div>
+            <div className={`font-bold mt-0.5 ${autoTrading ? 'text-emerald-400' : 'text-slate-400'}`}>
+              {autoTrading ? 'ON' : 'OFF'}
+            </div>
+          </div>
+
+          <div className="p-2.5 bg-slate-900/80 border border-slate-800/80 rounded-xl">
+            <div className="text-slate-500 text-[10px]">MODE</div>
+            <div className={`font-bold mt-0.5 ${mode === 'REAL' ? 'text-amber-400' : 'text-sky-400'}`}>
+              {mode}
+            </div>
+          </div>
+
+          <div className="p-2.5 bg-slate-900/80 border border-slate-800/80 rounded-xl">
+            <div className="text-slate-500 text-[10px]">LAST SCAN</div>
+            <div className="font-bold text-slate-300 mt-0.5 truncate">
+              {engineStatus?.lastScanAt ? new Date(engineStatus.lastScanAt).toLocaleTimeString() : 'Active'}
+            </div>
+          </div>
+
+          <div className="p-2.5 bg-slate-900/80 border border-slate-800/80 rounded-xl">
+            <div className="text-slate-500 text-[10px]">LAST CLOSED 5M</div>
+            <div className="font-bold text-amber-400 mt-0.5 truncate">
+              {engineStatus?.lastClosed5mCandleAt ? new Date(engineStatus.lastClosed5mCandleAt).toLocaleTimeString() : 'Synced'}
+            </div>
+          </div>
+
+          <div className="p-2.5 bg-slate-900/80 border border-slate-800/80 rounded-xl">
+            <div className="text-slate-500 text-[10px]">LAST ENTRY CHECK</div>
+            <div className="font-bold text-slate-300 mt-0.5 truncate">
+              {engineStatus?.lastEntryEvaluationAt ? new Date(engineStatus.lastEntryEvaluationAt).toLocaleTimeString() : 'Evaluating'}
+            </div>
+          </div>
+
+          <div className="p-2.5 bg-slate-900/80 border border-slate-800/80 rounded-xl">
+            <div className="text-slate-500 text-[10px]">BINANCE SYMBOLS</div>
+            <div className="font-bold text-emerald-400 mt-0.5">
+              {engineStatus?.validBinanceSymbols || spotStatus?.symbolsCount || 0} Spot
+            </div>
           </div>
         </div>
       </div>
@@ -326,26 +431,26 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           <div className="grid grid-cols-2 gap-2 text-xs font-mono">
             <div className="p-3 bg-slate-900/80 border border-slate-800 rounded-xl">
               <div className="text-slate-400 text-[11px]">PRE-BULLISH (Buy Zone)</div>
-              <div className="text-lg font-bold text-sky-400 mt-0.5">{summary.preBullishCount}</div>
+              <div className="text-lg font-bold text-sky-400 mt-0.5">{summary?.preBullishCount ?? 0}</div>
             </div>
             <div className="p-3 bg-slate-900/80 border border-slate-800 rounded-xl">
               <div className="text-slate-400 text-[11px]">STRONG BULLISH (Holding)</div>
-              <div className="text-lg font-bold text-emerald-400 mt-0.5">{summary.strongBullishCount}</div>
+              <div className="text-lg font-bold text-emerald-400 mt-0.5">{summary?.strongBullishCount ?? 0}</div>
             </div>
             <div className="p-3 bg-slate-900/80 border border-slate-800 rounded-xl">
               <div className="text-slate-400 text-[11px]">WEAKENING (Exit Zone)</div>
-              <div className="text-lg font-bold text-rose-400 mt-0.5">{summary.weakeningCount}</div>
+              <div className="text-lg font-bold text-rose-400 mt-0.5">{summary?.weakeningCount ?? 0}</div>
             </div>
             <div className="p-3 bg-slate-900/80 border border-slate-800 rounded-xl">
               <div className="text-slate-400 text-[11px]">BULLISH / NEUTRAL</div>
-              <div className="text-lg font-bold text-slate-400 mt-0.5">{summary.bullishCount + summary.neutralCount}</div>
+              <div className="text-lg font-bold text-slate-400 mt-0.5">{(summary?.bullishCount ?? 0) + (summary?.neutralCount ?? 0)}</div>
             </div>
           </div>
 
           <div className="bg-slate-900/60 border border-slate-800/80 rounded-xl p-3 text-xs text-slate-400 space-y-1.5">
             <div className="flex justify-between font-mono">
               <span>Strategy Invariant:</span>
-              <span className="text-amber-400 font-bold">{fixedTradeAmount} USDT per BUY</span>
+              <span className="text-amber-400 font-bold">{(fixedTradeAmount ?? 0).toFixed(2)} USDT per BUY</span>
             </div>
             <div className="flex justify-between font-mono">
               <span>Max Simultaneous Positions:</span>
@@ -385,17 +490,17 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                       {item.symbol}
                     </span>
                     <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-sky-500/10 text-sky-400 border border-sky-500/20">
-                      Score {item.score}
+                      Score {item.score ?? 0}
                     </span>
                   </div>
                   <div className="flex items-center justify-between text-xs font-mono text-slate-400">
-                    <span>${item.price}</span>
-                    <span className={item.priceChange24h >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
-                      {item.priceChange24h >= 0 ? '+' : ''}{item.priceChange24h.toFixed(2)}%
+                    <span>${item.price ?? 0}</span>
+                    <span className={(item.priceChange24h ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
+                      {(item.priceChange24h ?? 0) >= 0 ? '+' : ''}{(item.priceChange24h ?? 0).toFixed(2)}%
                     </span>
                   </div>
                   <div className="text-[11px] text-slate-500 mt-2 line-clamp-1">
-                    {item.stateReason}
+                    {item.stateReason || ''}
                   </div>
                 </div>
               ))}
@@ -418,7 +523,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
         {activePositions.length === 0 ? (
           <div className="py-8 text-center text-xs text-slate-500 bg-slate-900/40 rounded-xl border border-dashed border-slate-800">
-            No active positions open in {mode} mode. When a symbol triggers PRE_BULLISH and passes the Safety Gate, a fixed {fixedTradeAmount} USDT position will open.
+            No active positions open in {mode} mode. When a symbol triggers PRE_BULLISH and passes the Safety Gate, a fixed {(fixedTradeAmount ?? 0).toFixed(2)} USDT position will open.
           </div>
         ) : (
           <div className="overflow-x-auto">
@@ -436,52 +541,56 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800/60 font-mono">
-                {activePositions.map(pos => (
-                  <tr key={pos.id} className="hover:bg-slate-900/40 transition-colors">
-                    <td className="py-3 px-3 font-bold text-slate-100">{pos.symbol}</td>
-                    <td className="py-3 px-3">
-                      <div className="text-amber-400">{pos.entryQuoteAmount} USDT</div>
-                      <div className="text-[10px] text-slate-500">Qty: {pos.remainingQuantity}</div>
-                    </td>
-                    <td className="py-3 px-3 text-slate-300">${pos.entryPrice}</td>
-                    <td className="py-3 px-3 text-slate-100 font-bold">${pos.currentPrice}</td>
-                    <td className="py-3 px-3 text-[11px]">
-                      <div><span className="text-slate-500">BE:</span> <span className="text-amber-400">${pos.breakEvenPrice ?? '-'}</span></div>
-                      <div><span className="text-slate-500">TP:</span> <span className="text-emerald-400">${pos.takeProfitPrice ?? '-'}</span> | <span className="text-slate-500">SL:</span> <span className="text-rose-400">${pos.stopLossPrice ?? '-'}</span></div>
-                    </td>
-                    <td className={`py-3 px-3 font-bold ${(pos.estimatedNetPnL ?? pos.unrealizedPnL) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                      {(pos.estimatedNetPnL ?? pos.unrealizedPnL) >= 0 ? '+' : ''}${(pos.estimatedNetPnL ?? pos.unrealizedPnL).toFixed(2)} ({(pos.estimatedNetPnLPercent ?? pos.unrealizedPnLPercent) >= 0 ? '+' : ''}{pos.estimatedNetPnLPercent ?? pos.unrealizedPnLPercent}%)
-                    </td>
-                    <td className="py-3 px-3">
-                      <div className="flex items-center gap-1.5">
-                        <span className="text-slate-300 font-bold">{pos.currentScore}</span>
-                        <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                          pos.currentState === 'STRONG_BULLISH'
-                            ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
-                            : pos.currentState === 'WEAKENING'
-                            ? 'bg-rose-500/20 text-rose-400 border border-rose-500/30'
-                            : 'bg-sky-500/20 text-sky-400 border border-sky-500/30'
-                        }`}>
-                          {pos.currentState}
-                        </span>
-                      </div>
-                    </td>
-                    <td className="py-3 px-3 text-right space-x-2">
-                      <button
-                        onClick={() => onSelectSymbol(pos.symbol)}
-                        className="px-2.5 py-1 text-[11px] bg-slate-800 hover:bg-slate-700 text-slate-300 rounded"
-                      >
-                        Chart
-                      </button>
-                      <button
-                        onClick={() => onOpenSellModal(pos)}
-                        className="px-2.5 py-1 text-[11px] bg-rose-500/20 hover:bg-rose-500/30 text-rose-400 border border-rose-500/30 rounded font-bold"
-                      >
-                        Sell
-                      </button>
-                    </td>
-                  </tr>
-                ))}
+                {activePositions.map(pos => {
+                  const netPnL = pos.estimatedNetPnL ?? pos.unrealizedPnL ?? 0;
+                  const netPnLPercent = pos.estimatedNetPnLPercent ?? pos.unrealizedPnLPercent ?? 0;
+                  return (
+                    <tr key={pos.id} className="hover:bg-slate-900/40 transition-colors">
+                      <td className="py-3 px-3 font-bold text-slate-100">{pos.symbol}</td>
+                      <td className="py-3 px-3">
+                        <div className="text-amber-400">{pos.entryQuoteAmount ?? 0} USDT</div>
+                        <div className="text-[10px] text-slate-500">Qty: {pos.remainingQuantity ?? 0}</div>
+                      </td>
+                      <td className="py-3 px-3 text-slate-300">${pos.entryPrice ?? 0}</td>
+                      <td className="py-3 px-3 text-slate-100 font-bold">${pos.currentPrice ?? 0}</td>
+                      <td className="py-3 px-3 text-[11px]">
+                        <div><span className="text-slate-500">BE:</span> <span className="text-amber-400">${pos.breakEvenPrice ?? '-'}</span></div>
+                        <div><span className="text-slate-500">TP:</span> <span className="text-emerald-400">${pos.takeProfitPrice ?? '-'}</span> | <span className="text-slate-500">SL:</span> <span className="text-rose-400">${pos.stopLossPrice ?? '-'}</span></div>
+                      </td>
+                      <td className={`py-3 px-3 font-bold ${netPnL >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                        {netPnL >= 0 ? '+' : ''}${netPnL.toFixed(2)} ({netPnLPercent >= 0 ? '+' : ''}{netPnLPercent}%)
+                      </td>
+                      <td className="py-3 px-3">
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-slate-300 font-bold">{pos.currentScore ?? 0}</span>
+                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                            pos.currentState === 'STRONG_BULLISH'
+                              ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
+                              : pos.currentState === 'WEAKENING'
+                              ? 'bg-rose-500/20 text-rose-400 border border-rose-500/30'
+                              : 'bg-sky-500/20 text-sky-400 border border-sky-500/30'
+                          }`}>
+                            {pos.currentState}
+                          </span>
+                        </div>
+                      </td>
+                      <td className="py-3 px-3 text-right space-x-2">
+                        <button
+                          onClick={() => onSelectSymbol(pos.symbol)}
+                          className="px-2.5 py-1 text-[11px] bg-slate-800 hover:bg-slate-700 text-slate-300 rounded"
+                        >
+                          Chart
+                        </button>
+                        <button
+                          onClick={() => onOpenSellModal(pos)}
+                          className="px-2.5 py-1 text-[11px] bg-rose-500/20 hover:bg-rose-500/30 text-rose-400 border border-rose-500/30 rounded font-bold"
+                        >
+                          Sell
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

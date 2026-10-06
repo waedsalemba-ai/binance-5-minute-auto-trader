@@ -5,10 +5,13 @@ import {
   TradingSettings,
   ScannerSummary,
   StrategyState,
+  ServerEngineStatus,
+  DecisionAuditRecord,
 } from '../types/index.ts';
 import { Storage } from './storage.ts';
 import { BinanceRequestManager } from './binance-client.ts';
 import { BinanceSymbolValidator } from './symbol-validator.ts';
+import { BinanceTimeService } from './binance-time.ts';
 import { calculateAllIndicators } from './indicators.ts';
 import { detectCandlePatterns } from './pattern-detector.ts';
 import { analyzeMarketStructure } from './market-structure.ts';
@@ -16,12 +19,7 @@ import { StrategyEngine } from './strategy-engine.ts';
 import { SafetyGate } from './safety-gate.ts';
 import { PaperTradingExecutor, RealBinanceTradingExecutor, TradingExecutor } from './trading-executor.ts';
 import { Logger } from './logger.ts';
-import {
-  evaluateExitDecision,
-  calculatePositionNetPnL,
-  calculateBreakEvenExitPrice,
-  calculateTargetExitPrice,
-} from './exit-decision-engine.ts';
+import { evaluateExitDecision } from './exit-decision-engine.ts';
 import { evaluateEntryEligibility } from './entry-decision-engine.ts';
 
 type StateUpdateListener = (data: { type: string; payload: any }) => void;
@@ -32,10 +30,13 @@ export class AutoTradingEngine {
   private paperExecutor = new PaperTradingExecutor();
   private realExecutor = new RealBinanceTradingExecutor();
   private scanTimer: NodeJS.Timeout | null = null;
+  private watchdogTimer: NodeJS.Timeout | null = null;
   private isScanRunning = false;
+  private scanStartTime = 0;
   private isEmergencyStopped = false;
   private pendingBuyLocks = new Set<string>();
   private listeners = new Set<StateUpdateListener>();
+  private isEngineRunning = false;
 
   private constructor() {}
 
@@ -72,7 +73,6 @@ export class AutoTradingEngine {
   public setEmergencyStop(active: boolean): void {
     Storage.setEmergencyStopped(active);
     if (active) {
-      // Turn off auto-trading in settings
       Storage.updateSettings({ autoTrading: false });
       Logger.warn(
         Storage.getSettings().mode,
@@ -89,10 +89,63 @@ export class AutoTradingEngine {
     this.broadcast('emergency_stop_changed', { isEmergencyStopped: active });
   }
 
+  /**
+   * Starts the 24/7 server-side trading engine.
+   * Runs independently of browser/frontend connection.
+   */
+  public async start(): Promise<void> {
+    if (this.isEngineRunning) return;
+    this.isEngineRunning = true;
+    Logger.info('PAPER', 'SCAN', 'Initializing 24/7 server-side AutoTradingEngine and Binance services...');
+
+    // 1. Synchronize Binance server time
+    try {
+      await BinanceTimeService.getInstance().syncWithBinance();
+    } catch (err: any) {
+      Logger.warn('PAPER', 'BINANCE', `Initial Binance time sync notice: ${err.message}`);
+    }
+
+    // 2. Warm up Binance Spot exchange metadata
+    try {
+      await BinanceSymbolValidator.getInstance().ensureFreshMetadata('SPOT');
+    } catch (err: any) {
+      Logger.warn('PAPER', 'BINANCE', `Initial Spot metadata warmup notice: ${err.message}`);
+    }
+
+    // 3. Start scan scheduler & watchdog
+    this.startScheduler();
+    this.startWatchdog();
+
+    Storage.updateEngineTelemetry({
+      engineStatus: 'RUNNING',
+      schedulerStatus: 'RUNNING',
+      watchdogStatus: 'RUNNING',
+    });
+  }
+
+  /**
+   * Stops the trading engine scheduler and watchdog.
+   */
+  public stop(): void {
+    this.isEngineRunning = false;
+    this.stopScheduler();
+    this.stopWatchdog();
+    Storage.updateEngineTelemetry({
+      engineStatus: 'STOPPED',
+      schedulerStatus: 'STOPPED',
+      watchdogStatus: 'STOPPED',
+    });
+    Logger.info('PAPER', 'SCAN', 'AutoTradingEngine stopped.');
+  }
+
+  public isRunning(): boolean {
+    return this.isEngineRunning && this.scanTimer !== null;
+  }
+
   public startScheduler(): void {
     if (this.scanTimer) return;
     const settings = Storage.getSettings();
-    const intervalMs = settings.scanIntervalMs || 120000; // 2 minutes
+    const intervalMs = settings.scanIntervalMs || 120000; // 2 minutes default
 
     Logger.info('PAPER', 'SCAN', `AutoTrading scheduler initialized with ${intervalMs / 1000}s interval (2m).`);
 
@@ -104,6 +157,8 @@ export class AutoTradingEngine {
     this.scanTimer = setInterval(() => {
       this.runScanCycle().catch(err => Logger.error('PAPER', 'SCAN', `Scan cycle error: ${err.message}`));
     }, intervalMs);
+
+    Storage.updateEngineTelemetry({ schedulerStatus: 'RUNNING' });
   }
 
   public stopScheduler(): void {
@@ -111,8 +166,71 @@ export class AutoTradingEngine {
       clearInterval(this.scanTimer);
       this.scanTimer = null;
     }
+    Storage.updateEngineTelemetry({ schedulerStatus: 'STOPPED' });
   }
 
+  /**
+   * Server-side Watchdog Monitor: runs every 30s to detect stalled cycles or drift.
+   */
+  public startWatchdog(): void {
+    if (this.watchdogTimer) return;
+    this.watchdogTimer = setInterval(() => {
+      this.runWatchdogCheck().catch(() => {});
+    }, 30000);
+    Storage.updateEngineTelemetry({ watchdogStatus: 'RUNNING' });
+  }
+
+  public stopWatchdog(): void {
+    if (this.watchdogTimer) {
+      clearInterval(this.watchdogTimer);
+      this.watchdogTimer = null;
+    }
+    Storage.updateEngineTelemetry({ watchdogStatus: 'STOPPED' });
+  }
+
+  private async runWatchdogCheck(): Promise<void> {
+    const now = Date.now();
+    const settings = Storage.getSettings();
+    const telemetry = Storage.getEngineTelemetry();
+
+    // 1. Stuck scan cycle detection (> 5 minutes)
+    if (this.isScanRunning && this.scanStartTime > 0 && now - this.scanStartTime > 300000) {
+      Logger.warn(settings.mode, 'SCAN', 'Watchdog detected a stalled scan cycle (> 5m). Forcibly unlocking scan lock.');
+      this.isScanRunning = false;
+      this.scanStartTime = 0;
+    }
+
+    // 2. Scheduler restart if autoTrading is enabled but scheduler stopped
+    if (settings.autoTrading && !this.scanTimer && this.isEngineRunning) {
+      Logger.warn(settings.mode, 'SCAN', 'Watchdog detected autoTrading is enabled but scheduler timer was null. Restarting scheduler...');
+      this.startScheduler();
+    }
+
+    // 3. Binance Clock Drift Check
+    const timeService = BinanceTimeService.getInstance();
+    if (!timeService.isSafeDrift()) {
+      Logger.warn(settings.mode, 'BINANCE', `Watchdog detected clock drift (${timeService.getOffset()}ms). Resyncing...`);
+      await timeService.syncWithBinance().catch(() => {});
+    }
+
+    // 4. Spot metadata validation cache verification
+    const validator = BinanceSymbolValidator.getInstance();
+    if (validator.getSpotMarketTelemetry().symbolsCount === 0) {
+      Logger.warn(settings.mode, 'BINANCE', 'Watchdog detected empty Spot symbol cache. Refreshing metadata...');
+      await validator.ensureFreshMetadata('SPOT', true).catch(() => {});
+    }
+
+    // Update telemetry
+    Storage.updateEngineTelemetry({
+      engineStatus: this.isEngineRunning ? 'RUNNING' : 'STOPPED',
+      schedulerStatus: this.scanTimer ? 'RUNNING' : 'STOPPED',
+      watchdogStatus: this.watchdogTimer ? 'RUNNING' : 'STOPPED',
+    });
+  }
+
+  /**
+   * Main Market Scanning & Automated 5m Strategy Execution Loop.
+   */
   public async runScanCycle(): Promise<TechnicalAnalysis[]> {
     if (this.isScanRunning) {
       Logger.warn('PAPER', 'SCAN', 'Previous scan cycle still active, skipping overlapping trigger.');
@@ -120,11 +238,13 @@ export class AutoTradingEngine {
     }
 
     this.isScanRunning = true;
-    const startTime = Date.now();
+    this.scanStartTime = Date.now();
+    const startTime = this.scanStartTime;
     const settings = Storage.getSettings();
     const currentMode = settings.mode;
 
     Storage.updateScannerSummary({ isScanning: true, lastScanTime: startTime });
+    Storage.updateEngineTelemetry({ lastScanAt: startTime });
     this.broadcast('scanner_started', { timestamp: startTime });
 
     try {
@@ -167,20 +287,32 @@ export class AutoTradingEngine {
       let weakeningCount = 0;
       let neutralCount = 0;
 
-      // 2. Scan each symbol
+      // 2. Scan each liquid Spot symbol
       for (const t of validTickers) {
         try {
           const symbol = t.symbol;
           const candles5m = await this.binance.getKlines(symbol, '5m', Math.min(candleLimit, 250));
           if (candles5m.length < 35) continue;
 
-          // Technical indicators on 5m
-          const ind5m = calculateAllIndicators(candles5m);
-          const patterns5m = detectCandlePatterns(candles5m);
-          const struct5m = analyzeMarketStructure(candles5m);
-          const tf5mSignal = StrategyEngine.analyzeTimeframe(candles5m, '5m');
+          // =========================================================================
+          // CRITICAL: 5-MINUTE CLOSED CANDLE INVARIANT
+          // Binance returns the currently forming, unfinished candle at [length - 1].
+          // Strategy indicators, patterns, and ENTRY signals MUST evaluate the
+          // latest CLOSED candle at [length - 2].
+          // =========================================================================
+          const closedCandles5m = candles5m.slice(0, candles5m.length - 1);
+          const latestClosedCandle = closedCandles5m[closedCandles5m.length - 1];
+          const closedCandleCloseTime = latestClosedCandle.closeTime;
 
-          // Multi-timeframe: fetch 15m, 1h, 4h
+          Storage.updateEngineTelemetry({ lastClosed5mCandleAt: closedCandleCloseTime });
+
+          // Technical indicators computed on CLOSED candles
+          const ind5m = calculateAllIndicators(closedCandles5m);
+          const patterns5m = detectCandlePatterns(closedCandles5m);
+          const struct5m = analyzeMarketStructure(closedCandles5m);
+          const tf5mSignal = StrategyEngine.analyzeTimeframe(closedCandles5m, '5m');
+
+          // Multi-timeframe trend confirmation: fetch 15m, 1h, 4h (using closed candles)
           let tf15mSignal;
           let tf1hSignal;
           let tf4hSignal;
@@ -188,21 +320,24 @@ export class AutoTradingEngine {
           try {
             const candles15m = await this.binance.getKlines(symbol, '15m', 60);
             if (candles15m.length >= 30) {
-              tf15mSignal = StrategyEngine.analyzeTimeframe(candles15m, '15m');
+              const closed15m = candles15m.slice(0, candles15m.length - 1);
+              tf15mSignal = StrategyEngine.analyzeTimeframe(closed15m, '15m');
             }
           } catch {}
 
           try {
             const candles1h = await this.binance.getKlines(symbol, '1h', 60);
             if (candles1h.length >= 30) {
-              tf1hSignal = StrategyEngine.analyzeTimeframe(candles1h, '1h');
+              const closed1h = candles1h.slice(0, candles1h.length - 1);
+              tf1hSignal = StrategyEngine.analyzeTimeframe(closed1h, '1h');
             }
           } catch {}
 
           try {
             const candles4h = await this.binance.getKlines(symbol, '4h', 60);
             if (candles4h.length >= 30) {
-              tf4hSignal = StrategyEngine.analyzeTimeframe(candles4h, '4h');
+              const closed4h = candles4h.slice(0, candles4h.length - 1);
+              tf4hSignal = StrategyEngine.analyzeTimeframe(closed4h, '4h');
             }
           } catch {}
 
@@ -214,7 +349,7 @@ export class AutoTradingEngine {
           };
 
           const { score, components } = StrategyEngine.calculateTechnicalScore(
-            candles5m,
+            closedCandles5m,
             ind5m,
             patterns5m,
             struct5m,
@@ -271,7 +406,7 @@ export class AutoTradingEngine {
 
           // 3. Process automated trading decisions if enabled
           if (settings.autoTrading && !this.isEmergencyStopped) {
-            await this.processTradingSignal(analysis, prevAnalysis?.strategyState, settings, currentMode);
+            await this.processTradingSignal(analysis, prevAnalysis?.strategyState, settings, currentMode, closedCandleCloseTime);
           }
         } catch (symErr: any) {
           // continue with next symbol
@@ -336,6 +471,7 @@ export class AutoTradingEngine {
       };
 
       Storage.updateScannerSummary(summary);
+      Storage.updateEngineTelemetry({ lastSuccessfulScanAt: Date.now() });
       this.broadcast('scan_completed', { summary, resultsCount: results.length });
 
       const durationSec = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -352,6 +488,7 @@ export class AutoTradingEngine {
       throw err;
     } finally {
       this.isScanRunning = false;
+      this.scanStartTime = 0;
     }
   }
 
@@ -359,7 +496,8 @@ export class AutoTradingEngine {
     analysis: TechnicalAnalysis,
     previousState: StrategyState | undefined,
     settings: TradingSettings,
-    mode: TradingMode
+    mode: TradingMode,
+    closedCandleTime: number
   ): Promise<void> {
     const symbol = analysis.symbol;
     const executor = this.getExecutor(mode);
@@ -372,12 +510,25 @@ export class AutoTradingEngine {
     // 1. POSITION MANAGEMENT & EXIT ARCHITECTURE (IF POSITION OPEN)
     // -------------------------------------------------------------
     if (openPosition && openPosition.status === 'OPEN') {
+      Storage.updateEngineTelemetry({ lastExitEvaluationAt: Date.now() });
       await this.evaluateAndProcessPositionExit(openPosition, analysis, settings, mode);
       return;
     }
 
     // -------------------------------------------------------------
-    // 2. CENTRALIZED ENTRY DECISION EVALUATION (IF NO POSITION)
+    // 2. CLOSED CANDLE DEDUPLICATION CHECK
+    // If this closed 5m candle was already evaluated for entry, skip to prevent
+    // duplicate buys across multiple scans during the same candle period.
+    // -------------------------------------------------------------
+    const lastEvaluatedCandleTime = Storage.getLastEvaluatedCandle(symbol);
+    if (lastEvaluatedCandleTime && closedCandleTime <= lastEvaluatedCandleTime) {
+      return;
+    }
+
+    Storage.updateEngineTelemetry({ lastEntryEvaluationAt: Date.now() });
+
+    // -------------------------------------------------------------
+    // 3. CENTRALIZED ENTRY DECISION EVALUATION (IF NO POSITION)
     // -------------------------------------------------------------
     const entryDecision = evaluateEntryEligibility({
       symbol,
@@ -391,7 +542,8 @@ export class AutoTradingEngine {
     });
 
     if (!entryDecision.eligible) {
-      // Log blocked or skipped entry for informative diagnostic tracking
+      // Mark closed candle as evaluated so we don't spam checks for neutral/weakening
+      Storage.setLastEvaluatedCandle(symbol, closedCandleTime);
       if (analysis.strategyState === 'PRE_BULLISH' || analysis.strategyState === 'STRONG_BULLISH') {
         Logger.info(
           mode,
@@ -415,17 +567,32 @@ export class AutoTradingEngine {
       const wallet = Storage.getWallet(mode);
       const openPositions = Storage.getPositions(mode, 'OPEN');
 
-      // Defense in depth: no automated BUY may use a legacy alias or a symbol
-      // that is not currently tradable on Binance Spot.
+      // Strict Binance Spot Symbol Validation: no legacy aliases or non-tradable pairs
       const strictValidation = await BinanceSymbolValidator.getInstance().validateExactSpotUsdtSymbol(symbol);
       if (!strictValidation.tradable) {
         Logger.warn(mode, 'STRATEGY', `AUTO BUY BLOCKED: ${symbol} is not an exact current Binance Spot USDT symbol (${strictValidation.reason}).`);
+        Storage.setLastEvaluatedCandle(symbol, closedCandleTime);
+        Storage.saveDecisionAudit({
+          timestamp: Date.now(),
+          symbol,
+          candleTimestamp: closedCandleTime,
+          timeframe: '5m',
+          score5m: analysis.score,
+          price: analysis.price,
+          trend: analysis.marketStructure?.trend || 'NEUTRAL',
+          signalState: entryDecision.strategyState,
+          decision: 'REJECTED',
+          rejectionReason: `SYMBOL_NOT_TRADABLE: ${strictValidation.reason}`,
+          mode,
+          tradeAmount: fixedAmount,
+        });
         return;
       }
 
       const symbolFilter = await this.binance.getSymbolFilters(symbol);
 
-      const clientOrderId = `AUTO-${mode}-${symbol}-${Date.now().toString(36)}`;
+      // Deterministic & idempotent clientOrderId format: BOT_<MODE>_<SYMBOL>_<CANDLE_TIME>_BUY
+      const clientOrderId = `BOT_${mode}_${symbol}_${closedCandleTime}_BUY`.replace(/[^a-zA-Z0-9_]/g, '').slice(0, 36);
       const orderRequest = {
         symbol,
         side: 'BUY' as const,
@@ -458,13 +625,31 @@ export class AutoTradingEngine {
             technicalScore: entryDecision.technicalScore,
           }
         );
+        Storage.setLastEvaluatedCandle(symbol, closedCandleTime);
+        Storage.saveDecisionAudit({
+          timestamp: Date.now(),
+          symbol,
+          candleTimestamp: closedCandleTime,
+          timeframe: '5m',
+          score5m: analysis.score,
+          score15m: analysis.multiTimeframe?.['15m']?.score,
+          score1h: analysis.multiTimeframe?.['1h']?.score,
+          score4h: analysis.multiTimeframe?.['4h']?.score,
+          price: analysis.price,
+          trend: analysis.marketStructure?.trend || 'NEUTRAL',
+          signalState: entryDecision.strategyState,
+          decision: 'REJECTED',
+          rejectionReason: safetyResult.reason,
+          mode,
+          tradeAmount: fixedAmount,
+        });
         return;
       }
 
       Logger.info(
         mode,
         'STRATEGY',
-        `BUY SIGNAL TRIGGERED: ${symbol} (${entryDecision.strategyState}) | Fixed Amount: ${fixedAmount} USDT | Score: ${entryDecision.technicalScore}`,
+        `BUY SIGNAL TRIGGERED: ${symbol} (${entryDecision.strategyState}) | Fixed Amount: ${fixedAmount} USDT | Score: ${entryDecision.technicalScore} | Closed Candle: ${new Date(closedCandleTime).toISOString()}`,
         {
           symbol,
           strategyState: entryDecision.strategyState,
@@ -473,6 +658,26 @@ export class AutoTradingEngine {
       );
 
       const execResult = await executor.buy(orderRequest);
+      Storage.setLastEvaluatedCandle(symbol, closedCandleTime);
+
+      Storage.saveDecisionAudit({
+        timestamp: Date.now(),
+        symbol,
+        candleTimestamp: closedCandleTime,
+        timeframe: '5m',
+        score5m: analysis.score,
+        score15m: analysis.multiTimeframe?.['15m']?.score,
+        score1h: analysis.multiTimeframe?.['1h']?.score,
+        score4h: analysis.multiTimeframe?.['4h']?.score,
+        price: analysis.price,
+        trend: analysis.marketStructure?.trend || 'NEUTRAL',
+        signalState: entryDecision.strategyState,
+        decision: execResult.success ? 'BUY' : 'REJECTED',
+        rejectionReason: execResult.success ? null : execResult.error,
+        mode,
+        tradeAmount: fixedAmount,
+      });
+
       if (execResult.success) {
         this.broadcast('order_executed', { mode, order: execResult.order, position: execResult.position });
       }
@@ -483,7 +688,7 @@ export class AutoTradingEngine {
         technicalScore: entryDecision.technicalScore,
       });
     } finally {
-      // Release atomic lock regardless of outcome
+      // Release atomic lock
       this.pendingBuyLocks.delete(lockKey);
     }
   }
@@ -560,7 +765,7 @@ export class AutoTradingEngine {
 
     // 4. If SELL decision is authorized
     if (exitDecision.shouldSell) {
-      const clientOrderId = `AUTO-${mode}-SELL-${symbol}-${Date.now().toString(36)}`;
+      const clientOrderId = `BOT_${mode}_${symbol}_${Date.now()}_SELL`.replace(/[^a-zA-Z0-9_]/g, '').slice(0, 36);
       const orderRequest = {
         symbol,
         side: 'SELL' as const,
@@ -642,6 +847,21 @@ export class AutoTradingEngine {
 
       try {
         const execResult = await executor.sell(orderRequest, position.id);
+        Storage.saveDecisionAudit({
+          timestamp: Date.now(),
+          symbol,
+          candleTimestamp: Date.now(),
+          timeframe: '5m',
+          score5m: analysis.score,
+          price: freshPrice,
+          trend: analysis.marketStructure?.trend || 'NEUTRAL',
+          signalState: analysis.strategyState,
+          decision: execResult.success ? 'SELL' : 'REJECTED',
+          rejectionReason: execResult.success ? null : execResult.error,
+          mode,
+          tradeAmount: position.entryQuoteAmount,
+        });
+
         if (execResult.success) {
           this.broadcast('order_executed', { mode, order: execResult.order, trade: execResult.trade, position: execResult.position });
         }
@@ -653,5 +873,32 @@ export class AutoTradingEngine {
         });
       }
     }
+  }
+
+  public getEngineStatus(): ServerEngineStatus {
+    const settings = Storage.getSettings();
+    const telemetry = Storage.getEngineTelemetry();
+    const validator = BinanceSymbolValidator.getInstance();
+    const spotTele = validator.getSpotMarketTelemetry();
+    const openPositions = Storage.getPositions(settings.mode, 'OPEN');
+
+    return {
+      status: Storage.isReady() ? 'ok' : 'degraded',
+      serverTime: new Date().toISOString(),
+      tradingEngine: this.isEngineRunning ? 'RUNNING' : 'STOPPED',
+      scheduler: this.scanTimer ? 'RUNNING' : 'STOPPED',
+      watchdog: this.watchdogTimer ? 'RUNNING' : 'STOPPED',
+      mode: settings.mode,
+      autoTrading: settings.autoTrading,
+      isEmergencyStopped: this.isEmergencyStopActive(),
+      lastScanAt: telemetry.lastScanAt ? new Date(telemetry.lastScanAt).toISOString() : null,
+      lastSuccessfulScanAt: telemetry.lastSuccessfulScanAt ? new Date(telemetry.lastSuccessfulScanAt).toISOString() : null,
+      lastClosed5mCandleAt: telemetry.lastClosed5mCandleAt ? new Date(telemetry.lastClosed5mCandleAt).toISOString() : null,
+      lastEntryEvaluationAt: telemetry.lastEntryEvaluationAt ? new Date(telemetry.lastEntryEvaluationAt).toISOString() : null,
+      lastExitEvaluationAt: telemetry.lastExitEvaluationAt ? new Date(telemetry.lastExitEvaluationAt).toISOString() : null,
+      activePositions: openPositions.length,
+      validBinanceSymbols: spotTele.symbolsCount,
+      uptimeSeconds: Math.floor(process.uptime()),
+    };
   }
 }
