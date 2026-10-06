@@ -67,6 +67,13 @@ export class SafetyGate {
           reason: 'Binance API credentials are not configured for REAL mode.',
         };
       }
+      if (realAcc.permissions && realAcc.permissions.canTrade === false) {
+        return {
+          allowed: false,
+          code: 'ACCOUNT_CANNOT_TRADE',
+          reason: 'Binance reports that the connected API account does not have trading permission (canTrade is false).',
+        };
+      }
       if (!realAcc.autoTrading) {
         return {
           allowed: false,

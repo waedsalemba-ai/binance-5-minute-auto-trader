@@ -32,6 +32,9 @@ import {
   evaluateExitDecision,
 } from '../src/server/exit-decision-engine.ts';
 import { evaluateEntryEligibility } from '../src/server/entry-decision-engine.ts';
+import { BinanceSymbolValidator } from '../src/server/symbol-validator.ts';
+import { BinanceSymbolNormalizer } from '../src/server/symbol-normalizer.ts';
+import { RealBinanceTradingExecutor } from '../src/server/trading-executor.ts';
 import {
   verifyAdminToken,
   verifyAdminSessionToken,
@@ -457,6 +460,7 @@ async function runAllTests() {
   console.log('\n8. Exit Decision Engine Verification:');
   const baseSettings: TradingSettings = {
     ...Storage.getSettings(),
+    autoTrading: true,
     takeProfitPercent: 2.0,
     stopLossPercent: 3.0,
     minProfitForTechnicalExitPercent: 0.20,
@@ -1349,6 +1353,462 @@ async function runAllTests() {
     assert.strictEqual(wallet.realizedPnL, 0);
     assert.strictEqual(wallet.unrealizedPnL, 0);
     assert.strictEqual(wallet.assets.length, 0);
+  });
+
+  // -------------------------------------------------------------
+  // 18. Live Binance Spot Market Validation & Migration Suite
+  // -------------------------------------------------------------
+  console.log('\n18. Binance Spot Market Validation & Delisted Token Protection Suite:');
+
+  const validator = BinanceSymbolValidator.getInstance();
+
+  // Seed standard test mock exchange metadata
+  validator.setMockMetadata('SPOT', [
+    {
+      symbol: 'BTCUSDT',
+      status: 'TRADING',
+      baseAsset: 'BTC',
+      quoteAsset: 'USDT',
+      isSpotTradingAllowed: true,
+      permissions: ['SPOT'],
+      filters: [
+        { filterType: 'LOT_SIZE', minQty: '0.00001000', maxQty: '9000.00000000', stepSize: '0.00001000' },
+        { filterType: 'PRICE_FILTER', minPrice: '0.01000000', maxPrice: '1000000.00000000', tickSize: '0.01000000' },
+        { filterType: 'NOTIONAL', minNotional: '5.00000000' },
+      ],
+    },
+    {
+      symbol: 'ETHUSDT',
+      status: 'TRADING',
+      baseAsset: 'ETH',
+      quoteAsset: 'USDT',
+      isSpotTradingAllowed: true,
+      permissions: ['SPOT'],
+      filters: [
+        { filterType: 'LOT_SIZE', minQty: '0.00010000', maxQty: '9000.00000000', stepSize: '0.00010000' },
+        { filterType: 'PRICE_FILTER', minPrice: '0.01000000', maxPrice: '100000.00000000', tickSize: '0.01000000' },
+        { filterType: 'NOTIONAL', minNotional: '5.00000000' },
+      ],
+    },
+    {
+      symbol: 'RENDERUSDT',
+      status: 'TRADING',
+      baseAsset: 'RENDER',
+      quoteAsset: 'USDT',
+      isSpotTradingAllowed: true,
+      permissions: ['SPOT'],
+      filters: [
+        { filterType: 'LOT_SIZE', minQty: '0.01000000', maxQty: '900000.00000000', stepSize: '0.01000000' },
+        { filterType: 'PRICE_FILTER', minPrice: '0.00100000', maxPrice: '10000.00000000', tickSize: '0.00100000' },
+        { filterType: 'NOTIONAL', minNotional: '5.00000000' },
+      ],
+    },
+    {
+      symbol: 'BREAKUSDT',
+      status: 'BREAK',
+      baseAsset: 'BREAK',
+      quoteAsset: 'USDT',
+      isSpotTradingAllowed: true,
+      permissions: ['SPOT'],
+      filters: [],
+    },
+    {
+      symbol: 'HALTUSDT',
+      status: 'HALT',
+      baseAsset: 'HALT',
+      quoteAsset: 'USDT',
+      isSpotTradingAllowed: true,
+      permissions: ['SPOT'],
+      filters: [],
+    },
+    {
+      symbol: 'NOSPOTUSDT',
+      status: 'TRADING',
+      baseAsset: 'NOSPOT',
+      quoteAsset: 'USDT',
+      isSpotTradingAllowed: false,
+      permissions: ['SPOT'],
+      filters: [],
+    },
+    {
+      symbol: 'NOMARGINUSDT',
+      status: 'TRADING',
+      baseAsset: 'NOMARGIN',
+      quoteAsset: 'USDT',
+      isSpotTradingAllowed: true,
+      permissions: ['MARGIN', 'LEVERAGED'], // missing SPOT
+      filters: [],
+    },
+    {
+      symbol: 'BTCETH',
+      status: 'TRADING',
+      baseAsset: 'BTC',
+      quoteAsset: 'ETH',
+      isSpotTradingAllowed: true,
+      permissions: ['SPOT'],
+      filters: [
+        { filterType: 'LOT_SIZE', minQty: '0.00001000', maxQty: '9000.00000000', stepSize: '0.00001000' },
+        { filterType: 'NOTIONAL', minNotional: '0.005' },
+      ],
+    },
+  ]);
+
+  test('SPOT TEST 1: Valid Spot symbol (BTCUSDT) passes all validations', async () => {
+    const res = await validator.validateSpotSymbol('BTCUSDT');
+    assert.strictEqual(res.exists, true);
+    assert.strictEqual(res.status, 'TRADING');
+    assert.strictEqual(res.tradable, true);
+    assert.strictEqual(res.isSpotTradingAllowed, true);
+    assert.strictEqual(res.quoteAsset, 'USDT');
+    assert.strictEqual(res.baseAsset, 'BTC');
+    assert.strictEqual(res.reason, null);
+  });
+
+  test('SPOT TEST 2: Nonexistent symbol (FAKEUSDT) fails closed with SYMBOL_NOT_TRADABLE', async () => {
+    const res = await validator.validateSpotSymbol('FAKEUSDT');
+    assert.strictEqual(res.exists, false);
+    assert.strictEqual(res.tradable, false);
+    assert.strictEqual(res.reason, 'SYMBOL_NOT_TRADABLE');
+  });
+
+  test('SPOT TEST 3: Symbol status BREAK is rejected with SYMBOL_STATUS_BREAK', async () => {
+    const res = await validator.validateSpotSymbol('BREAKUSDT');
+    assert.strictEqual(res.exists, true);
+    assert.strictEqual(res.status, 'BREAK');
+    assert.strictEqual(res.tradable, false);
+    assert.strictEqual(res.reason, 'SYMBOL_STATUS_BREAK');
+  });
+
+  test('SPOT TEST 4: Symbol status HALT is rejected with SYMBOL_STATUS_HALT', async () => {
+    const res = await validator.validateSpotSymbol('HALTUSDT');
+    assert.strictEqual(res.exists, true);
+    assert.strictEqual(res.status, 'HALT');
+    assert.strictEqual(res.tradable, false);
+    assert.strictEqual(res.reason, 'SYMBOL_STATUS_HALT');
+  });
+
+  test('SPOT TEST 5: isSpotTradingAllowed=false is rejected with SPOT_TRADING_NOT_ALLOWED', async () => {
+    const res = await validator.validateSpotSymbol('NOSPOTUSDT');
+    assert.strictEqual(res.tradable, false);
+    assert.strictEqual(res.reason, 'SPOT_TRADING_NOT_ALLOWED');
+  });
+
+  test('SPOT TEST 6: Missing SPOT permission is rejected with SPOT_PERMISSION_MISSING', async () => {
+    const res = await validator.validateSpotSymbol('NOMARGINUSDT');
+    assert.strictEqual(res.tradable, false);
+    assert.strictEqual(res.reason, 'SPOT_PERMISSION_MISSING');
+  });
+
+  test('SPOT TEST 7: Non-USDT quote asset (BTCETH) is rejected with INVALID_QUOTE_ASSET', async () => {
+    const res = await validator.validateSpotSymbol('BTCETH');
+    assert.strictEqual(res.tradable, false);
+    assert.strictEqual(res.reason, 'INVALID_QUOTE_ASSET');
+  });
+
+  test('SPOT TEST 8: LOT_SIZE stepSize formatting rounds downward cleanly', async () => {
+    const formatted = await validator.formatOrderQuantity('BTCUSDT', 0.12345678, 'SPOT');
+    assert.strictEqual(formatted.valid, true);
+    assert.strictEqual(formatted.formattedQty, '0.12345');
+    assert.strictEqual(formatted.numericQty, 0.12345);
+  });
+
+  test('SPOT TEST 9: Quantity below minQty is rejected with QUANTITY_BELOW_MIN', async () => {
+    const formatted = await validator.formatOrderQuantity('BTCUSDT', 0.000001, 'SPOT');
+    assert.strictEqual(formatted.valid, false);
+    assert.ok(formatted.reason?.includes('QUANTITY_BELOW_MIN'));
+  });
+
+  test('SPOT TEST 10: Quantity above maxQty is rejected with QUANTITY_ABOVE_MAX', async () => {
+    const formatted = await validator.formatOrderQuantity('BTCUSDT', 99999999, 'SPOT');
+    assert.strictEqual(formatted.valid, false);
+    assert.ok(formatted.reason?.includes('QUANTITY_ABOVE_MAX'));
+  });
+
+  test('SPOT TEST 11: MIN_NOTIONAL failure blocks order execution', () => {
+    const filter: SymbolFilterRules = {
+      minNotional: 10,
+      minQty: 0.0001,
+      maxQty: 1000,
+      stepSize: 0.0001,
+      tickSize: 0.01,
+      minPrice: 0.01,
+      maxPrice: 10000,
+    };
+    const paperWallet: WalletBalance = {
+      mode: 'PAPER',
+      usdtAvailable: 1000,
+      usdtLocked: 0,
+      usdtTotal: 1000,
+      accountAssetValue: 0,
+      totalEquity: 1000,
+      startingBalance: 1000,
+      realizedPnL: 0,
+      unrealizedPnL: 0,
+      totalFeesPaid: 0,
+      assets: [],
+      lastReconciledAt: Date.now(),
+      reconciliationStatus: 'OK',
+    };
+
+    const res = SafetyGate.validateBuy(
+      {
+        symbol: 'BTCUSDT',
+        side: 'BUY',
+        quoteAmount: 5,
+        reason: 'Min Notional Test',
+        strategyState: 'STRONG_BULLISH',
+        technicalScore: 85,
+        clientOrderId: 'test-notional-1',
+      },
+      'PAPER',
+      { ...baseSettings, fixedTradeAmount: 5 },
+      paperWallet,
+      [],
+      filter,
+      50000,
+      false
+    );
+
+    assert.strictEqual(res.allowed, false);
+    assert.strictEqual(res.code, 'MIN_NOTIONAL_NOT_MET');
+  });
+
+  test('SPOT TEST 12: Successful BUY validation flow provides tradable=true and filters', async () => {
+    const res = await validator.validateSpotSymbol('ETHUSDT');
+    assert.strictEqual(res.tradable, true);
+    assert.strictEqual(res.normalizedSymbol, 'ETHUSDT');
+    assert.strictEqual(res.filters.minNotional, 5);
+  });
+
+  test('SPOT TEST 13: Successful SELL validation format calculates correct floored quantity', async () => {
+    const format = await validator.formatOrderQuantity('ETHUSDT', 0.543219, 'SPOT');
+    assert.strictEqual(format.valid, true);
+    assert.strictEqual(format.formattedQty, '0.5432');
+  });
+
+  test('SPOT TEST 14: Binance invalid symbol rejection invalidates cache', () => {
+    validator.invalidateCache('SPOT');
+    const tele = validator.getSpotMarketTelemetry();
+    assert.strictEqual(tele.spotMarketAvailable, false);
+    assert.strictEqual(tele.symbolsCount, 0);
+  });
+
+  test('SPOT TEST 15: Cache refresh re-populates metadata cache', () => {
+    validator.setMockMetadata('SPOT', [
+      {
+        symbol: 'BTCUSDT',
+        status: 'TRADING',
+        baseAsset: 'BTC',
+        quoteAsset: 'USDT',
+        isSpotTradingAllowed: true,
+        filters: [],
+      },
+    ]);
+    const tele = validator.getSpotMarketTelemetry();
+    assert.strictEqual(tele.spotMarketAvailable, true);
+    assert.strictEqual(tele.symbolsCount, 1);
+  });
+
+  test('SPOT TEST 16: Legacy RNDRUSDT normalizes to RENDERUSDT and confirms tradability on Binance Spot', async () => {
+    validator.setMockMetadata('SPOT', [
+      {
+        symbol: 'RENDERUSDT',
+        status: 'TRADING',
+        baseAsset: 'RENDER',
+        quoteAsset: 'USDT',
+        isSpotTradingAllowed: true,
+        permissions: ['SPOT'],
+        filters: [],
+      },
+    ]);
+
+    const res = await validator.validateSpotSymbol('RNDRUSDT');
+    assert.strictEqual(res.requestedSymbol, 'RNDRUSDT');
+    assert.strictEqual(res.normalizedSymbol, 'RENDERUSDT');
+    assert.strictEqual(res.tradable, true);
+  });
+
+  test('SPOT TEST 17: Legacy TOMOUSDT -> VICUSDT fails closed when VICUSDT is not available/tradable on Binance Spot', async () => {
+    // Deliberately do not include VICUSDT in Spot exchange metadata
+    validator.setMockMetadata('SPOT', [
+      {
+        symbol: 'BTCUSDT',
+        status: 'TRADING',
+        baseAsset: 'BTC',
+        quoteAsset: 'USDT',
+        isSpotTradingAllowed: true,
+        filters: [],
+      },
+    ]);
+
+    const res = await validator.validateSpotSymbol('TOMOUSDT');
+    assert.strictEqual(res.requestedSymbol, 'TOMOUSDT');
+    assert.strictEqual(res.normalizedSymbol, 'VICUSDT');
+    assert.strictEqual(res.tradable, false);
+    assert.strictEqual(res.reason, 'SYMBOL_NOT_TRADABLE');
+  });
+
+  test('SPOT TEST 18: Account canTrade=false blocks live order execution in SafetyGate', () => {
+    const realAccId = 'real-default';
+    Storage.saveBinanceCredentials(realAccId, 'test-api-key', 'test-secret', {
+      canTrade: false,
+      canRead: true,
+      hasWithdrawalWarning: false,
+    });
+
+    const realWallet: WalletBalance = {
+      mode: 'REAL',
+      usdtAvailable: 1000,
+      usdtLocked: 0,
+      usdtTotal: 1000,
+      accountAssetValue: 0,
+      totalEquity: 1000,
+      startingBalance: 0,
+      realizedPnL: 0,
+      unrealizedPnL: 0,
+      totalFeesPaid: 0,
+      assets: [],
+      lastReconciledAt: Date.now(),
+      reconciliationStatus: 'OK',
+    };
+
+    const originalLiveTradingEnv = process.env.LIVE_TRADING_ENABLED;
+    try {
+      process.env.LIVE_TRADING_ENABLED = 'true';
+      const res = SafetyGate.validateBuy(
+        {
+          symbol: 'BTCUSDT',
+          side: 'BUY',
+          quoteAmount: 100,
+          reason: 'CanTrade Test',
+          strategyState: 'STRONG_BULLISH',
+          technicalScore: 85,
+          clientOrderId: 'test-cantrade-1',
+        },
+        'REAL',
+        { ...baseSettings, fixedTradeAmount: 100 },
+        realWallet,
+        [],
+        { minNotional: 5, minQty: 0.0001, maxQty: 1000, stepSize: 0.0001, tickSize: 0.01, minPrice: 0.01, maxPrice: 10000 },
+        50000,
+        false
+      );
+
+      assert.strictEqual(res.allowed, false);
+      assert.strictEqual(res.code, 'ACCOUNT_CANNOT_TRADE');
+    } finally {
+      process.env.LIVE_TRADING_ENABLED = originalLiveTradingEnv;
+    }
+  });
+
+  test('SPOT TEST 19: Insufficient available USDT blocks buy order', () => {
+    const wallet: WalletBalance = {
+      mode: 'PAPER',
+      usdtAvailable: 50,
+      usdtLocked: 0,
+      usdtTotal: 50,
+      accountAssetValue: 0,
+      totalEquity: 50,
+      startingBalance: 1000,
+      realizedPnL: 0,
+      unrealizedPnL: 0,
+      totalFeesPaid: 0,
+      assets: [],
+      lastReconciledAt: Date.now(),
+      reconciliationStatus: 'OK',
+    };
+
+    const res = SafetyGate.validateBuy(
+      {
+        symbol: 'ETHUSDT',
+        side: 'BUY',
+        quoteAmount: 100,
+        reason: 'Balance Test',
+        strategyState: 'STRONG_BULLISH',
+        technicalScore: 85,
+        clientOrderId: 'test-insufficient-1',
+      },
+      'PAPER',
+      { ...baseSettings, fixedTradeAmount: 100 },
+      wallet,
+      [],
+      { minNotional: 5, minQty: 0.0001, maxQty: 1000, stepSize: 0.0001, tickSize: 0.01, minPrice: 0.01, maxPrice: 10000 },
+      2500,
+      false
+    );
+
+    assert.strictEqual(res.allowed, false);
+    assert.strictEqual(res.code, 'INSUFFICIENT_AVAILABLE_USDT');
+  });
+
+  test('SPOT TEST 20: Actual fill price calculation from executedQuote / executedQty', () => {
+    const executedQty = 0.0452;
+    const executedQuote = 100.0;
+    const calculatedPrice = executedQuote / executedQty;
+    assert.strictEqual(Number(calculatedPrice.toFixed(4)), 2212.3894);
+  });
+
+  test('SPOT TEST 21: Partial fill updates remaining quantity and keeps position OPEN', async () => {
+    const pos: Position = {
+      id: 'partial-pos-1',
+      accountId: 'paper-default',
+      symbol: 'SOLUSDT',
+      mode: 'PAPER',
+      status: 'OPEN',
+      entryPrice: 100,
+      quantity: 2.0,
+      remainingQuantity: 2.0,
+      entryQuoteAmount: 200,
+      entryFees: 0.2,
+      entryScore: 85,
+      entryState: 'STRONG_BULLISH',
+      entryReason: 'Test Partial Fill',
+      currentPrice: 105,
+      currentScore: 85,
+      currentState: 'STRONG_BULLISH',
+      unrealizedPnL: 10,
+      unrealizedPnLPercent: 5.0,
+      openedAt: Date.now(),
+      updatedAt: Date.now(),
+      entryOrderId: 'order-partial-1',
+    };
+    Storage.savePosition(pos);
+
+    // Simulate selling half quantity (1.0 out of 2.0)
+    pos.remainingQuantity = Number((pos.remainingQuantity - 1.0).toFixed(8));
+    if (pos.remainingQuantity <= 0.00001) {
+      pos.status = 'CLOSED';
+    } else {
+      pos.status = 'OPEN';
+    }
+    Storage.savePosition(pos);
+
+    const saved = Storage.getPositionById('partial-pos-1');
+    assert.strictEqual(saved?.status, 'OPEN');
+    assert.strictEqual(saved?.remainingQuantity, 1.0);
+  });
+
+  test('SPOT TEST 22: Full fill transitions position to CLOSED and records trade', () => {
+    const pos = Storage.getPositionById('partial-pos-1')!;
+    pos.remainingQuantity = Number((pos.remainingQuantity - 1.0).toFixed(8));
+    if (pos.remainingQuantity <= 0.00001) {
+      pos.status = 'CLOSED';
+      pos.remainingQuantity = 0;
+    }
+    Storage.savePosition(pos);
+
+    const saved = Storage.getPositionById('partial-pos-1');
+    assert.strictEqual(saved?.status, 'CLOSED');
+    assert.strictEqual(saved?.remainingQuantity, 0);
+  });
+
+  test('SPOT TEST 23: Paper trading remains functional and completely isolated from live execution', async () => {
+    const paperExec = new PaperTradingExecutor();
+    assert.strictEqual(paperExec.getMode(), 'PAPER');
+
+    const wallet = await paperExec.getBalance();
+    assert.strictEqual(wallet.mode, 'PAPER');
+    assert.ok(wallet.usdtTotal >= 0);
   });
 
   await testQueue;

@@ -3,6 +3,7 @@ import path from 'node:path';
 import {
   TradingMode,
   TradingAccount,
+  MarketType,
   Position,
   Order,
   Trade,
@@ -11,6 +12,7 @@ import {
   TechnicalAnalysis,
   ScannerSummary,
   StrategyState,
+  SymbolAuditRecord,
 } from '../types/index.ts';
 import { EncryptedPayload, encryptSecret, decryptSecret, maskApiKey } from './security.ts';
 import { Logger } from './logger.ts';
@@ -114,6 +116,7 @@ export interface DatabaseMemoryCache {
   realWallet: WalletBalance;
   latestAnalysis: Record<string, TechnicalAnalysis>;
   symbolCooldowns: Record<string, { symbol: string; mode: TradingMode; until: number }>;
+  symbolAudits: SymbolAuditRecord[];
   scannerSummary: ScannerSummary;
   lastPersistedAt: number;
 }
@@ -170,6 +173,7 @@ class PostgresStorageEngine {
       realWallet: createInitialRealWallet(),
       latestAnalysis: {},
       symbolCooldowns: {},
+      symbolAudits: [],
       scannerSummary: {
         pairsAnalyzed: 0,
         preBullishCount: 0,
@@ -414,6 +418,26 @@ class PostgresStorageEngine {
             until,
           };
         }
+      }
+
+      // Load Symbol Audit Records (most recent 200)
+      try {
+        const auditRes = await query('SELECT * FROM symbol_audit_records ORDER BY timestamp DESC LIMIT 200');
+        this.cache.symbolAudits = auditRes.rows.map(row => ({
+          id: row.id,
+          timestamp: Number(row.timestamp),
+          requestedSymbol: row.requested_symbol,
+          normalizedSymbol: row.normalized_symbol,
+          market: row.market as MarketType,
+          side: row.side as Order['side'],
+          validationResult: Boolean(row.validation_result),
+          binanceStatus: row.binance_status || null,
+          mappingApplied: Boolean(row.mapping_applied),
+          rejectionReason: row.rejection_reason || null,
+          orderId: row.order_id || undefined,
+        }));
+      } catch {
+        this.cache.symbolAudits = [];
       }
 
       this.cache.scannerSummary.openPositionsCount = this.cache.positions.filter(p => p.status === 'OPEN').length;
@@ -899,6 +923,7 @@ class PostgresStorageEngine {
     this.cache.orders = [];
     this.cache.trades = [];
     this.cache.symbolCooldowns = {};
+    this.cache.symbolAudits = [];
     const defaultStarting = this.cache.settings.paperStartingBalance || 1000;
     this.cache.paperWallet = createInitialPaperWallet(defaultStarting);
     this.cache.realWallet = createInitialRealWallet();
@@ -917,6 +942,7 @@ class PostgresStorageEngine {
         await client.query('DELETE FROM orders');
         await client.query('DELETE FROM trades');
         await client.query('DELETE FROM trade_decisions');
+        await client.query('DELETE FROM symbol_audit_records').catch(() => {});
         await client.query('DELETE FROM symbol_cooldowns');
         await client.query('DELETE FROM system_state');
 
@@ -1454,6 +1480,47 @@ class PostgresStorageEngine {
       ...this.cache.scannerSummary,
       ...updates,
     };
+  }
+
+  // --- Symbol Audit Trail ---
+  public saveSymbolAuditRecord(record: SymbolAuditRecord): void {
+    const id = record.id || `audit-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+    const fullRecord: SymbolAuditRecord = {
+      ...record,
+      id,
+    };
+
+    this.cache.symbolAudits.unshift(fullRecord);
+    if (this.cache.symbolAudits.length > 500) {
+      this.cache.symbolAudits.pop();
+    }
+
+    query(
+      `INSERT INTO symbol_audit_records (
+        id, timestamp, requested_symbol, normalized_symbol, market, side,
+        validation_result, binance_status, mapping_applied, rejection_reason, order_id
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      ON CONFLICT (id) DO NOTHING`,
+      [
+        fullRecord.id,
+        fullRecord.timestamp,
+        fullRecord.requestedSymbol,
+        fullRecord.normalizedSymbol,
+        fullRecord.market,
+        fullRecord.side,
+        fullRecord.validationResult,
+        fullRecord.binanceStatus || null,
+        fullRecord.mappingApplied,
+        fullRecord.rejectionReason || null,
+        fullRecord.orderId || null,
+      ]
+    ).catch(err => {
+      Logger.error('PAPER', 'DATABASE', `Failed to persist symbol audit record to PostgreSQL: ${err.message}`);
+    });
+  }
+
+  public getSymbolAuditRecords(limit = 100): SymbolAuditRecord[] {
+    return this.cache.symbolAudits.slice(0, limit);
   }
 }
 

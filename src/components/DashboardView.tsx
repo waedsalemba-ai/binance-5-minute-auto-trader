@@ -13,6 +13,9 @@ import {
   ArrowRight,
   Flame,
   RotateCcw,
+  Globe,
+  CheckCircle2,
+  XCircle,
 } from 'lucide-react';
 import {
   WalletBalance,
@@ -20,6 +23,7 @@ import {
   ScannerSummary,
   TechnicalAnalysis,
   TradingMode,
+  SpotMarketStatusData,
 } from '../types/index.ts';
 
 interface DashboardViewProps {
@@ -52,6 +56,27 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   onOpenResetModal,
 }) => {
   const [secondsToNextScan, setSecondsToNextScan] = useState<number>(0);
+  const [spotStatus, setSpotStatus] = useState<SpotMarketStatusData | null>(null);
+
+  const fetchSpotStatus = async () => {
+    try {
+      const res = await fetch('/api/market/spot-status');
+      if (res.ok) {
+        const json = await res.json();
+        if (json.success && json.data) {
+          setSpotStatus(json.data);
+        }
+      }
+    } catch {
+      // Ignore background telemetry errors
+    }
+  };
+
+  useEffect(() => {
+    fetchSpotStatus();
+    const interval = setInterval(fetchSpotStatus, 15000);
+    return () => clearInterval(interval);
+  }, []);
 
   useEffect(() => {
     const updateCountdown = () => {
@@ -196,6 +221,90 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           </div>
           <div className="text-[11px] text-slate-500 mt-1">
             2m interval sync
+          </div>
+        </div>
+      </div>
+
+      {/* Live Binance Spot Market & Validation Status Card */}
+      <div className="bg-[#0f172a] border border-slate-800 rounded-2xl p-4 sm:p-5">
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-3 border-b border-slate-800/80 pb-3">
+          <div className="flex items-center gap-2.5">
+            <div className="p-2 rounded-lg bg-amber-500/10 text-amber-400">
+              <Globe className="w-4 h-4" />
+            </div>
+            <div>
+              <h3 className="font-bold text-sm text-slate-100 flex items-center gap-2">
+                Live Binance Spot Market & Validation Authority
+              </h3>
+              <p className="text-[11px] text-slate-400">
+                Authoritative exchangeInfo metadata caching (5m TTL), delisted token protection, and Spot trading guard rails.
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <span className={`text-[11px] font-mono px-2.5 py-1 rounded-lg font-bold flex items-center gap-1.5 ${
+              spotStatus?.liveTradingReady
+                ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
+                : 'bg-slate-800 text-slate-400 border border-slate-700'
+            }`}>
+              {spotStatus?.liveTradingReady ? (
+                <>
+                  <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+                  <span>Live Trading Ready</span>
+                </>
+              ) : (
+                <>
+                  <AlertCircle className="w-3 h-3 text-slate-400" />
+                  <span>{mode === 'REAL' ? 'Live Guard Active' : 'Paper Mode Active'}</span>
+                </>
+              )}
+            </span>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 text-xs font-mono">
+          <div className="p-2.5 bg-slate-900/80 border border-slate-800/80 rounded-xl">
+            <div className="text-slate-500 text-[10px]">Binance API</div>
+            <div className={`font-bold mt-0.5 flex items-center gap-1 ${spotStatus?.connected || spotStatus?.spotMarketAvailable ? 'text-emerald-400' : 'text-slate-400'}`}>
+              <span className={`w-1.5 h-1.5 rounded-full ${spotStatus?.connected || spotStatus?.spotMarketAvailable ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'}`} />
+              <span>{spotStatus?.connected ? 'Connected' : 'Public Active'}</span>
+            </div>
+          </div>
+
+          <div className="p-2.5 bg-slate-900/80 border border-slate-800/80 rounded-xl">
+            <div className="text-slate-500 text-[10px]">API Can Trade</div>
+            <div className={`font-bold mt-0.5 ${spotStatus?.canTrade ? 'text-emerald-400' : 'text-slate-400'}`}>
+              {spotStatus?.canTrade ? 'Can Trade (YES)' : 'Cannot Trade (NO)'}
+            </div>
+          </div>
+
+          <div className="p-2.5 bg-slate-900/80 border border-slate-800/80 rounded-xl">
+            <div className="text-slate-500 text-[10px]">Spot Market</div>
+            <div className={`font-bold mt-0.5 ${spotStatus?.spotMarketAvailable ? 'text-emerald-400' : 'text-rose-400'}`}>
+              {spotStatus?.spotMarketAvailable ? `Available (${spotStatus.symbolsCount})` : 'Unavailable'}
+            </div>
+          </div>
+
+          <div className="p-2.5 bg-slate-900/80 border border-slate-800/80 rounded-xl">
+            <div className="text-slate-500 text-[10px]">Last exchangeInfo</div>
+            <div className="font-bold text-slate-300 mt-0.5 truncate">
+              {spotStatus?.lastExchangeInfoRefresh ? new Date(spotStatus.lastExchangeInfoRefresh).toLocaleTimeString() : 'Refreshing...'}
+            </div>
+          </div>
+
+          <div className="p-2.5 bg-slate-900/80 border border-slate-800/80 rounded-xl">
+            <div className="text-slate-500 text-[10px]">Last Validated Symbol</div>
+            <div className="font-bold text-amber-400 mt-0.5 truncate">
+              {spotStatus?.lastValidatedSymbol || 'Ready (None)'}
+            </div>
+          </div>
+
+          <div className="p-2.5 bg-slate-900/80 border border-slate-800/80 rounded-xl">
+            <div className="text-slate-500 text-[10px]">Last Error / Guard</div>
+            <div className={`font-bold mt-0.5 truncate ${spotStatus?.lastValidationError ? 'text-rose-400' : 'text-emerald-400'}`}>
+              {spotStatus?.lastValidationError || 'None (Passing)'}
+            </div>
           </div>
         </div>
       </div>

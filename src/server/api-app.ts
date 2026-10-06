@@ -2,6 +2,7 @@ import express, { Request, Response, NextFunction } from 'express';
 import { Storage, DATA_DIR } from './storage.ts';
 import { BinanceRequestManager } from './binance-client.ts';
 import { BinanceTimeService } from './binance-time.ts';
+import { BinanceSymbolValidator } from './symbol-validator.ts';
 import { AutoTradingEngine } from './auto-trading-engine.ts';
 import { Logger } from './logger.ts';
 import { TradingMode, OrderRequest } from '../types/index.ts';
@@ -266,6 +267,89 @@ apiApp.get('/api/market/status', async (req: Request, res: Response) => {
         isClockDriftSafe: timeService.isSafeDrift(),
       },
     });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+apiApp.get('/api/market/spot-status', async (req: Request, res: Response) => {
+  try {
+    const validator = BinanceSymbolValidator.getInstance();
+    const telemetry = validator.getSpotMarketTelemetry();
+    const realAcc = Storage.getAccounts().find(a => a.mode === 'REAL');
+    const liveTradingEnabled = process.env.LIVE_TRADING_ENABLED === 'true';
+
+    let canTrade = false;
+    let canWithdraw = false;
+    let accountType = 'SPOT';
+    let permissions: string[] = [];
+
+    if (realAcc?.permissions) {
+      canTrade = Boolean(realAcc.permissions.canTrade);
+      canWithdraw = Boolean(realAcc.permissions.hasWithdrawalWarning);
+    }
+
+    const isLiveReady =
+      liveTradingEnabled &&
+      Boolean(realAcc?.hasApiKeys) &&
+      canTrade &&
+      telemetry.spotMarketAvailable &&
+      Storage.isReady() &&
+      BinanceTimeService.getInstance().isSafeDrift();
+
+    res.json({
+      success: true,
+      data: {
+        connected: Boolean(realAcc?.hasApiKeys),
+        canTrade,
+        canWithdraw,
+        hasWithdrawalWarning: canWithdraw,
+        accountType,
+        accountPermissions: permissions,
+        spotMarketAvailable: telemetry.spotMarketAvailable,
+        symbolsCount: telemetry.symbolsCount,
+        lastExchangeInfoRefresh: telemetry.lastExchangeInfoRefresh,
+        lastSymbolValidationTime: telemetry.lastSymbolValidationTime,
+        lastValidatedSymbol: telemetry.lastValidatedSymbol,
+        lastValidationError: telemetry.lastValidationError,
+        liveTradingReady: isLiveReady,
+        liveTradingEnabled,
+      },
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+apiApp.get('/api/symbol/validate/:symbol', async (req: Request, res: Response) => {
+  try {
+    const symbol = req.params.symbol.toUpperCase();
+    const forceRefresh = req.query.refresh === 'true';
+    const validator = BinanceSymbolValidator.getInstance();
+    const result = await validator.validateSpotSymbol(symbol, forceRefresh);
+    res.json({ success: true, data: result });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+apiApp.get('/api/audit/symbols', (req: Request, res: Response) => {
+  try {
+    const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 50));
+    const records = Storage.getSymbolAuditRecords(limit);
+    res.json({ success: true, data: records });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+apiApp.post('/api/market/refresh-exchange-info', requireAdminAuth, async (req: Request, res: Response) => {
+  try {
+    const validator = BinanceSymbolValidator.getInstance();
+    validator.invalidateCache('SPOT');
+    const ok = await validator.fetchExchangeInfo('SPOT');
+    const telemetry = validator.getSpotMarketTelemetry();
+    res.json({ success: ok, message: ok ? `Successfully indexed ${telemetry.symbolsCount} Spot symbols` : 'Failed to refresh exchangeInfo', data: telemetry });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
   }

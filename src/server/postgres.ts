@@ -617,6 +617,24 @@ export async function initializePostgresSchema(): Promise<void> {
         );
       `);
 
+      // Symbol Validation & Live Order Audit Records
+      await safeExec(`
+        CREATE TABLE IF NOT EXISTS symbol_audit_records (
+          id VARCHAR(64) PRIMARY KEY,
+          timestamp BIGINT NOT NULL,
+          requested_symbol VARCHAR(32) NOT NULL,
+          normalized_symbol VARCHAR(32) NOT NULL,
+          market VARCHAR(16) NOT NULL,
+          side VARCHAR(8) NOT NULL,
+          validation_result BOOLEAN NOT NULL,
+          binance_status VARCHAR(32),
+          mapping_applied BOOLEAN NOT NULL,
+          rejection_reason TEXT,
+          order_id VARCHAR(64)
+        );
+      `);
+      await safeExec(`CREATE INDEX IF NOT EXISTS idx_audit_symbol ON symbol_audit_records(requested_symbol, timestamp);`);
+
       await safeExec(
         'INSERT INTO schema_migrations (id, name, applied_at) VALUES ($1, $2, $3)',
         ['1', '001_initial_schema', Date.now()]

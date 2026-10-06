@@ -427,14 +427,33 @@ export interface SymbolValidationResult {
   exists: boolean;
   status: string | null; // e.g. 'TRADING', 'BREAK', 'HALT', 'DELISTED', null
   tradable: boolean;
+  isSpotTradingAllowed?: boolean;
+  permissions?: string[];
   reason: string | null;
   baseAsset?: string;
   quoteAsset?: string;
   filters?: SymbolFilterRules;
   lastUpdated?: number;
+  fetchedAt?: number;
+}
+
+export interface SpotSymbolValidationResult {
+  requestedSymbol: string;
+  normalizedSymbol: string;
+  exists: boolean;
+  status: string | null;
+  tradable: boolean;
+  isSpotTradingAllowed: boolean;
+  baseAsset: string;
+  quoteAsset: string;
+  permissions: string[];
+  filters: SymbolFilterRules;
+  reason: string | null;
+  fetchedAt: number;
 }
 
 export interface SymbolAuditRecord {
+  id?: string;
   timestamp: number;
   requestedSymbol: string;
   normalizedSymbol: string;
@@ -445,5 +464,22 @@ export interface SymbolAuditRecord {
   mappingApplied: boolean;
   rejectionReason: string | null;
   orderId?: string;
+}
+
+export interface SpotMarketStatusData {
+  connected: boolean;
+  canTrade: boolean;
+  canWithdraw: boolean;
+  hasWithdrawalWarning: boolean;
+  accountType?: string;
+  accountPermissions: string[];
+  spotMarketAvailable: boolean;
+  symbolsCount: number;
+  lastExchangeInfoRefresh: number;
+  lastSymbolValidationTime: number;
+  lastValidatedSymbol?: string;
+  lastValidationError?: string | null;
+  liveTradingReady: boolean;
+  liveTradingEnabled: boolean;
 }
 

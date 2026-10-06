@@ -2,11 +2,10 @@ import {
   MarketType,
   SymbolFilterRules,
   SymbolValidationResult,
-  OrderSide,
+  SpotSymbolValidationResult,
 } from '../types/index.ts';
 import { BinanceSymbolNormalizer } from './symbol-normalizer.ts';
 import { Logger } from './logger.ts';
-import { Storage } from './storage.ts';
 
 export interface BinanceRawSymbolInfo {
   symbol: string;
@@ -24,6 +23,8 @@ export interface CachedMarketMetadata {
     status: string;
     baseAsset: string;
     quoteAsset: string;
+    isSpotTradingAllowed?: boolean;
+    permissions: string[];
     tradable: boolean;
     filters: SymbolFilterRules;
   }>;
@@ -41,8 +42,18 @@ export class BinanceSymbolValidator {
   private spotCache: CachedMarketMetadata | null = null;
   private futuresCache: CachedMarketMetadata | null = null;
   private refreshMutex = new Map<MarketType, Promise<boolean>>();
+  private lastValidationTime = 0;
+  private lastValidatedSymbol?: string;
+  private lastValidationError: string | null = null;
+  private autoRefreshTimer: NodeJS.Timeout | null = null;
 
-  private constructor() {}
+  private constructor() {
+    // Periodically refresh Spot metadata cache every 5 minutes
+    this.autoRefreshTimer = setInterval(() => {
+      this.ensureFreshMetadata('SPOT', true).catch(() => {});
+    }, DEFAULT_CACHE_TTL_MS);
+    this.autoRefreshTimer.unref();
+  }
 
   public static getInstance(): BinanceSymbolValidator {
     if (!BinanceSymbolValidator.instance) {
@@ -58,12 +69,16 @@ export class BinanceSymbolValidator {
     const symbolsMap = new Map<string, any>();
     for (const s of rawSymbols) {
       const parsedFilters = this.extractFilters(s.filters || []);
-      const isTradable = s.status === 'TRADING';
+      const isTradable = s.status === 'TRADING' && (s.isSpotTradingAllowed !== false);
+      const permissions = Array.isArray(s.permissions) ? s.permissions : ['SPOT'];
+
       symbolsMap.set(s.symbol.toUpperCase(), {
         symbol: s.symbol.toUpperCase(),
         status: s.status,
         baseAsset: s.baseAsset,
         quoteAsset: s.quoteAsset,
+        isSpotTradingAllowed: s.isSpotTradingAllowed ?? true,
+        permissions,
         tradable: isTradable,
         filters: parsedFilters,
       });
@@ -82,46 +97,285 @@ export class BinanceSymbolValidator {
   }
 
   /**
-   * Validates whether a symbol is currently tradable on Binance Spot or Futures.
-   * Automatically normalizes legacy tokens (e.g. RNDRUSDT -> RENDERUSDT).
+   * Authoritative Binance Spot Symbol Validation.
+   * Confirms symbol existence, TRADING status, isSpotTradingAllowed, SPOT permission, quoteAsset is USDT, and filters.
+   */
+  public async validateSpotSymbol(
+    rawSymbol: string,
+    forceRefresh = false
+  ): Promise<SpotSymbolValidationResult> {
+    const cleanRaw = (rawSymbol || '').trim().toUpperCase();
+    this.lastValidationTime = Date.now();
+    this.lastValidatedSymbol = cleanRaw;
+
+    const defaultEmptyFilters: SymbolFilterRules = {
+      minNotional: 5,
+      minQty: 0.0001,
+      maxQty: 9999999,
+      stepSize: 0.0001,
+      tickSize: 0.01,
+      minPrice: 0.000001,
+      maxPrice: 1000000,
+    };
+
+    if (!cleanRaw) {
+      this.lastValidationError = 'INVALID_EMPTY_SYMBOL';
+      return {
+        requestedSymbol: rawSymbol,
+        normalizedSymbol: '',
+        exists: false,
+        status: null,
+        tradable: false,
+        isSpotTradingAllowed: false,
+        baseAsset: '',
+        quoteAsset: '',
+        permissions: [],
+        filters: defaultEmptyFilters,
+        reason: 'INVALID_EMPTY_SYMBOL',
+        fetchedAt: Date.now(),
+      };
+    }
+
+    // Ensure exchange metadata is available
+    await this.ensureFreshMetadata('SPOT', forceRefresh);
+
+    if (!this.spotCache || !this.spotCache.symbolsMap || this.spotCache.symbolsMap.size === 0) {
+      const reason = 'EXCHANGE_METADATA_UNAVAILABLE';
+      this.lastValidationError = reason;
+      Logger.warn('REAL', 'BINANCE', `LIVE_ORDER_BLOCKED symbol=${cleanRaw} market=SPOT reason=${reason}`);
+      return {
+        requestedSymbol: cleanRaw,
+        normalizedSymbol: cleanRaw,
+        exists: false,
+        status: null,
+        tradable: false,
+        isSpotTradingAllowed: false,
+        baseAsset: '',
+        quoteAsset: '',
+        permissions: [],
+        filters: defaultEmptyFilters,
+        reason,
+        fetchedAt: this.spotCache?.fetchedAt || Date.now(),
+      };
+    }
+
+    const symbolsMap = this.spotCache.symbolsMap;
+
+    // Normalization check: Determine candidate symbol
+    const normalizer = BinanceSymbolNormalizer.getInstance();
+    const candidateResult = normalizer.normalize(cleanRaw);
+    let targetSymbol = cleanRaw;
+    let appliedMigration = false;
+
+    // Check if the original symbol exists directly in Binance Spot
+    const directInfo = symbolsMap.get(cleanRaw);
+    const candidateInfo = symbolsMap.get(candidateResult.normalizedSymbol);
+
+    if (directInfo && directInfo.status === 'TRADING') {
+      targetSymbol = cleanRaw;
+    } else if (candidateResult.mappingApplied && candidateInfo && candidateInfo.status === 'TRADING') {
+      // Confirmed on live Binance Spot that the migrated candidate exists and is TRADING
+      targetSymbol = candidateResult.normalizedSymbol;
+      appliedMigration = true;
+    } else if (directInfo) {
+      targetSymbol = cleanRaw;
+    } else if (candidateResult.mappingApplied && candidateInfo) {
+      targetSymbol = candidateResult.normalizedSymbol;
+      appliedMigration = true;
+    } else {
+      targetSymbol = candidateResult.normalizedSymbol || cleanRaw;
+    }
+
+    const symbolInfo = symbolsMap.get(targetSymbol);
+
+    if (!symbolInfo) {
+      const reason = 'SYMBOL_NOT_TRADABLE';
+      this.lastValidationError = reason;
+      Logger.warn(
+        'REAL',
+        'BINANCE',
+        `LIVE_ORDER_BLOCKED symbol=${cleanRaw} market=SPOT reason=${reason} (target: ${targetSymbol})`
+      );
+      return {
+        requestedSymbol: cleanRaw,
+        normalizedSymbol: targetSymbol,
+        exists: false,
+        status: null,
+        tradable: false,
+        isSpotTradingAllowed: false,
+        baseAsset: candidateResult.baseAsset,
+        quoteAsset: candidateResult.quoteAsset,
+        permissions: [],
+        filters: defaultEmptyFilters,
+        reason,
+        fetchedAt: this.spotCache.fetchedAt,
+      };
+    }
+
+    // Check 1: Status must be TRADING
+    if (symbolInfo.status !== 'TRADING') {
+      const reason = `SYMBOL_STATUS_${symbolInfo.status}`;
+      this.lastValidationError = reason;
+      Logger.warn(
+        'REAL',
+        'BINANCE',
+        `LIVE_ORDER_BLOCKED symbol=${cleanRaw} market=SPOT reason=${reason} binanceStatus=${symbolInfo.status}`
+      );
+      return {
+        requestedSymbol: cleanRaw,
+        normalizedSymbol: targetSymbol,
+        exists: true,
+        status: symbolInfo.status,
+        tradable: false,
+        isSpotTradingAllowed: symbolInfo.isSpotTradingAllowed ?? false,
+        baseAsset: symbolInfo.baseAsset,
+        quoteAsset: symbolInfo.quoteAsset,
+        permissions: symbolInfo.permissions,
+        filters: symbolInfo.filters,
+        reason,
+        fetchedAt: this.spotCache.fetchedAt,
+      };
+    }
+
+    // Check 2: isSpotTradingAllowed must not be false
+    if (symbolInfo.isSpotTradingAllowed === false) {
+      const reason = 'SPOT_TRADING_NOT_ALLOWED';
+      this.lastValidationError = reason;
+      Logger.warn(
+        'REAL',
+        'BINANCE',
+        `LIVE_ORDER_BLOCKED symbol=${cleanRaw} market=SPOT reason=${reason}`
+      );
+      return {
+        requestedSymbol: cleanRaw,
+        normalizedSymbol: targetSymbol,
+        exists: true,
+        status: symbolInfo.status,
+        tradable: false,
+        isSpotTradingAllowed: false,
+        baseAsset: symbolInfo.baseAsset,
+        quoteAsset: symbolInfo.quoteAsset,
+        permissions: symbolInfo.permissions,
+        filters: symbolInfo.filters,
+        reason,
+        fetchedAt: this.spotCache.fetchedAt,
+      };
+    }
+
+    // Check 3: Permissions must include SPOT if permissions list is provided
+    if (
+      Array.isArray(symbolInfo.permissions) &&
+      symbolInfo.permissions.length > 0 &&
+      !symbolInfo.permissions.includes('SPOT') &&
+      !symbolInfo.permissions.includes('TRD_GRP_001')
+    ) {
+      const reason = 'SPOT_PERMISSION_MISSING';
+      this.lastValidationError = reason;
+      Logger.warn(
+        'REAL',
+        'BINANCE',
+        `LIVE_ORDER_BLOCKED symbol=${cleanRaw} market=SPOT reason=${reason}`
+      );
+      return {
+        requestedSymbol: cleanRaw,
+        normalizedSymbol: targetSymbol,
+        exists: true,
+        status: symbolInfo.status,
+        tradable: false,
+        isSpotTradingAllowed: symbolInfo.isSpotTradingAllowed ?? true,
+        baseAsset: symbolInfo.baseAsset,
+        quoteAsset: symbolInfo.quoteAsset,
+        permissions: symbolInfo.permissions,
+        filters: symbolInfo.filters,
+        reason,
+        fetchedAt: this.spotCache.fetchedAt,
+      };
+    }
+
+    // Check 4: Quote asset must be USDT
+    if (symbolInfo.quoteAsset !== 'USDT') {
+      const reason = 'INVALID_QUOTE_ASSET';
+      this.lastValidationError = reason;
+      Logger.warn(
+        'REAL',
+        'BINANCE',
+        `LIVE_ORDER_BLOCKED symbol=${cleanRaw} market=SPOT reason=${reason} (quoteAsset: ${symbolInfo.quoteAsset})`
+      );
+      return {
+        requestedSymbol: cleanRaw,
+        normalizedSymbol: targetSymbol,
+        exists: true,
+        status: symbolInfo.status,
+        tradable: false,
+        isSpotTradingAllowed: symbolInfo.isSpotTradingAllowed ?? true,
+        baseAsset: symbolInfo.baseAsset,
+        quoteAsset: symbolInfo.quoteAsset,
+        permissions: symbolInfo.permissions,
+        filters: symbolInfo.filters,
+        reason,
+        fetchedAt: this.spotCache.fetchedAt,
+      };
+    }
+
+    // All validation passed
+    this.lastValidationError = null;
+    return {
+      requestedSymbol: cleanRaw,
+      normalizedSymbol: targetSymbol,
+      exists: true,
+      status: 'TRADING',
+      tradable: true,
+      isSpotTradingAllowed: true,
+      baseAsset: symbolInfo.baseAsset,
+      quoteAsset: symbolInfo.quoteAsset,
+      permissions: symbolInfo.permissions,
+      filters: symbolInfo.filters,
+      reason: null,
+      fetchedAt: this.spotCache.fetchedAt,
+    };
+  }
+
+  /**
+   * Generalized validator method
    */
   public async validateSymbol(
     rawSymbol: string,
     market: MarketType = 'SPOT',
     forceRefresh = false
   ): Promise<SymbolValidationResult> {
+    if (market === 'SPOT') {
+      const spotRes = await this.validateSpotSymbol(rawSymbol, forceRefresh);
+      return {
+        requestedSymbol: spotRes.requestedSymbol,
+        normalizedSymbol: spotRes.normalizedSymbol,
+        market: 'SPOT',
+        exists: spotRes.exists,
+        status: spotRes.status,
+        tradable: spotRes.tradable,
+        isSpotTradingAllowed: spotRes.isSpotTradingAllowed,
+        permissions: spotRes.permissions,
+        reason: spotRes.reason,
+        baseAsset: spotRes.baseAsset,
+        quoteAsset: spotRes.quoteAsset,
+        filters: spotRes.filters,
+        lastUpdated: spotRes.fetchedAt,
+        fetchedAt: spotRes.fetchedAt,
+      };
+    }
+
+    // Futures validation fallback
     const normalizer = BinanceSymbolNormalizer.getInstance();
     const normalized = normalizer.normalize(rawSymbol);
     const targetSymbol = normalized.normalizedSymbol;
 
-    if (!targetSymbol) {
-      return {
-        requestedSymbol: rawSymbol,
-        normalizedSymbol: '',
-        market,
-        exists: false,
-        status: null,
-        tradable: false,
-        reason: 'INVALID_EMPTY_SYMBOL',
-      };
-    }
-
-    // Ensure exchange metadata is available
-    await this.ensureFreshMetadata(market, forceRefresh);
-
-    const cache = market === 'SPOT' ? this.spotCache : this.futuresCache;
+    await this.ensureFreshMetadata('USDM_FUTURES', forceRefresh);
+    const cache = this.futuresCache;
 
     if (!cache || !cache.symbolsMap || cache.symbolsMap.size === 0) {
-      // FAIL CLOSED: No exchange metadata could be retrieved
-      Logger.warn(
-        'PAPER',
-        'BINANCE',
-        `[VALIDATION] Metadata unavailable for ${market} market. Failing closed on ${targetSymbol}.`
-      );
       return {
         requestedSymbol: rawSymbol,
         normalizedSymbol: targetSymbol,
-        market,
+        market: 'USDM_FUTURES',
         exists: false,
         status: null,
         tradable: false,
@@ -130,57 +384,27 @@ export class BinanceSymbolValidator {
     }
 
     const symbolInfo = cache.symbolsMap.get(targetSymbol);
-
     if (!symbolInfo) {
-      const reason = 'SYMBOL_NOT_TRADABLE';
-      Logger.warn(
-        'PAPER',
-        'BINANCE',
-        `[VALIDATION] Symbol ${targetSymbol} (from ${rawSymbol}) not found on Binance ${market}. Reason: ${reason}`
-      );
       return {
         requestedSymbol: rawSymbol,
         normalizedSymbol: targetSymbol,
-        market,
+        market: 'USDM_FUTURES',
         exists: false,
         status: null,
         tradable: false,
-        reason,
-        baseAsset: normalized.baseAsset,
-        quoteAsset: normalized.quoteAsset,
+        reason: 'SYMBOL_NOT_TRADABLE',
       };
     }
 
-    if (symbolInfo.status !== 'TRADING') {
-      const reason = `SYMBOL_STATUS_${symbolInfo.status}`;
-      Logger.warn(
-        'PAPER',
-        'BINANCE',
-        `[VALIDATION] Symbol ${targetSymbol} exists on Binance ${market} but status is '${symbolInfo.status}'. Non-tradable.`
-      );
-      return {
-        requestedSymbol: rawSymbol,
-        normalizedSymbol: targetSymbol,
-        market,
-        exists: true,
-        status: symbolInfo.status,
-        tradable: false,
-        reason,
-        baseAsset: symbolInfo.baseAsset,
-        quoteAsset: symbolInfo.quoteAsset,
-        filters: symbolInfo.filters,
-        lastUpdated: cache.fetchedAt,
-      };
-    }
-
+    const isTradable = symbolInfo.status === 'TRADING';
     return {
       requestedSymbol: rawSymbol,
       normalizedSymbol: targetSymbol,
-      market,
+      market: 'USDM_FUTURES',
       exists: true,
-      status: 'TRADING',
-      tradable: true,
-      reason: null,
+      status: symbolInfo.status,
+      tradable: isTradable,
+      reason: isTradable ? null : `SYMBOL_STATUS_${symbolInfo.status}`,
       baseAsset: symbolInfo.baseAsset,
       quoteAsset: symbolInfo.quoteAsset,
       filters: symbolInfo.filters,
@@ -189,7 +413,7 @@ export class BinanceSymbolValidator {
   }
 
   /**
-   * Retrieves live filters for a symbol on Spot or Futures.
+   * Retrieves live filters for a symbol on Spot.
    */
   public async getSymbolFilters(
     symbol: string,
@@ -245,7 +469,7 @@ export class BinanceSymbolValidator {
         valid: false,
         formattedQty: '0',
         numericQty: 0,
-        reason: `STEP_FLOORED_QUANTITY_BELOW_MIN (${numericQty} < ${filters.minQty})`,
+        reason: `QUANTITY_BELOW_MIN (Floored ${numericQty} < Min ${filters.minQty})`,
       };
     }
 
@@ -290,9 +514,30 @@ export class BinanceSymbolValidator {
   }
 
   /**
+   * Returns current Spot Market metadata summary for dashboard/telemetry.
+   */
+  public getSpotMarketTelemetry(): {
+    spotMarketAvailable: boolean;
+    symbolsCount: number;
+    lastExchangeInfoRefresh: number;
+    lastSymbolValidationTime: number;
+    lastValidatedSymbol?: string;
+    lastValidationError?: string | null;
+  } {
+    return {
+      spotMarketAvailable: !!this.spotCache && this.spotCache.symbolsMap.size > 0,
+      symbolsCount: this.spotCache?.symbolsMap.size || 0,
+      lastExchangeInfoRefresh: this.spotCache?.fetchedAt || 0,
+      lastSymbolValidationTime: this.lastValidationTime,
+      lastValidatedSymbol: this.lastValidatedSymbol,
+      lastValidationError: this.lastValidationError,
+    };
+  }
+
+  /**
    * Ensures metadata cache is fresh; fetches if expired, missing, or explicitly forced.
    */
-  private async ensureFreshMetadata(market: MarketType, forceRefresh = false): Promise<void> {
+  public async ensureFreshMetadata(market: MarketType, forceRefresh = false): Promise<void> {
     const cache = market === 'SPOT' ? this.spotCache : this.futuresCache;
     const now = Date.now();
 
@@ -348,14 +593,17 @@ export class BinanceSymbolValidator {
       for (const s of data.symbols) {
         if (!s.symbol) continue;
         const symbolKey = s.symbol.toUpperCase();
-        const isTradable = s.status === 'TRADING';
+        const isTradable = s.status === 'TRADING' && (s.isSpotTradingAllowed !== false);
         const parsedFilters = this.extractFilters(s.filters || []);
+        const permissions = Array.isArray(s.permissions) ? s.permissions : ['SPOT'];
 
         symbolsMap.set(symbolKey, {
           symbol: symbolKey,
           status: s.status,
           baseAsset: s.baseAsset,
           quoteAsset: s.quoteAsset,
+          isSpotTradingAllowed: s.isSpotTradingAllowed ?? true,
+          permissions,
           tradable: isTradable,
           filters: parsedFilters,
         });
@@ -391,6 +639,7 @@ export class BinanceSymbolValidator {
   public invalidateCache(market?: MarketType): void {
     if (!market || market === 'SPOT') this.spotCache = null;
     if (!market || market === 'USDM_FUTURES') this.futuresCache = null;
+    Logger.info('REAL', 'BINANCE', `[VALIDATION] Invalidated Binance ${market || 'all'} market metadata cache.`);
   }
 
   private extractFilters(filters: any[]): SymbolFilterRules {

@@ -8,9 +8,11 @@ import {
   Trade,
   WalletBalance,
   ReconciliationResult,
+  SymbolAuditRecord,
 } from '../types/index.ts';
 import { Storage } from './storage.ts';
 import { BinanceRequestManager } from './binance-client.ts';
+import { BinanceSymbolValidator } from './symbol-validator.ts';
 import { Logger } from './logger.ts';
 import {
   calculatePositionNetPnL,
@@ -559,22 +561,184 @@ export class RealBinanceTradingExecutor implements TradingExecutor {
     const settings = Storage.getSettings();
     const fixedAmount = settings.fixedTradeAmount;
 
-    // Hard Invariant Check
+    // 1. Authoritative Binance Spot Market Validation & Normalization
+    const validator = BinanceSymbolValidator.getInstance();
+    const valResult = await validator.validateSpotSymbol(request.symbol);
+
+    if (!valResult.tradable || !valResult.exists) {
+      const rejectionReason = valResult.reason || 'SYMBOL_NOT_TRADABLE';
+      Storage.saveSymbolAuditRecord({
+        timestamp: Date.now(),
+        requestedSymbol: request.symbol,
+        normalizedSymbol: valResult.normalizedSymbol || request.symbol,
+        market: 'SPOT',
+        side: 'BUY',
+        validationResult: false,
+        binanceStatus: valResult.status,
+        mappingApplied: valResult.normalizedSymbol !== request.symbol,
+        rejectionReason,
+      });
+
+      Logger.warn(
+        'REAL',
+        'ORDER',
+        `LIVE_ORDER_BLOCKED symbol=${request.symbol} market=SPOT reason=${rejectionReason} binanceStatus=${valResult.status}`
+      );
+      throw new Error(`Live BUY blocked: Symbol ${request.symbol} is not tradable on Binance Spot (${rejectionReason})`);
+    }
+
+    // 2. Permissions and Quote Asset Checks
+    if (!valResult.isSpotTradingAllowed) {
+      const reason = 'SPOT_TRADING_NOT_ALLOWED';
+      Storage.saveSymbolAuditRecord({
+        timestamp: Date.now(),
+        requestedSymbol: request.symbol,
+        normalizedSymbol: valResult.normalizedSymbol,
+        market: 'SPOT',
+        side: 'BUY',
+        validationResult: false,
+        binanceStatus: valResult.status,
+        mappingApplied: valResult.normalizedSymbol !== request.symbol,
+        rejectionReason: reason,
+      });
+      Logger.warn('REAL', 'ORDER', `LIVE_ORDER_BLOCKED symbol=${request.symbol} market=SPOT reason=${reason}`);
+      throw new Error(`Live BUY blocked: ${reason}`);
+    }
+
+    if (valResult.quoteAsset !== 'USDT') {
+      const reason = 'INVALID_QUOTE_ASSET';
+      Storage.saveSymbolAuditRecord({
+        timestamp: Date.now(),
+        requestedSymbol: request.symbol,
+        normalizedSymbol: valResult.normalizedSymbol,
+        market: 'SPOT',
+        side: 'BUY',
+        validationResult: false,
+        binanceStatus: valResult.status,
+        mappingApplied: valResult.normalizedSymbol !== request.symbol,
+        rejectionReason: reason,
+      });
+      Logger.warn('REAL', 'ORDER', `LIVE_ORDER_BLOCKED symbol=${request.symbol} market=SPOT reason=${reason}`);
+      throw new Error(`Live BUY blocked: Only USDT quote asset is supported (${valResult.quoteAsset})`);
+    }
+
+    // 3. Minimum Notional Check
+    if (fixedAmount < valResult.filters.minNotional) {
+      const reason = `MIN_NOTIONAL_NOT_MET (${fixedAmount} < ${valResult.filters.minNotional})`;
+      Storage.saveSymbolAuditRecord({
+        timestamp: Date.now(),
+        requestedSymbol: request.symbol,
+        normalizedSymbol: valResult.normalizedSymbol,
+        market: 'SPOT',
+        side: 'BUY',
+        validationResult: false,
+        binanceStatus: valResult.status,
+        mappingApplied: valResult.normalizedSymbol !== request.symbol,
+        rejectionReason: reason,
+      });
+      Logger.warn('REAL', 'ORDER', `LIVE_ORDER_BLOCKED symbol=${request.symbol} market=SPOT reason=${reason}`);
+      throw new Error(`Live BUY blocked: Fixed amount ${fixedAmount} USDT is below minimum notional ${valResult.filters.minNotional} USDT`);
+    }
+
+    // 4. Hard Invariant Check on Quote Amount
     if (!request.quoteAmount || Math.abs(request.quoteAmount - fixedAmount) > 0.001) {
       throw new Error(`Real BUY invariant rejected: requested quote amount (${request.quoteAmount}) must equal fixed trade amount (${fixedAmount})`);
     }
 
-    // Idempotent client order id
-    const clientOrderId = request.clientOrderId || `AUTO-REAL-${request.symbol}-${Date.now().toString(36)}`;
+    // 5. Live Binance Account Validation (canTrade & balance check)
+    let accountInfo;
+    try {
+      accountInfo = await this.binance.getAccount(apiKey, apiSecret);
+    } catch (accErr: any) {
+      throw new Error(`Failed to fetch Binance account status: ${accErr.message}`);
+    }
+
+    if (!accountInfo.canTrade) {
+      const reason = 'ACCOUNT_CANNOT_TRADE';
+      Storage.saveSymbolAuditRecord({
+        timestamp: Date.now(),
+        requestedSymbol: request.symbol,
+        normalizedSymbol: valResult.normalizedSymbol,
+        market: 'SPOT',
+        side: 'BUY',
+        validationResult: false,
+        binanceStatus: valResult.status,
+        mappingApplied: valResult.normalizedSymbol !== request.symbol,
+        rejectionReason: reason,
+      });
+      Logger.error('REAL', 'ORDER', `LIVE_ORDER_BLOCKED symbol=${request.symbol} market=SPOT reason=${reason}`);
+      throw new Error('Live Binance BUY blocked: API account cannot trade (canTrade is false)');
+    }
+
+    const usdtBalanceObj = accountInfo.balances.find(b => b.asset === 'USDT');
+    const usdtAvailable = usdtBalanceObj ? parseFloat(usdtBalanceObj.free) : 0;
+    const requiredTotal = fixedAmount + (fixedAmount * 0.001);
+
+    if (usdtAvailable < requiredTotal) {
+      const reason = `INSUFFICIENT_AVAILABLE_USDT (Required: ${requiredTotal.toFixed(2)}, Available: ${usdtAvailable.toFixed(2)})`;
+      Storage.saveSymbolAuditRecord({
+        timestamp: Date.now(),
+        requestedSymbol: request.symbol,
+        normalizedSymbol: valResult.normalizedSymbol,
+        market: 'SPOT',
+        side: 'BUY',
+        validationResult: false,
+        binanceStatus: valResult.status,
+        mappingApplied: valResult.normalizedSymbol !== request.symbol,
+        rejectionReason: reason,
+      });
+      Logger.warn('REAL', 'ORDER', `LIVE_ORDER_BLOCKED symbol=${request.symbol} market=SPOT reason=${reason}`);
+      throw new Error(`Live Binance BUY blocked: Insufficient available USDT (Required: ${requiredTotal.toFixed(2)}, Available: ${usdtAvailable.toFixed(2)})`);
+    }
+
+    const targetTradingSymbol = valResult.normalizedSymbol;
+    const clientOrderId = request.clientOrderId || `AUTO-REAL-${targetTradingSymbol}-${Date.now().toString(36)}`;
+
+    // Record submission audit
+    Storage.saveSymbolAuditRecord({
+      timestamp: Date.now(),
+      requestedSymbol: request.symbol,
+      normalizedSymbol: targetTradingSymbol,
+      market: 'SPOT',
+      side: 'BUY',
+      validationResult: true,
+      binanceStatus: valResult.status,
+      mappingApplied: targetTradingSymbol !== request.symbol,
+      rejectionReason: null,
+      orderId: clientOrderId,
+    });
 
     // Place market buy on Binance
-    Logger.info('REAL', 'ORDER', `Submitting live Binance MARKET BUY for ${request.symbol} | Quote: ${fixedAmount} USDT`, {
-      symbol: request.symbol,
+    Logger.info('REAL', 'ORDER', `Submitting live Binance MARKET BUY for ${targetTradingSymbol} (from ${request.symbol}) | Quote: ${fixedAmount} USDT`, {
+      symbol: targetTradingSymbol,
       strategyState: request.strategyState,
       technicalScore: request.technicalScore,
     });
 
-    const response = await this.binance.placeMarketBuy(apiKey, apiSecret, request.symbol, fixedAmount, clientOrderId);
+    let response;
+    try {
+      response = await this.binance.placeMarketBuy(apiKey, apiSecret, targetTradingSymbol, fixedAmount, clientOrderId);
+    } catch (binanceErr: any) {
+      // Invalidate metadata cache on Binance error to ensure fresh state
+      validator.invalidateCache('SPOT');
+      validator.ensureFreshMetadata('SPOT', true).catch(() => {});
+
+      Storage.saveSymbolAuditRecord({
+        timestamp: Date.now(),
+        requestedSymbol: request.symbol,
+        normalizedSymbol: targetTradingSymbol,
+        market: 'SPOT',
+        side: 'BUY',
+        validationResult: false,
+        binanceStatus: 'ERROR',
+        mappingApplied: targetTradingSymbol !== request.symbol,
+        rejectionReason: `BINANCE_REJECTION: ${binanceErr.message}`,
+        orderId: clientOrderId,
+      });
+
+      Logger.error('REAL', 'ORDER', `LIVE_ORDER_REJECTED symbol=${targetTradingSymbol} reason=${binanceErr.message}`);
+      throw binanceErr;
+    }
 
     const executedQty = parseFloat(response.executedQty);
     const executedQuote = parseFloat(response.cummulativeQuoteQty);
@@ -602,7 +766,7 @@ export class RealBinanceTradingExecutor implements TradingExecutor {
       binanceOrderId: response.orderId.toString(),
       accountId: 'real-default',
       mode: 'REAL',
-      symbol: request.symbol,
+      symbol: targetTradingSymbol,
       side: 'BUY',
       status: response.status as OrderStatus,
       requestedQuoteAmount: fixedAmount,
@@ -626,7 +790,7 @@ export class RealBinanceTradingExecutor implements TradingExecutor {
         id: positionId,
         accountId: 'real-default',
         mode: 'REAL',
-        symbol: request.symbol,
+        symbol: targetTradingSymbol,
         quantity: executedQty,
         remainingQuantity: executedQty,
         entryPrice: fillPrice,
@@ -647,11 +811,24 @@ export class RealBinanceTradingExecutor implements TradingExecutor {
       };
       Storage.savePosition(position);
 
+      Storage.saveSymbolAuditRecord({
+        timestamp: Date.now(),
+        requestedSymbol: request.symbol,
+        normalizedSymbol: targetTradingSymbol,
+        market: 'SPOT',
+        side: 'BUY',
+        validationResult: true,
+        binanceStatus: 'FILLED',
+        mappingApplied: targetTradingSymbol !== request.symbol,
+        rejectionReason: null,
+        orderId: order.id,
+      });
+
       // Trigger background real balance update
       this.getBalance().catch(err => Logger.warn('REAL', 'WALLET', `Post-buy balance sync error: ${err.message}`));
 
-      Logger.info('REAL', 'ORDER', `Real Binance BUY FILLED: ${request.symbol} | Executed: ${executedQty} @ ${fillPrice.toFixed(4)} | Total: ${executedQuote} USDT`, {
-        symbol: request.symbol,
+      Logger.info('REAL', 'ORDER', `Real Binance BUY FILLED: ${targetTradingSymbol} | Executed: ${executedQty} @ ${fillPrice.toFixed(4)} | Total: ${executedQuote} USDT`, {
+        symbol: targetTradingSymbol,
         orderId: order.id,
       });
 
@@ -675,21 +852,104 @@ export class RealBinanceTradingExecutor implements TradingExecutor {
       throw new Error(`No open real position found for ${request.symbol} (status: ${position?.status})`);
     }
 
+    // 1. Authoritative Spot Symbol Validation
+    const validator = BinanceSymbolValidator.getInstance();
+    const valResult = await validator.validateSpotSymbol(position.symbol);
+
+    if (!valResult.tradable) {
+      Logger.warn(
+        'REAL',
+        'ORDER',
+        `LIVE_ORDER_BLOCKED SELL symbol=${position.symbol} market=SPOT reason=${valResult.reason}`
+      );
+      throw new Error(`Live SELL blocked: Symbol ${position.symbol} is not tradable on Binance Spot (${valResult.reason})`);
+    }
+
+    // 2. Validate & Floor Sell Quantity to LOT_SIZE stepSize
+    const rawSellQty = request.quantity || position.remainingQuantity;
+    const qtyFormat = await validator.formatOrderQuantity(valResult.normalizedSymbol, rawSellQty, 'SPOT');
+
+    if (!qtyFormat.valid) {
+      const reason = qtyFormat.reason || 'INVALID_QUANTITY';
+      Storage.saveSymbolAuditRecord({
+        timestamp: Date.now(),
+        requestedSymbol: position.symbol,
+        normalizedSymbol: valResult.normalizedSymbol,
+        market: 'SPOT',
+        side: 'SELL',
+        validationResult: false,
+        binanceStatus: valResult.status,
+        mappingApplied: valResult.normalizedSymbol !== position.symbol,
+        rejectionReason: reason,
+      });
+      Logger.warn('REAL', 'ORDER', `LIVE_ORDER_BLOCKED SELL symbol=${position.symbol} reason=${reason}`);
+      throw new Error(`Live SELL blocked: ${reason}`);
+    }
+
+    // 3. Verify Account Asset Balance on Binance
+    let accountInfo;
+    try {
+      accountInfo = await this.binance.getAccount(apiKey, apiSecret);
+    } catch (accErr: any) {
+      throw new Error(`Failed to fetch Binance account status: ${accErr.message}`);
+    }
+
+    if (!accountInfo.canTrade) {
+      throw new Error('Live Binance SELL blocked: API account cannot trade (canTrade is false)');
+    }
+
+    const baseAsset = valResult.baseAsset;
+    const assetBalanceObj = accountInfo.balances.find(b => b.asset === baseAsset);
+    const assetFree = assetBalanceObj ? parseFloat(assetBalanceObj.free) : 0;
+
+    let finalSellQty = qtyFormat.numericQty;
+    if (assetFree < finalSellQty) {
+      if (assetFree >= valResult.filters.minQty) {
+        // Adjust downward to exact free asset balance floored to stepSize
+        const recheck = await validator.formatOrderQuantity(valResult.normalizedSymbol, assetFree, 'SPOT');
+        if (!recheck.valid) {
+          throw new Error(`Live SELL blocked: Available ${baseAsset} (${assetFree}) cannot satisfy stepSize`);
+        }
+        finalSellQty = recheck.numericQty;
+      } else {
+        throw new Error(`Live SELL blocked: Insufficient ${baseAsset} balance on Binance (Available: ${assetFree}, Required: ${finalSellQty})`);
+      }
+    }
+
     // Atomically transition OPEN -> CLOSING
     position.status = 'CLOSING';
     Storage.savePosition(position);
 
-    try {
-      const sellQty = request.quantity || position.remainingQuantity;
-      const clientOrderId = request.clientOrderId || `AUTO-REAL-SELL-${request.symbol}-${Date.now().toString(36)}`;
+    const clientOrderId = request.clientOrderId || `AUTO-REAL-SELL-${valResult.normalizedSymbol}-${Date.now().toString(36)}`;
 
-      Logger.info('REAL', 'ORDER', `Submitting live Binance MARKET SELL for ${request.symbol} | Quantity: ${sellQty}`, {
-        symbol: request.symbol,
+    Storage.saveSymbolAuditRecord({
+      timestamp: Date.now(),
+      requestedSymbol: position.symbol,
+      normalizedSymbol: valResult.normalizedSymbol,
+      market: 'SPOT',
+      side: 'SELL',
+      validationResult: true,
+      binanceStatus: valResult.status,
+      mappingApplied: valResult.normalizedSymbol !== position.symbol,
+      rejectionReason: null,
+      orderId: clientOrderId,
+    });
+
+    try {
+      Logger.info('REAL', 'ORDER', `Submitting live Binance MARKET SELL for ${valResult.normalizedSymbol} | Quantity: ${finalSellQty}`, {
+        symbol: valResult.normalizedSymbol,
         strategyState: request.strategyState,
         technicalScore: request.technicalScore,
       });
 
-      const response = await this.binance.placeMarketSell(apiKey, apiSecret, request.symbol, sellQty, clientOrderId);
+      let response;
+      try {
+        response = await this.binance.placeMarketSell(apiKey, apiSecret, valResult.normalizedSymbol, finalSellQty, clientOrderId);
+      } catch (sellErr: any) {
+        validator.invalidateCache('SPOT');
+        validator.ensureFreshMetadata('SPOT', true).catch(() => {});
+        throw sellErr;
+      }
 
       const executedQty = parseFloat(response.executedQty);
       const executedQuote = parseFloat(response.cummulativeQuoteQty);
@@ -717,10 +977,10 @@ export class RealBinanceTradingExecutor implements TradingExecutor {
         binanceOrderId: response.orderId.toString(),
         accountId: 'real-default',
         mode: 'REAL',
-        symbol: request.symbol,
+        symbol: valResult.normalizedSymbol,
         side: 'SELL',
         status: response.status as OrderStatus,
-        requestedQuantity: sellQty,
+        requestedQuantity: finalSellQty,
         executedQuantity: executedQty,
         executedQuoteAmount: executedQuote,
         executionPrice: fillPrice,
@@ -751,7 +1011,7 @@ export class RealBinanceTradingExecutor implements TradingExecutor {
           id: `real-trade-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
           accountId: 'real-default',
           mode: 'REAL',
-          symbol: request.symbol,
+          symbol: valResult.normalizedSymbol,
           entryOrderId: position.entryOrderId,
           exitOrderId: order.id,
           entryPrice: position.entryPrice,
@@ -776,7 +1036,7 @@ export class RealBinanceTradingExecutor implements TradingExecutor {
 
         // Update remaining quantity & position status
         position.remainingQuantity = Number((position.remainingQuantity - executedQty).toFixed(8));
-        if (position.remainingQuantity <= 0.00001 || response.status === 'FILLED') {
+        if (position.remainingQuantity <= 0.00001 || position.remainingQuantity < valResult.filters.minQty || response.status === 'FILLED') {
           position.status = 'CLOSED';
           position.remainingQuantity = 0;
         } else {
@@ -787,14 +1047,27 @@ export class RealBinanceTradingExecutor implements TradingExecutor {
         position.updatedAt = Date.now();
         Storage.savePosition(position);
 
+        Storage.saveSymbolAuditRecord({
+          timestamp: Date.now(),
+          requestedSymbol: position.symbol,
+          normalizedSymbol: valResult.normalizedSymbol,
+          market: 'SPOT',
+          side: 'SELL',
+          validationResult: true,
+          binanceStatus: 'FILLED',
+          mappingApplied: valResult.normalizedSymbol !== position.symbol,
+          rejectionReason: null,
+          orderId: order.id,
+        });
+
         const settings = Storage.getSettings();
-        Storage.setSymbolCooldown(request.symbol, 'REAL', settings.symbolCooldownMinutes || 30);
+        Storage.setSymbolCooldown(position.symbol, 'REAL', settings.symbolCooldownMinutes || 30);
 
         // Re-sync wallet
         this.getBalance().catch(err => Logger.warn('REAL', 'WALLET', `Post-sell sync error: ${err.message}`));
 
-        Logger.info('REAL', 'ORDER', `Real Binance SELL FILLED: ${request.symbol} | Net PnL: ${netPnL >= 0 ? '+' : ''}${netPnL} USDT (${netPnLPercent}%) | Fill: ${fillPrice.toFixed(4)}`, {
-          symbol: request.symbol,
+        Logger.info('REAL', 'ORDER', `Real Binance SELL FILLED: ${valResult.normalizedSymbol} | Net PnL: ${netPnL >= 0 ? '+' : ''}${netPnL} USDT (${netPnLPercent}%) | Fill: ${fillPrice.toFixed(4)}`, {
+          symbol: valResult.normalizedSymbol,
           orderId: order.id,
         });
 
@@ -808,7 +1081,7 @@ export class RealBinanceTradingExecutor implements TradingExecutor {
     } catch (err: any) {
       position.status = 'OPEN';
       Storage.savePosition(position);
-      Logger.error('REAL', 'ORDER', `Real SELL failed for ${request.symbol}: ${err.message}. Position status restored to OPEN.`);
+      Logger.error('REAL', 'ORDER', `Real SELL failed for ${position.symbol}: ${err.message}. Position status restored to OPEN.`);
       throw err;
     }
   }
