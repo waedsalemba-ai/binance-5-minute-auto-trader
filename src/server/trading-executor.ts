@@ -97,7 +97,14 @@ export class PaperTradingExecutor implements TradingExecutor {
       throw new Error(`Paper BUY invariant error: requested quote amount (${request.quoteAmount}) must equal fixed trade amount (${fixedAmount})`);
     }
 
-    // 1. Get real-time Binance market price
+    // 1. Authoritative Binance Spot validation. Paper mode must mirror the
+    //    real Binance tradable universe; it must never invent unsupported pairs.
+    const validation = await BinanceSymbolValidator.getInstance().validateExactSpotUsdtSymbol(request.symbol);
+    if (!validation.tradable) {
+      throw new Error(`Paper BUY blocked: ${request.symbol} is not an exact current Binance Spot USDT symbol (${validation.reason}).`);
+    }
+
+    // 2. Get real-time Binance market price
     const livePrice = await this.binance.getLatestPrice(request.symbol);
     if (!livePrice || livePrice <= 0) {
       throw new Error(`Real market price unavailable for ${request.symbol}. Paper BUY aborted.`);
@@ -235,7 +242,13 @@ export class PaperTradingExecutor implements TradingExecutor {
     try {
       const sellQty = request.quantity || position.remainingQuantity;
 
-      // 1. Get real-time Binance market price
+      // 1. Validate against the current Binance Spot universe.
+      const validation = await BinanceSymbolValidator.getInstance().validateExactSpotUsdtSymbol(request.symbol);
+      if (!validation.tradable) {
+        throw new Error(`Paper SELL blocked: ${request.symbol} is not an exact current Binance Spot USDT symbol (${validation.reason}).`);
+      }
+
+      // 2. Get real-time Binance market price
       const livePrice = await this.binance.getLatestPrice(request.symbol);
       if (!livePrice || livePrice <= 0) {
         throw new Error(`Real market price unavailable for ${request.symbol}. Paper SELL aborted.`);

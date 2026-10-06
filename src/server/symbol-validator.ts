@@ -97,6 +97,52 @@ export class BinanceSymbolValidator {
   }
 
   /**
+   * Returns the authoritative current Binance Spot USDT universe.
+   * Automatic scanning MUST use this list instead of treating ticker/24hr as the
+   * source of truth, because ticker data alone is not a sufficient tradability gate.
+   */
+  public async getTradableSpotUsdtSymbols(forceRefresh = false): Promise<Set<string>> {
+    await this.ensureFreshMetadata('SPOT', forceRefresh);
+
+    if (!this.spotCache || this.spotCache.symbolsMap.size === 0) {
+      throw new Error('BINANCE_SPOT_METADATA_UNAVAILABLE');
+    }
+
+    const symbols = new Set<string>();
+    for (const [symbol, info] of this.spotCache.symbolsMap.entries()) {
+      if (
+        info.status === 'TRADING' &&
+        info.tradable &&
+        info.isSpotTradingAllowed !== false &&
+        info.quoteAsset === 'USDT' &&
+        (!info.permissions.length || info.permissions.includes('SPOT') || info.permissions.includes('TRD_GRP_001'))
+      ) {
+        symbols.add(symbol);
+      }
+    }
+
+    return symbols;
+  }
+
+  /**
+   * Strict check for automated trading: symbol must be the exact current Binance
+   * Spot symbol. Legacy/rebranded aliases are NOT accepted for auto-generated
+   * signals, even when the normalizer knows a migration mapping.
+   */
+  public async validateExactSpotUsdtSymbol(rawSymbol: string): Promise<SpotSymbolValidationResult> {
+    const clean = (rawSymbol || '').trim().toUpperCase();
+    const result = await this.validateSpotSymbol(clean);
+    if (!result.tradable || result.normalizedSymbol !== clean || result.quoteAsset !== 'USDT') {
+      return {
+        ...result,
+        tradable: false,
+        reason: result.tradable ? 'STRICT_BINANCE_SYMBOL_MISMATCH' : result.reason,
+      };
+    }
+    return result;
+  }
+
+  /**
    * Authoritative Binance Spot Symbol Validation.
    * Confirms symbol existence, TRADING status, isSpotTradingAllowed, SPOT permission, quoteAsset is USDT, and filters.
    */

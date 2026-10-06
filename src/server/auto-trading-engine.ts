@@ -8,6 +8,7 @@ import {
 } from '../types/index.ts';
 import { Storage } from './storage.ts';
 import { BinanceRequestManager } from './binance-client.ts';
+import { BinanceSymbolValidator } from './symbol-validator.ts';
 import { calculateAllIndicators } from './indicators.ts';
 import { detectCandlePatterns } from './pattern-detector.ts';
 import { analyzeMarketStructure } from './market-structure.ts';
@@ -127,18 +128,21 @@ export class AutoTradingEngine {
     this.broadcast('scanner_started', { timestamp: startTime });
 
     try {
-      // 1. Fetch 24hr tickers to select liquid USDT universe
+      // 1. Build the scanner universe from authoritative Binance Spot exchangeInfo
+      //    and use 24hr ticker data ONLY for liquidity/ranking. This prevents
+      //    legacy/delisted/non-Spot symbols from ever entering automatic trading.
+      const validator = BinanceSymbolValidator.getInstance();
+      const authoritativeUsdtSymbols = await validator.getTradableSpotUsdtSymbols();
       const tickers = await this.binance.get24hrTickers();
       const minVolume = Number(process.env.MIN_24H_VOLUME) || 1000000;
       const maxSymbolsEnv = process.env.MAX_SYMBOLS_PER_SCAN !== undefined ? Number(process.env.MAX_SYMBOLS_PER_SCAN) : 0;
       const candleLimit = Number(process.env.CANDLE_LIMIT) || 250;
 
-      // Filter active USDT pairs (exclude leveraged tokens like UP/DOWN/BEAR/BULL)
       const sortedTickers = tickers
         .filter(t => {
-          const sym = t.symbol;
+          const sym = String(t.symbol || '').trim().toUpperCase();
           return (
-            sym.endsWith('USDT') &&
+            authoritativeUsdtSymbols.has(sym) &&
             !sym.includes('UPUSDT') &&
             !sym.includes('DOWNUSDT') &&
             !sym.includes('BEARUSDT') &&
@@ -153,7 +157,7 @@ export class AutoTradingEngine {
       Logger.info(
         currentMode,
         'SCAN',
-        `Starting 2m scan across ${validTickers.length} liquid USDT pairs (min 24h vol: $${(minVolume / 1e6).toFixed(1)}M${maxSymbolsEnv > 0 ? `, limit: ${maxSymbolsEnv}` : ', all liquid pairs'})`
+        `Starting authoritative Binance Spot scan across ${validTickers.length} liquid USDT pairs (min 24h vol: $${(minVolume / 1e6).toFixed(1)}M${maxSymbolsEnv > 0 ? `, limit: ${maxSymbolsEnv}` : ', all liquid pairs'})`
       );
 
       const results: TechnicalAnalysis[] = [];
@@ -338,7 +342,7 @@ export class AutoTradingEngine {
       Logger.info(
         currentMode,
         'SCAN',
-        `2m Scan completed in ${durationSec}s. Analyzed: ${results.length} | Pre-Bullish: ${preBullishCount} | Strong Bullish: ${strongBullishCount} | Weakening: ${weakeningCount}`
+        `Binance Spot scan completed in ${durationSec}s. Analyzed: ${results.length} | Pre-Bullish: ${preBullishCount} | Strong Bullish: ${strongBullishCount} | Weakening: ${weakeningCount}`
       );
 
       return results;
@@ -410,6 +414,15 @@ export class AutoTradingEngine {
       const fixedAmount = settings.fixedTradeAmount;
       const wallet = Storage.getWallet(mode);
       const openPositions = Storage.getPositions(mode, 'OPEN');
+
+      // Defense in depth: no automated BUY may use a legacy alias or a symbol
+      // that is not currently tradable on Binance Spot.
+      const strictValidation = await BinanceSymbolValidator.getInstance().validateExactSpotUsdtSymbol(symbol);
+      if (!strictValidation.tradable) {
+        Logger.warn(mode, 'STRATEGY', `AUTO BUY BLOCKED: ${symbol} is not an exact current Binance Spot USDT symbol (${strictValidation.reason}).`);
+        return;
+      }
+
       const symbolFilter = await this.binance.getSymbolFilters(symbol);
 
       const clientOrderId = `AUTO-${mode}-${symbol}-${Date.now().toString(36)}`;

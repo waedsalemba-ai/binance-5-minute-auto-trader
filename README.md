@@ -155,3 +155,7 @@ Run the full automated test suite covering technical indicators, strategy transi
 ```bash
 bun test # or npm test
 ```
+
+## Binance Symbol Safety (patched)
+
+Automatic scanning now uses Binance Spot `exchangeInfo` as the authoritative source of tradable USDT symbols and intersects it with 24-hour ticker data only for liquidity/ranking. Automatic BUYs and paper BUYs use a strict exact-symbol validation gate, so legacy aliases such as `RNDRUSDT`, `COCOSUSDT`, `POLYUSDT`, and `TOMOUSDT` cannot become new positions. Existing stale paper positions are not silently rewritten; use **Reset Positions & Balance** after deploying this patch if the current database contains unsupported legacy positions.
