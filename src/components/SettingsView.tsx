@@ -333,6 +333,124 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ settings, onUpdateSe
           </div>
         </div>
 
+        {/* Configurable Entry Quality Filters (Phase 6) */}
+        <div className="space-y-4">
+          <h3 className="text-sm font-bold text-slate-200 border-b border-slate-800 pb-2 flex items-center justify-between">
+            <span>6. Authoritative Entry Quality Filters</span>
+            <span className="text-[10px] font-mono text-amber-400 font-normal">Strict Qualification - Not a Quota</span>
+          </h3>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 text-xs font-mono">
+            <div className="space-y-1.5">
+              <label className="text-slate-300">Min 24h Liquidity ($)</label>
+              <input
+                type="number"
+                step="50000"
+                value={form.minLiquidity24hUsdt ?? 1000000}
+                onChange={e => setForm({ ...form, minLiquidity24hUsdt: parseFloat(e.target.value) || 1000000 })}
+                className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-slate-100 focus:outline-none focus:border-amber-400"
+              />
+              <p className="text-[10px] text-slate-500">Min 24h quote volume USDT (Default: $1,000,000).</p>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-slate-300">Max Data Age (ms)</label>
+              <input
+                type="number"
+                step="10000"
+                value={form.maxAcceptableDataAgeMs ?? 300000}
+                onChange={e => setForm({ ...form, maxAcceptableDataAgeMs: parseInt(e.target.value) || 300000 })}
+                className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-slate-100 focus:outline-none focus:border-amber-400"
+              />
+              <p className="text-[10px] text-slate-500">Max candle age (Default: 300,000ms = 5m).</p>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-slate-300">Entry RSI Bounds [Min - Max]</label>
+              <div className="flex gap-2">
+                <input
+                  type="number"
+                  placeholder="Min"
+                  value={form.minRsi ?? 45}
+                  onChange={e => setForm({ ...form, minRsi: parseFloat(e.target.value) || 45 })}
+                  className="w-1/2 px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-slate-100 focus:outline-none focus:border-amber-400"
+                />
+                <input
+                  type="number"
+                  placeholder="Max"
+                  value={form.maxRsi ?? 72}
+                  onChange={e => setForm({ ...form, maxRsi: parseFloat(e.target.value) || 72 })}
+                  className="w-1/2 px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-slate-100 focus:outline-none focus:border-amber-400"
+                />
+              </div>
+              <p className="text-[10px] text-slate-500">Safe momentum zone (Default: 45 - 72).</p>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-slate-300">Min Risk/Reward Ratio</label>
+              <input
+                type="number"
+                step="0.1"
+                value={form.minRiskRewardRatio ?? 1.5}
+                onChange={e => setForm({ ...form, minRiskRewardRatio: parseFloat(e.target.value) || 1.5 })}
+                className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-slate-100 focus:outline-none focus:border-amber-400"
+              />
+              <p className="text-[10px] text-slate-500">TakeProfit / StopLoss ratio (Default: 1.5).</p>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-slate-300">Min Net Profitability %</label>
+              <input
+                type="number"
+                step="0.1"
+                value={form.minEstimatedNetProfitPercent ?? 0.5}
+                onChange={e => setForm({ ...form, minEstimatedNetProfitPercent: parseFloat(e.target.value) || 0.5 })}
+                className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-slate-100 focus:outline-none focus:border-amber-400"
+              />
+              <p className="text-[10px] text-slate-500">Profit after roundtrip fees (Default: +0.5%).</p>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-slate-300">Min 5m Momentum Score</label>
+              <input
+                type="number"
+                step="0.5"
+                value={form.minMomentumScore5m ?? 7.0}
+                onChange={e => setForm({ ...form, minMomentumScore5m: parseFloat(e.target.value) || 7.0 })}
+                className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-slate-100 focus:outline-none focus:border-amber-400"
+              />
+              <p className="text-[10px] text-slate-500">Minimum 5m momentum component (Default: 7.0).</p>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-slate-300">Max EMA21 Extension %</label>
+              <input
+                type="number"
+                step="0.5"
+                value={form.maxExtensionAboveEma21Percent ?? 3.5}
+                onChange={e => setForm({ ...form, maxExtensionAboveEma21Percent: parseFloat(e.target.value) || 3.5 })}
+                className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-slate-100 focus:outline-none focus:border-amber-400"
+              />
+              <p className="text-[10px] text-slate-500">Prevents buying extended tops (Default: 3.5%).</p>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-slate-300">Require 15m Confirmation</label>
+              <div className="pt-2">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={form.require15mConfirmation !== false}
+                    onChange={e => setForm({ ...form, require15mConfirmation: e.target.checked })}
+                    className="w-4 h-4 rounded bg-slate-900 border-slate-700 text-amber-400 focus:ring-0"
+                  />
+                  <span className="text-[11px] text-slate-300">Block BUY if 15m trend is Bearish</span>
+                </label>
+              </div>
+              <p className="text-[10px] text-slate-500">Enforces multi-timeframe alignment.</p>
+            </div>
+          </div>
+        </div>
+
         <div className="flex justify-end pt-4 border-t border-slate-800">
           <button
             type="submit"

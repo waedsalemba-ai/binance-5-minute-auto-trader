@@ -15,6 +15,7 @@ import {
   RotateCcw,
 } from 'lucide-react';
 import { TradingMode } from '../types/index.ts';
+import { formatCurrency } from '../utils/format.ts';
 
 interface NavbarProps {
   currentTab: string;
@@ -82,7 +83,7 @@ export const Navbar: React.FC<NavbarProps> = ({
             {/* Fixed Trade Amount Pill */}
             <div className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-900 border border-slate-700 rounded-lg text-xs font-mono">
               <span className="text-slate-400">Fixed Trade:</span>
-              <span className="font-bold text-amber-400">{fixedTradeAmount.toFixed(2)} USDT</span>
+              <span className="font-bold text-amber-400">{formatCurrency(fixedTradeAmount, 2)} USDT</span>
             </div>
 
             {/* Trading Mode Badge & Toggle */}

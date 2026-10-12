@@ -15,6 +15,7 @@ import {
 } from 'lucide-react';
 import { Candle, TechnicalAnalysis, Position, TradingMode } from '../types/index.ts';
 import { CandleChart } from './CandleChart.tsx';
+import { safeNum, formatCurrency, formatPercent, formatSignedCurrency } from '../utils/format.ts';
 
 interface TokenDetailViewProps {
   symbol: string;
@@ -181,8 +182,8 @@ export const TokenDetailView: React.FC<TokenDetailViewProps> = ({
                 <span>Fixed Entry Quote: <strong className="text-slate-200">{activePosition.entryQuoteAmount} USDT</strong></span>
                 <span>Qty: <strong className="text-slate-200">{activePosition.remainingQuantity}</strong></span>
                 <span>Entry Price: <strong className="text-slate-200">${activePosition.entryPrice}</strong></span>
-                <span>Unrealized: <strong className={activePosition.unrealizedPnL >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
-                  {activePosition.unrealizedPnL >= 0 ? '+' : ''}${activePosition.unrealizedPnL.toFixed(2)} ({activePosition.unrealizedPnLPercent}%)
+                <span>Unrealized: <strong className={safeNum(activePosition.unrealizedPnL, 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
+                  {formatSignedCurrency(activePosition.unrealizedPnL, 2)} ({formatPercent(activePosition.unrealizedPnLPercent, 2, true)})
                 </strong></span>
               </div>
             </div>

@@ -14,6 +14,7 @@ import {
   ExternalLink,
 } from 'lucide-react';
 import { WalletBalance, TradingAccount } from '../types/index.ts';
+import { safeNum, formatCurrency } from '../utils/format.ts';
 
 interface RealWalletViewProps {
   wallet: WalletBalance;
@@ -193,7 +194,7 @@ export const RealWalletView: React.FC<RealWalletViewProps> = ({
             <div className="bg-[#0f172a] border border-slate-800 rounded-2xl p-4">
               <span className="text-[11px] text-slate-400 font-medium">Real Total Equity</span>
               <div className="text-2xl font-black font-mono text-slate-100 mt-1">
-                ${wallet.totalEquity.toFixed(2)}
+                ${formatCurrency(wallet.totalEquity, 2)}
               </div>
               <span className="text-[11px] text-slate-500 font-mono mt-1 block">
                 Live Binance Spot Account
@@ -203,7 +204,7 @@ export const RealWalletView: React.FC<RealWalletViewProps> = ({
             <div className="bg-[#0f172a] border border-slate-800 rounded-2xl p-4">
               <span className="text-[11px] text-slate-400 font-medium">Available USDT</span>
               <div className="text-2xl font-black font-mono text-emerald-400 mt-1">
-                ${wallet.usdtAvailable.toFixed(2)}
+                ${formatCurrency(wallet.usdtAvailable, 2)}
               </div>
               <span className="text-[11px] text-slate-500 font-mono mt-1 block">
                 Free balance for new trades
@@ -213,7 +214,7 @@ export const RealWalletView: React.FC<RealWalletViewProps> = ({
             <div className="bg-[#0f172a] border border-slate-800 rounded-2xl p-4">
               <span className="text-[11px] text-slate-400 font-medium">Crypto Asset Holdings Value</span>
               <div className="text-2xl font-black font-mono text-amber-400 mt-1">
-                ${wallet.accountAssetValue.toFixed(2)}
+                ${formatCurrency(wallet.accountAssetValue, 2)}
               </div>
               <span className="text-[11px] text-slate-500 font-mono mt-1 block">
                 {wallet.assets.length} assets on Binance
@@ -244,7 +245,7 @@ export const RealWalletView: React.FC<RealWalletViewProps> = ({
                   {wallet.assets.length === 0 ? (
                     <tr>
                       <td colSpan={6} className="py-8 text-center text-slate-500">
-                        No crypto asset balances detected on Binance. Free USDT balance: ${wallet.usdtAvailable.toFixed(2)}.
+                        No crypto asset balances detected on Binance. Free USDT balance: ${formatCurrency(wallet.usdtAvailable, 2)}.
                       </td>
                     </tr>
                   ) : (
@@ -254,7 +255,7 @@ export const RealWalletView: React.FC<RealWalletViewProps> = ({
                         <td className="py-3 px-4 text-slate-300">{a.free}</td>
                         <td className="py-3 px-4 text-slate-400">{a.locked}</td>
                         <td className="py-3 px-4 text-slate-200">{a.total}</td>
-                        <td className="py-3 px-4 text-amber-400 font-bold">${a.valueUsdt.toFixed(2)}</td>
+                        <td className="py-3 px-4 text-amber-400 font-bold">${formatCurrency(a.valueUsdt, 2)}</td>
                         <td className="py-3 px-4 text-right">
                           {a.isExternal ? (
                             <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-800 text-slate-400 border border-slate-700">

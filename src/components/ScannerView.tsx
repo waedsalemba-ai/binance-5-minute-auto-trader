@@ -11,6 +11,7 @@ import {
   Star,
 } from 'lucide-react';
 import { TechnicalAnalysis, StrategyState, Position, TradingMode } from '../types/index.ts';
+import { safeNum, formatCurrency, formatPercent } from '../utils/format.ts';
 
 interface ScannerViewProps {
   analyses: TechnicalAnalysis[];
@@ -250,14 +251,14 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
 
                       {/* 24h Change */}
                       <td className={`py-3 px-3 font-bold ${
-                        item.priceChange24h >= 0 ? 'text-emerald-400' : 'text-rose-400'
+                        safeNum(item.priceChange24h, 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'
                       }`}>
-                        {item.priceChange24h >= 0 ? '+' : ''}{item.priceChange24h.toFixed(2)}%
+                        {formatPercent(item.priceChange24h, 2, true)}
                       </td>
 
                       {/* 24h Volume */}
                       <td className="py-3 px-3 text-slate-400">
-                        ${(item.quoteVolume24h / 1e6).toFixed(2)}M
+                        ${formatCurrency(safeNum(item.quoteVolume24h, 0) / 1e6, 2)}M
                       </td>
 
                       {/* MTF Signals */}
@@ -272,15 +273,15 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
 
                       {/* RSI-14 */}
                       <td className="py-3 px-3">
-                        <span className={rsiVal >= 70 ? 'text-rose-400 font-bold' : rsiVal <= 30 ? 'text-emerald-400 font-bold' : 'text-slate-300'}>
-                          {rsiVal.toFixed(1)}
+                        <span className={safeNum(rsiVal, 50) >= 70 ? 'text-rose-400 font-bold' : safeNum(rsiVal, 50) <= 30 ? 'text-emerald-400 font-bold' : 'text-slate-300'}>
+                          {formatCurrency(rsiVal, 1)}
                         </span>
                       </td>
 
                       {/* Volume Ratio */}
                       <td className="py-3 px-3">
-                        <span className={item.indicators.volumeRatio >= 1.5 ? 'text-amber-400 font-bold' : 'text-slate-400'}>
-                          {item.indicators.volumeRatio}x
+                        <span className={safeNum(item.indicators.volumeRatio, 1) >= 1.5 ? 'text-amber-400 font-bold' : 'text-slate-400'}>
+                          {formatCurrency(item.indicators.volumeRatio, 2)}x
                         </span>
                       </td>
 

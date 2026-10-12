@@ -1,6 +1,7 @@
 import React from 'react';
 import { Layers, TrendingUp, TrendingDown, Clock, ShieldAlert, BarChart3, AlertCircle, RotateCcw } from 'lucide-react';
 import { Position, TradingMode } from '../types/index.ts';
+import { safeNum, formatCurrency, formatPercent, formatSignedCurrency } from '../utils/format.ts';
 
 interface PositionsViewProps {
   positions: Position[];
@@ -18,9 +19,9 @@ export const PositionsView: React.FC<PositionsViewProps> = ({
   onOpenResetModal,
 }) => {
   const currentPositions = positions.filter(p => p.mode === mode && p.status === 'OPEN');
-  const totalAllocated = currentPositions.reduce((sum, p) => sum + (p.entryQuoteAmount || 0), 0);
-  const totalCurrentValue = currentPositions.reduce((sum, p) => sum + (p.currentPrice || 0) * (p.remainingQuantity || 0), 0);
-  const totalUnrealized = currentPositions.reduce((sum, p) => sum + (p.unrealizedPnL || 0), 0);
+  const totalAllocated = currentPositions.reduce((sum, p) => sum + safeNum(p.entryQuoteAmount, 0), 0);
+  const totalCurrentValue = currentPositions.reduce((sum, p) => sum + safeNum(p.currentPrice, 0) * safeNum(p.remainingQuantity, 0), 0);
+  const totalUnrealized = currentPositions.reduce((sum, p) => sum + safeNum(p.estimatedNetPnL ?? p.unrealizedPnL, 0), 0);
 
   const formatDuration = (openedAt: number) => {
     const diff = Math.max(0, Math.floor((Date.now() - openedAt) / 1000));
@@ -167,14 +168,14 @@ export const PositionsView: React.FC<PositionsViewProps> = ({
                 <div className="pt-2 border-t border-slate-800 space-y-1.5">
                   <div className="flex justify-between">
                     <span className="text-slate-400">Current Gross PnL:</span>
-                    <span className={(pos.grossPnL ?? pos.unrealizedPnL) >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
-                      {(pos.grossPnL ?? pos.unrealizedPnL) >= 0 ? '+' : ''}${(pos.grossPnL ?? pos.unrealizedPnL).toFixed(2)}
+                    <span className={safeNum(pos.grossPnL ?? pos.unrealizedPnL, 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
+                      {formatSignedCurrency(pos.grossPnL ?? pos.unrealizedPnL, 2)}
                     </span>
                   </div>
                   <div className="flex justify-between font-bold">
                     <span className="text-slate-200">Estimated Net PnL:</span>
-                    <span className={(pos.estimatedNetPnL ?? pos.unrealizedPnL) >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
-                      {(pos.estimatedNetPnL ?? pos.unrealizedPnL) >= 0 ? '+' : ''}${(pos.estimatedNetPnL ?? pos.unrealizedPnL).toFixed(2)} ({(pos.estimatedNetPnLPercent ?? pos.unrealizedPnLPercent) >= 0 ? '+' : ''}{pos.estimatedNetPnLPercent ?? pos.unrealizedPnLPercent}%)
+                    <span className={safeNum(pos.estimatedNetPnL ?? pos.unrealizedPnL, 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
+                      {formatSignedCurrency(pos.estimatedNetPnL ?? pos.unrealizedPnL, 2)} ({formatPercent(pos.estimatedNetPnLPercent ?? pos.unrealizedPnLPercent, 2, true)})
                     </span>
                   </div>
                 </div>

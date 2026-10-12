@@ -13,6 +13,7 @@ import {
   Save,
 } from 'lucide-react';
 import { TradingSettings, TradingMode, WalletBalance, Position } from '../types/index.ts';
+import { formatCurrency } from '../utils/format.ts';
 
 interface TradingViewProps {
   settings: TradingSettings;
@@ -368,7 +369,7 @@ export const TradingView: React.FC<TradingViewProps> = ({
               <span className="text-slate-300">Balance &ge; Fixed Amount</span>
               {isBalanceSufficient ? (
                 <span className="text-emerald-400 flex items-center gap-1 font-bold">
-                  <CheckCircle2 className="w-3.5 h-3.5" /> OK (${wallet.usdtAvailable.toFixed(2)})
+                  <CheckCircle2 className="w-3.5 h-3.5" /> OK (${formatCurrency(wallet.usdtAvailable, 2)})
                 </span>
               ) : (
                 <span className="text-rose-400 flex items-center gap-1 font-bold">

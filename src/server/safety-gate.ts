@@ -127,13 +127,16 @@ export class SafetyGate {
       };
     }
 
-    // 6. Max Open Positions Check
+    // 6. Max Open Positions Check (Strict Upper Bound: OPEN positions + In-flight reservations)
     const activePositions = openPositions.filter(p => p.mode === mode && p.status === 'OPEN');
-    if (activePositions.length >= settings.maxOpenPositions) {
+    const inFlightCount = Storage.getInFlightBuyCount(mode);
+    const totalCommittedPositions = activePositions.length + inFlightCount;
+
+    if (totalCommittedPositions >= settings.maxOpenPositions) {
       return {
         allowed: false,
         code: 'MAX_POSITIONS_REACHED',
-        reason: `Maximum open positions limit reached (${activePositions.length}/${settings.maxOpenPositions}). Cannot open new position.`,
+        reason: `Maximum open positions limit reached (${totalCommittedPositions}/${settings.maxOpenPositions} open/reserved). Cannot open new position.`,
       };
     }
 

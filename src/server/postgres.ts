@@ -24,9 +24,12 @@ export function normalizeDatabaseUrl(rawUrl?: string): string {
   try {
     const parsed = new URL(trimmed);
     // If Render internal service hostname is used (e.g. dpg-db1udtss728c73ac7e00-a) without a domain suffix,
+    // and we are NOT running directly on Render (where internal hostnames resolve on the private network),
     // normalize to the standard Render Postgres public hostname format: dpg-*.oregon-postgres.render.com
-    if (parsed.hostname && parsed.hostname.startsWith('dpg-') && !parsed.hostname.includes('.')) {
-      parsed.hostname = `${parsed.hostname}.oregon-postgres.render.com`;
+    const isRenderInternal = parsed.hostname && parsed.hostname.startsWith('dpg-') && !parsed.hostname.includes('.');
+    if (isRenderInternal && !process.env.RENDER) {
+      const region = process.env.RENDER_REGION || 'oregon';
+      parsed.hostname = `${parsed.hostname}.${region}-postgres.render.com`;
       return parsed.toString();
     }
     return trimmed;
@@ -50,10 +53,16 @@ export function sanitizeDatabaseUrl(rawUrl?: string): string {
 
 let activePool: pg.Pool | null = null;
 let isRemoteConnected = false;
+let isEmbeddedDev = false;
 let lastConnectionError: string | null = null;
 let reconnectIntervalTimer: NodeJS.Timeout | null = null;
 let isReconnecting = false;
+let reconnectAttemptCount = 0;
 const onReconnectCallbacks: Array<() => Promise<void>> = [];
+
+export function isEmbeddedPostgres(): boolean {
+  return isEmbeddedDev;
+}
 
 export function registerDatabaseReconnectHandler(fn: () => Promise<void>): void {
   onReconnectCallbacks.push(fn);
@@ -81,7 +90,8 @@ function isNetworkOrDnsError(err: any): boolean {
     code === 'EHOSTUNREACH' ||
     msg.includes('getaddrinfo') ||
     msg.includes('Connection timeout') ||
-    msg.includes('Connection timed out')
+    msg.includes('Connection timed out') ||
+    msg.includes('Connection terminated unexpectedly')
   );
 }
 
@@ -92,49 +102,87 @@ export function startDatabaseReconnectLoop(): void {
   if (!rawUrl) return;
 
   const effectiveUrl = normalizeDatabaseUrl(rawUrl);
-  reconnectIntervalTimer = setInterval(async () => {
-    if (isRemoteConnected || isReconnecting) return;
+  let backoffMs = isEmbeddedDev ? 60000 : 5000;
+
+  const attemptReconnect = async () => {
+    // If remote connection is already healthy and not embedded, or a reconnect is in-flight, skip
+    if ((isRemoteConnected && !isEmbeddedDev) || isReconnecting) {
+      scheduleNext();
+      return;
+    }
+
     isReconnecting = true;
+    reconnectAttemptCount++;
     const sanitized = sanitizeDatabaseUrl(effectiveUrl);
 
+    let testPool: pg.Pool | null = null;
     try {
       const isLocal = effectiveUrl.includes('localhost') || effectiveUrl.includes('127.0.0.1');
-      const testPool = new pg.Pool({
+      testPool = new pg.Pool({
         connectionString: effectiveUrl,
         ssl: isLocal ? false : { rejectUnauthorized: false },
-        max: 10,
-        idleTimeoutMillis: 30000,
-        connectionTimeoutMillis: 5000,
+        max: 5,
+        idleTimeoutMillis: 10000,
+        connectionTimeoutMillis: 4000,
       });
 
-      const testClient = await testPool.connect();
+      const testClient = await Promise.race([
+        testPool.connect(),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('Connection timed out after 4000ms')), 4000)
+        ),
+      ]);
       const res = await testClient.query('SELECT 1 as ping');
       testClient.release();
 
       if (res.rows?.[0]?.ping === 1 || res.rows?.[0]?.ping === '1') {
-        if (activePool) {
+        if (activePool && !isEmbeddedDev) {
           try {
             await activePool.end();
           } catch {}
         }
         activePool = testPool;
         isRemoteConnected = true;
+        isEmbeddedDev = false;
         lastConnectionError = null;
+        reconnectAttemptCount = 0;
+        backoffMs = 5000;
 
         Logger.info('PAPER', 'DATABASE', `[DATABASE] [POSTGRES] Re-established connection to PostgreSQL at ${sanitized}. Running schema verification and rehydrating state...`);
         await initializePostgresSchema();
         await notifyReconnected();
         Logger.info('PAPER', 'DATABASE', '[DATABASE] [POSTGRES] Rehydration complete. Trading engine is now READY.');
+        return;
       }
     } catch (err: any) {
-      lastConnectionError = err.message;
-      isRemoteConnected = false;
-      Logger.warn('PAPER', 'DATABASE', `[DATABASE] [POSTGRES] Reconnection attempt failed (${err.message}). Retrying in 5s...`);
+      if (testPool) {
+        await testPool.end().catch(() => {});
+      }
+      if (!isEmbeddedDev) {
+        lastConnectionError = err.message;
+        isRemoteConnected = false;
+      }
+
+      // Exponential backoff up to 60s (fixed 60s for embedded dev)
+      backoffMs = isEmbeddedDev ? 60000 : Math.min(backoffMs * 1.5, 60000);
+
+      // Only log on first attempt or every 10 attempts to avoid spamming the log
+      if (!isEmbeddedDev && (reconnectAttemptCount === 1 || reconnectAttemptCount % 10 === 0)) {
+        Logger.info('PAPER', 'DATABASE', `[DATABASE] [POSTGRES] Background reconnection to remote ${sanitized} pending (${err.message}). Next attempt in ${(backoffMs / 1000).toFixed(0)}s.`);
+      }
     } finally {
       isReconnecting = false;
+      scheduleNext();
     }
-  }, 5000);
-  reconnectIntervalTimer.unref();
+  };
+
+  const scheduleNext = () => {
+    if (reconnectIntervalTimer) clearTimeout(reconnectIntervalTimer);
+    reconnectIntervalTimer = setTimeout(attemptReconnect, backoffMs);
+    reconnectIntervalTimer.unref();
+  };
+
+  scheduleNext();
 }
 
 export async function probeAndSelectPool(): Promise<pg.Pool> {
@@ -143,18 +191,19 @@ export async function probeAndSelectPool(): Promise<pg.Pool> {
   }
 
   const isTest = process.env.NODE_ENV === 'test';
+  const isProduction = process.env.NODE_ENV === 'production';
+  const rawUrl = process.env.DATABASE_URL?.trim();
+
   if (isTest) {
     if (!activePool) {
       const memDb = newDb();
       const MemPool = memDb.adapters.createPg().Pool;
       activePool = new MemPool() as unknown as pg.Pool;
       isRemoteConnected = true;
+      isEmbeddedDev = true;
     }
     return activePool;
   }
-
-  const rawUrl = process.env.DATABASE_URL?.trim();
-  const isProduction = process.env.NODE_ENV === 'production';
 
   if (!rawUrl) {
     if (isProduction) {
@@ -163,21 +212,16 @@ export async function probeAndSelectPool(): Promise<pg.Pool> {
       throw new Error(errMsg);
     }
 
-    if (isTest) {
-      // In explicit automated test runner with no external DB, provide pg-mem for unit tests only
-      if (!activePool) {
-        const memDb = newDb();
-        const MemPool = memDb.adapters.createPg().Pool;
-        activePool = new MemPool() as unknown as pg.Pool;
-        isRemoteConnected = true;
-        Logger.info('PAPER', 'DATABASE', '[TEST] Initialized in-memory PostgreSQL engine for test suite execution.');
-      }
-      return activePool;
+    // In development without DATABASE_URL, initialize embedded PostgreSQL engine
+    if (!activePool) {
+      const memDb = newDb();
+      const MemPool = memDb.adapters.createPg().Pool;
+      activePool = new MemPool() as unknown as pg.Pool;
+      isRemoteConnected = true;
+      isEmbeddedDev = true;
+      Logger.info('PAPER', 'DATABASE', '[DATABASE] [POSTGRES] DATABASE_URL not configured. Operating with embedded PostgreSQL storage engine.');
     }
-
-    const errMsg = 'DATABASE_URL environment variable is not configured.';
-    Logger.error('PAPER', 'DATABASE', errMsg);
-    throw new Error(errMsg);
+    return activePool;
   }
 
   const effectiveUrl = normalizeDatabaseUrl(rawUrl);
@@ -189,7 +233,7 @@ export async function probeAndSelectPool(): Promise<pg.Pool> {
     ssl: isLocal ? false : { rejectUnauthorized: false },
     max: 10,
     idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 5000,
+    connectionTimeoutMillis: 4000,
   });
 
   remotePool.on('error', (err) => {
@@ -204,7 +248,7 @@ export async function probeAndSelectPool(): Promise<pg.Pool> {
     const testClient = await Promise.race([
       remotePool.connect(),
       new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('Connection timed out after 5000ms')), 5000)
+        setTimeout(() => reject(new Error('Connection timed out after 4000ms')), 4000)
       ),
     ]);
     const res = await testClient.query('SELECT 1 as ping');
@@ -213,38 +257,47 @@ export async function probeAndSelectPool(): Promise<pg.Pool> {
     if (res.rows?.[0]?.ping === 1 || res.rows?.[0]?.ping === '1') {
       activePool = remotePool;
       isRemoteConnected = true;
+      isEmbeddedDev = false;
       lastConnectionError = null;
       Logger.info('PAPER', 'DATABASE', `[DATABASE] [POSTGRES] Successfully connected to PostgreSQL at ${sanitized}`);
       return activePool;
     }
   } catch (err: any) {
+    await remotePool.end().catch(() => {});
     lastConnectionError = err.message;
     isRemoteConnected = false;
-    activePool = null;
-
-    Logger.error(
-      'PAPER',
-      'DATABASE',
-      `[DATABASE] [POSTGRES] Failed to connect to PostgreSQL at ${sanitized}: ${err.message}. Storage is marked UNHEALTHY. Starting automatic reconnection loop.`
-    );
-
-    startDatabaseReconnectLoop();
 
     if (isProduction) {
-      // In production, do not proceed with dummy database
+      activePool = null;
+      Logger.error(
+        'PAPER',
+        'DATABASE',
+        `[DATABASE] [POSTGRES] Failed to connect to production PostgreSQL at ${sanitized}: ${err.message}. Storage is marked UNHEALTHY. Starting automatic reconnection loop.`
+      );
+      startDatabaseReconnectLoop();
       throw new Error(`Failed to connect to production PostgreSQL at ${sanitized}: ${err.message}`);
     }
 
-    if (isTest) {
-      // Test suite fallback
+    // In development / preview:
+    // Remote database could not be reached (e.g. Render internal URL accessed from external preview environment)
+    Logger.info(
+      'PAPER',
+      'DATABASE',
+      `[DATABASE] [POSTGRES] Remote PostgreSQL at ${sanitized} is not reachable from this environment (${err.message}). Initializing embedded PostgreSQL storage engine for development.`
+    );
+
+    if (!activePool) {
       const memDb = newDb();
       const MemPool = memDb.adapters.createPg().Pool;
       activePool = new MemPool() as unknown as pg.Pool;
-      isRemoteConnected = true;
-      return activePool;
     }
+    isRemoteConnected = true;
+    isEmbeddedDev = true;
+    lastConnectionError = null;
 
-    throw err;
+    startDatabaseReconnectLoop();
+
+    return activePool;
   }
 
   throw new Error('PostgreSQL connection failed.');
@@ -257,8 +310,11 @@ export function getPostgresPool(): pg.Pool | null {
 export function setTestPool(pool: pg.Pool | null): void {
   activePool = pool;
   isRemoteConnected = Boolean(pool);
+  isEmbeddedDev = Boolean(pool);
   if (pool) {
     lastConnectionError = null;
+  } else {
+    lastConnectionError = 'PostgreSQL database is currently disconnected.';
   }
 }
 
@@ -676,6 +732,42 @@ export async function initializePostgresSchema(): Promise<void> {
         ['1', '001_initial_schema', Date.now()]
       );
       Logger.info('PAPER', 'DATABASE', 'Applied migration 001_initial_schema successfully.');
+    }
+
+    // Migration 2: Configurable Quality Filters & Decision Audit Fields
+    const migration2Applied = await safeExec('SELECT id FROM schema_migrations WHERE id = $1', ['2']);
+    if (migration2Applied.rowCount === 0) {
+      await safeExec(`
+        ALTER TABLE trading_settings
+        ADD COLUMN IF NOT EXISTS min_liquidity_24h_usdt NUMERIC DEFAULT 1000000,
+        ADD COLUMN IF NOT EXISTS max_acceptable_data_age_ms INT DEFAULT 300000,
+        ADD COLUMN IF NOT EXISTS min_rsi NUMERIC DEFAULT 45,
+        ADD COLUMN IF NOT EXISTS max_rsi NUMERIC DEFAULT 72,
+        ADD COLUMN IF NOT EXISTS min_momentum_score_5m NUMERIC DEFAULT 7.0,
+        ADD COLUMN IF NOT EXISTS require_15m_confirmation BOOLEAN DEFAULT TRUE,
+        ADD COLUMN IF NOT EXISTS min_risk_reward_ratio NUMERIC DEFAULT 1.5,
+        ADD COLUMN IF NOT EXISTS min_estimated_net_profit_percent NUMERIC DEFAULT 0.5,
+        ADD COLUMN IF NOT EXISTS require_volume_confirmation BOOLEAN DEFAULT TRUE,
+        ADD COLUMN IF NOT EXISTS min_volume_ratio NUMERIC DEFAULT 0.8,
+        ADD COLUMN IF NOT EXISTS max_extension_above_ema21_percent NUMERIC DEFAULT 3.5;
+      `);
+
+      await safeExec(`
+        ALTER TABLE decision_audit_records
+        ADD COLUMN IF NOT EXISTS passed_checks JSONB DEFAULT '[]'::jsonb,
+        ADD COLUMN IF NOT EXISTS failed_checks JSONB DEFAULT '[]'::jsonb,
+        ADD COLUMN IF NOT EXISTS qualified BOOLEAN DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS rank INT DEFAULT NULL,
+        ADD COLUMN IF NOT EXISTS available_capacity INT DEFAULT NULL,
+        ADD COLUMN IF NOT EXISTS capacity_reserved BOOLEAN DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS order_submission_result VARCHAR(32) DEFAULT NULL;
+      `);
+
+      await safeExec(
+        'INSERT INTO schema_migrations (id, name, applied_at) VALUES ($1, $2, $3)',
+        ['2', '002_quality_filters_and_audit', Date.now()]
+      );
+      Logger.info('PAPER', 'DATABASE', 'Applied migration 002_quality_filters_and_audit successfully.');
     }
   });
 }

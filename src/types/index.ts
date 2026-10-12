@@ -231,11 +231,43 @@ export interface ExitDecision {
   logMessage: string;
 }
 
+export interface BuyAuthorizationResult {
+  authorized: boolean;
+  symbol: string;
+  technicalScore: number;
+  strategyState: StrategyState;
+  passedChecks: string[];
+  failedChecks: string[];
+  rejectionReasons: string[];
+  entryPrice: number;
+  evaluatedAt: number;
+  marketDataTimestamp: number;
+  decisionId: string;
+  // Quantitative context
+  riskRewardRatio?: number;
+  estimatedNetProfitPercent?: number;
+  estimatedFees?: number;
+  dataAgeMs?: number;
+  liquidityQuoteVolume24h?: number;
+  momentumScore5m?: number;
+  confirmationScore15m?: number;
+  rankingScore?: number;
+}
+
+export interface CandidateRankInfo {
+  symbol: string;
+  authorization: BuyAuthorizationResult;
+  rank: number;
+  qualified: boolean;
+}
+
 export interface EntryDecision {
   eligible: boolean;
   reason: string;
   strategyState: StrategyState;
   technicalScore: number;
+  // Phase 2 authoritative details (optional for backward compatibility)
+  authorization?: BuyAuthorizationResult;
 }
 
 export interface Order {
@@ -343,6 +375,18 @@ export interface TradingSettings {
   stopLossPercent: number; // e.g. 3.0% NET loss ceiling
   minProfitForTechnicalExitPercent: number; // e.g. 0.20% minimum buffer for technical weakening exits
   maxExitPriceAgeMs: number; // e.g. 5000 ms max allowable price age before exit decision
+  // Phase 6 Configurable Quality Filters (with strict defaults)
+  minLiquidity24hUsdt?: number; // Minimum 24h quote volume USDT (default: 1,000,000)
+  maxAcceptableDataAgeMs?: number; // Maximum age of candle data ms (default: 300,000 ms = 5 min)
+  minRsi?: number; // Minimum entry RSI bound (default: 45)
+  maxRsi?: number; // Maximum entry RSI bound before overbought (default: 72)
+  minMomentumScore5m?: number; // Minimum 5m momentum component (default: 7.0)
+  require15mConfirmation?: boolean; // Must 15m trend not be bearish (default: true)
+  minRiskRewardRatio?: number; // Minimum Risk/Reward ratio (default: 1.5)
+  minEstimatedNetProfitPercent?: number; // Minimum net expected profit % after roundtrip fees (default: 0.5%)
+  requireVolumeConfirmation?: boolean; // Require volume ratio >= minVolumeRatio (default: true)
+  minVolumeRatio?: number; // Ratio of current candle vol vs 20-period avg vol (default: 0.8)
+  maxExtensionAboveEma21Percent?: number; // Max allowable extension above 5m EMA21 % (default: 3.5%)
 }
 
 export interface SystemLogEntry {
@@ -523,6 +567,14 @@ export interface DecisionAuditRecord {
   rejectionReason?: string | null;
   mode: TradingMode;
   tradeAmount: number;
+  // Phase 8 Full Decision Audit Trail
+  passedChecks?: string[];
+  failedChecks?: string[];
+  qualified?: boolean;
+  rank?: number;
+  availableCapacity?: number;
+  capacityReserved?: boolean;
+  orderSubmissionResult?: 'SUBMITTED' | 'FILLED' | 'FAILED' | 'REJECTED' | 'NOT_SUBMITTED';
 }
 
 

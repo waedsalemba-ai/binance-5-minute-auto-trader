@@ -11,6 +11,7 @@ import {
   DollarSign,
 } from 'lucide-react';
 import { Trade, Order, TradingMode } from '../types/index.ts';
+import { safeNum, formatCurrency, formatPercent, formatSignedCurrency } from '../utils/format.ts';
 
 interface OrdersViewProps {
   trades: Trade[];
@@ -27,11 +28,11 @@ export const OrdersView: React.FC<OrdersViewProps> = ({ trades, orders, mode }) 
 
   // Stats calculation
   const totalTradesCount = filteredTrades.length;
-  const winningTrades = filteredTrades.filter(t => t.netPnL > 0).length;
-  const losingTrades = filteredTrades.filter(t => t.netPnL < 0).length;
+  const winningTrades = filteredTrades.filter(t => safeNum(t.netPnL, 0) > 0).length;
+  const losingTrades = filteredTrades.filter(t => safeNum(t.netPnL, 0) < 0).length;
   const winRate = totalTradesCount > 0 ? ((winningTrades / totalTradesCount) * 100).toFixed(1) : '0.0';
-  const totalNetPnL = filteredTrades.reduce((sum, t) => sum + t.netPnL, 0);
-  const totalFees = filteredTrades.reduce((sum, t) => sum + t.entryFees + t.exitFees, 0);
+  const totalNetPnL = filteredTrades.reduce((sum, t) => sum + safeNum(t.netPnL, 0), 0);
+  const totalFees = filteredTrades.reduce((sum, t) => sum + safeNum(t.entryFees, 0) + safeNum(t.exitFees, 0), 0);
 
   const formatTime = (ts: number) => {
     return new Date(ts).toLocaleString('en-US', {
@@ -179,12 +180,12 @@ export const OrdersView: React.FC<OrdersViewProps> = ({ trades, orders, mode }) 
                       <td className="py-3 px-3 text-slate-300">{trade.quantity}</td>
                       <td className="py-3 px-3 text-slate-300">${trade.entryPrice}</td>
                       <td className="py-3 px-3 text-slate-300">${trade.exitPrice}</td>
-                      <td className="py-3 px-3 text-slate-400">${(trade.entryFees + trade.exitFees).toFixed(4)}</td>
-                      <td className={`py-3 px-3 ${trade.grossPnL >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                        {trade.grossPnL >= 0 ? '+' : ''}${trade.grossPnL.toFixed(2)}
+                      <td className="py-3 px-3 text-slate-400">${formatCurrency(safeNum(trade.entryFees, 0) + safeNum(trade.exitFees, 0), 4)}</td>
+                      <td className={`py-3 px-3 ${safeNum(trade.grossPnL, 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                        {formatSignedCurrency(trade.grossPnL, 2)}
                       </td>
-                      <td className={`py-3 px-3 font-bold ${trade.netPnL >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                        {trade.netPnL >= 0 ? '+' : ''}${trade.netPnL.toFixed(2)} ({trade.netPnLPercent >= 0 ? '+' : ''}{trade.netPnLPercent}%)
+                      <td className={`py-3 px-3 font-bold ${safeNum(trade.netPnL, 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                        {formatSignedCurrency(trade.netPnL, 2)} ({formatPercent(trade.netPnLPercent, 2, true)})
                       </td>
                       <td className="py-3 px-3 text-slate-400">{formatDuration(trade.durationMs)}</td>
                       <td className="py-3 px-3 text-slate-400 text-[11px] max-w-xs truncate" title={trade.exitReason}>

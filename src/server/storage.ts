@@ -121,6 +121,7 @@ export interface DatabaseMemoryCache {
   symbolAudits: SymbolAuditRecord[];
   decisionAudits: DecisionAuditRecord[];
   lastEvaluatedCandles: Record<string, number>;
+  inFlightBuyReservations: Record<string, { symbol: string; mode: TradingMode; quoteAmount: number; timestamp: number }>;
   engineTelemetry: {
     lastScanAt: number | null;
     lastSuccessfulScanAt: number | null;
@@ -190,6 +191,7 @@ class PostgresStorageEngine {
       symbolAudits: [],
       decisionAudits: [],
       lastEvaluatedCandles: {},
+      inFlightBuyReservations: {},
       engineTelemetry: {
         lastScanAt: null,
         lastSuccessfulScanAt: null,
@@ -275,6 +277,17 @@ class PostgresStorageEngine {
           stopLossPercent: Number(row.stop_loss_percent) || 3.0,
           minProfitForTechnicalExitPercent: Number(row.min_profit_for_technical_exit_percent) || 0.20,
           maxExitPriceAgeMs: Number(row.max_exit_price_age_ms) || 5000,
+          minLiquidity24hUsdt: row.min_liquidity_24h_usdt !== null && row.min_liquidity_24h_usdt !== undefined ? Number(row.min_liquidity_24h_usdt) : 1000000,
+          maxAcceptableDataAgeMs: row.max_acceptable_data_age_ms !== null && row.max_acceptable_data_age_ms !== undefined ? Number(row.max_acceptable_data_age_ms) : 300000,
+          minRsi: row.min_rsi !== null && row.min_rsi !== undefined ? Number(row.min_rsi) : 45,
+          maxRsi: row.max_rsi !== null && row.max_rsi !== undefined ? Number(row.max_rsi) : 72,
+          minMomentumScore5m: row.min_momentum_score_5m !== null && row.min_momentum_score_5m !== undefined ? Number(row.min_momentum_score_5m) : 7.0,
+          require15mConfirmation: row.require_15m_confirmation !== null && row.require_15m_confirmation !== undefined ? Boolean(row.require_15m_confirmation) : true,
+          minRiskRewardRatio: row.min_risk_reward_ratio !== null && row.min_risk_reward_ratio !== undefined ? Number(row.min_risk_reward_ratio) : 1.5,
+          minEstimatedNetProfitPercent: row.min_estimated_net_profit_percent !== null && row.min_estimated_net_profit_percent !== undefined ? Number(row.min_estimated_net_profit_percent) : 0.5,
+          requireVolumeConfirmation: row.require_volume_confirmation !== null && row.require_volume_confirmation !== undefined ? Boolean(row.require_volume_confirmation) : true,
+          minVolumeRatio: row.min_volume_ratio !== null && row.min_volume_ratio !== undefined ? Number(row.min_volume_ratio) : 0.8,
+          maxExtensionAboveEma21Percent: row.max_extension_above_ema21_percent !== null && row.max_extension_above_ema21_percent !== undefined ? Number(row.max_extension_above_ema21_percent) : 3.5,
         };
       }
 
@@ -630,6 +643,77 @@ class PostgresStorageEngine {
       }
     }
 
+    if (updates.minLiquidity24hUsdt !== undefined) {
+      const liq = Number(updates.minLiquidity24hUsdt);
+      if (!isNaN(liq) && liq >= 0) {
+        this.cache.settings.minLiquidity24hUsdt = liq;
+      }
+    }
+
+    if (updates.maxAcceptableDataAgeMs !== undefined) {
+      const age = Number(updates.maxAcceptableDataAgeMs);
+      if (!isNaN(age) && age >= 5000) {
+        this.cache.settings.maxAcceptableDataAgeMs = Math.floor(age);
+      }
+    }
+
+    if (updates.minRsi !== undefined) {
+      const rsi = Number(updates.minRsi);
+      if (!isNaN(rsi) && rsi >= 0 && rsi <= 100) {
+        this.cache.settings.minRsi = rsi;
+      }
+    }
+
+    if (updates.maxRsi !== undefined) {
+      const rsi = Number(updates.maxRsi);
+      if (!isNaN(rsi) && rsi >= 0 && rsi <= 100) {
+        this.cache.settings.maxRsi = rsi;
+      }
+    }
+
+    if (updates.minMomentumScore5m !== undefined) {
+      const mom = Number(updates.minMomentumScore5m);
+      if (!isNaN(mom) && mom >= 0) {
+        this.cache.settings.minMomentumScore5m = mom;
+      }
+    }
+
+    if (updates.require15mConfirmation !== undefined) {
+      this.cache.settings.require15mConfirmation = Boolean(updates.require15mConfirmation);
+    }
+
+    if (updates.minRiskRewardRatio !== undefined) {
+      const rr = Number(updates.minRiskRewardRatio);
+      if (!isNaN(rr) && rr >= 0) {
+        this.cache.settings.minRiskRewardRatio = rr;
+      }
+    }
+
+    if (updates.minEstimatedNetProfitPercent !== undefined) {
+      const np = Number(updates.minEstimatedNetProfitPercent);
+      if (!isNaN(np) && np >= 0) {
+        this.cache.settings.minEstimatedNetProfitPercent = np;
+      }
+    }
+
+    if (updates.requireVolumeConfirmation !== undefined) {
+      this.cache.settings.requireVolumeConfirmation = Boolean(updates.requireVolumeConfirmation);
+    }
+
+    if (updates.minVolumeRatio !== undefined) {
+      const vr = Number(updates.minVolumeRatio);
+      if (!isNaN(vr) && vr >= 0) {
+        this.cache.settings.minVolumeRatio = vr;
+      }
+    }
+
+    if (updates.maxExtensionAboveEma21Percent !== undefined) {
+      const ext = Number(updates.maxExtensionAboveEma21Percent);
+      if (!isNaN(ext) && ext >= 0) {
+        this.cache.settings.maxExtensionAboveEma21Percent = ext;
+      }
+    }
+
     // Persist to PostgreSQL
     const s = this.cache.settings;
     query(
@@ -640,9 +724,13 @@ class PostgresStorageEngine {
         paper_starting_balance, paper_fee_rate, paper_slippage_bps,
         manage_existing_holdings, resume_on_restart, scan_interval_ms,
         take_profit_percent, stop_loss_percent, min_profit_for_technical_exit_percent,
-        max_exit_price_age_ms, updated_at
+        max_exit_price_age_ms, min_liquidity_24h_usdt, max_acceptable_data_age_ms,
+        min_rsi, max_rsi, min_momentum_score_5m, require_15m_confirmation,
+        min_risk_reward_ratio, min_estimated_net_profit_percent,
+        require_volume_confirmation, min_volume_ratio, max_extension_above_ema21_percent, updated_at
       ) VALUES (
-        'current', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21
+        'current', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+        $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32
       ) ON CONFLICT (id) DO UPDATE SET
         mode = EXCLUDED.mode,
         auto_trading = EXCLUDED.auto_trading,
@@ -656,6 +744,17 @@ class PostgresStorageEngine {
         take_profit_percent = EXCLUDED.take_profit_percent,
         stop_loss_percent = EXCLUDED.stop_loss_percent,
         min_profit_for_technical_exit_percent = EXCLUDED.min_profit_for_technical_exit_percent,
+        min_liquidity_24h_usdt = EXCLUDED.min_liquidity_24h_usdt,
+        max_acceptable_data_age_ms = EXCLUDED.max_acceptable_data_age_ms,
+        min_rsi = EXCLUDED.min_rsi,
+        max_rsi = EXCLUDED.max_rsi,
+        min_momentum_score_5m = EXCLUDED.min_momentum_score_5m,
+        require_15m_confirmation = EXCLUDED.require_15m_confirmation,
+        min_risk_reward_ratio = EXCLUDED.min_risk_reward_ratio,
+        min_estimated_net_profit_percent = EXCLUDED.min_estimated_net_profit_percent,
+        require_volume_confirmation = EXCLUDED.require_volume_confirmation,
+        min_volume_ratio = EXCLUDED.min_volume_ratio,
+        max_extension_above_ema21_percent = EXCLUDED.max_extension_above_ema21_percent,
         updated_at = EXCLUDED.updated_at`,
       [
         s.mode,
@@ -678,6 +777,17 @@ class PostgresStorageEngine {
         s.stopLossPercent,
         s.minProfitForTechnicalExitPercent,
         s.maxExitPriceAgeMs,
+        s.minLiquidity24hUsdt ?? 1000000,
+        s.maxAcceptableDataAgeMs ?? 300000,
+        s.minRsi ?? 45,
+        s.maxRsi ?? 72,
+        s.minMomentumScore5m ?? 7.0,
+        s.require15mConfirmation !== false,
+        s.minRiskRewardRatio ?? 1.5,
+        s.minEstimatedNetProfitPercent ?? 0.5,
+        s.requireVolumeConfirmation !== false,
+        s.minVolumeRatio ?? 0.8,
+        s.maxExtensionAboveEma21Percent ?? 3.5,
         Date.now(),
       ]
     ).catch(err => {
@@ -1441,6 +1551,10 @@ class PostgresStorageEngine {
     return Boolean(this.cache.isEmergencyStopped);
   }
 
+  public isEmergencyStopActive(): boolean {
+    return Boolean(this.cache.isEmergencyStopped);
+  }
+
   public setEmergencyStopped(val: boolean): void {
     this.cache.isEmergencyStopped = Boolean(val);
 
@@ -1625,8 +1739,9 @@ class PostgresStorageEngine {
       `INSERT INTO decision_audit_records (
         id, timestamp, symbol, candle_timestamp, timeframe, score_5m,
         score_15m, score_1h, score_4h, rsi, macd_cross, ema_trend,
-        volume_ratio, price, trend, signal_state, decision, rejection_reason, mode, trade_amount
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+        volume_ratio, price, trend, signal_state, decision, rejection_reason, mode, trade_amount,
+        passed_checks, failed_checks, qualified, rank, available_capacity, capacity_reserved, order_submission_result
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
       ON CONFLICT (id) DO NOTHING`,
       [
         fullRecord.id,
@@ -1649,6 +1764,13 @@ class PostgresStorageEngine {
         fullRecord.rejectionReason || null,
         fullRecord.mode,
         fullRecord.tradeAmount,
+        JSON.stringify(fullRecord.passedChecks || []),
+        JSON.stringify(fullRecord.failedChecks || []),
+        fullRecord.qualified || false,
+        fullRecord.rank || null,
+        fullRecord.availableCapacity !== undefined ? fullRecord.availableCapacity : null,
+        fullRecord.capacityReserved || false,
+        fullRecord.orderSubmissionResult || null,
       ]
     ).catch(err => {
       Logger.error('PAPER', 'DATABASE', `Failed to persist decision audit record: ${err.message}`);
@@ -1660,6 +1782,126 @@ class PostgresStorageEngine {
       return this.cache.decisionAudits.filter(d => d.symbol === symbol).slice(0, limit);
     }
     return this.cache.decisionAudits.slice(0, limit);
+  }
+
+  // --- Capacity Reservation & Concurrency Control (Phase 4) ---
+  public getInFlightBuyCount(mode: TradingMode): number {
+    const now = Date.now();
+    let count = 0;
+    for (const key of Object.keys(this.cache.inFlightBuyReservations)) {
+      const res = this.cache.inFlightBuyReservations[key];
+      // Expire reservations older than 45 seconds automatically
+      if (now - res.timestamp > 45000) {
+        delete this.cache.inFlightBuyReservations[key];
+      } else if (res.mode === mode) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  public isSymbolBuyInFlight(symbol: string, mode: TradingMode): boolean {
+    const key = `${mode}:${symbol}`;
+    const res = this.cache.inFlightBuyReservations[key];
+    if (!res) return false;
+    if (Date.now() - res.timestamp > 45000) {
+      delete this.cache.inFlightBuyReservations[key];
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Atomically reserves position capacity and balance headroom.
+   * Returns true if capacity is safely reserved, false if capacity limit reached or position exists.
+   */
+  public reservePositionCapacity(symbol: string, mode: TradingMode, quoteAmount: number): {
+    reserved: boolean;
+    reason?: string;
+    availableCapacity: number;
+    committedPositions: number;
+    maxPositions: number;
+  } {
+    const settings = this.getSettings();
+    const maxPositions = settings.maxOpenPositions;
+    const openPositions = this.getPositions(mode, 'OPEN');
+    
+    // Check if position already open
+    if (openPositions.some(p => p.symbol === symbol)) {
+      return {
+        reserved: false,
+        reason: `Open position already exists for ${symbol}`,
+        availableCapacity: 0,
+        committedPositions: openPositions.length,
+        maxPositions,
+      };
+    }
+
+    const key = `${mode}:${symbol}`;
+    if (this.isSymbolBuyInFlight(symbol, mode)) {
+      return {
+        reserved: false,
+        reason: `In-flight BUY order already reserved for ${symbol}`,
+        availableCapacity: 0,
+        committedPositions: openPositions.length + this.getInFlightBuyCount(mode),
+        maxPositions,
+      };
+    }
+
+    const inFlightCount = this.getInFlightBuyCount(mode);
+    const committedPositions = openPositions.length + inFlightCount;
+    const availableCapacity = Math.max(0, maxPositions - committedPositions);
+
+    if (committedPositions >= maxPositions || availableCapacity <= 0) {
+      return {
+        reserved: false,
+        reason: `Position capacity limit strictly reached (${committedPositions}/${maxPositions} open/in-flight)`,
+        availableCapacity: 0,
+        committedPositions,
+        maxPositions,
+      };
+    }
+
+    // Safely reserve slot
+    this.cache.inFlightBuyReservations[key] = {
+      symbol,
+      mode,
+      quoteAmount,
+      timestamp: Date.now(),
+    };
+
+    return {
+      reserved: true,
+      availableCapacity: availableCapacity - 1,
+      committedPositions: committedPositions + 1,
+      maxPositions,
+    };
+  }
+
+  public releasePositionCapacity(symbol: string, mode: TradingMode): void {
+    const key = `${mode}:${symbol}`;
+    delete this.cache.inFlightBuyReservations[key];
+  }
+
+  public getAvailableCapacity(mode: TradingMode): {
+    openCount: number;
+    inFlightCount: number;
+    totalCommitted: number;
+    maxPositions: number;
+    availableCapacity: number;
+  } {
+    const maxPositions = this.cache.settings.maxOpenPositions;
+    const openCount = this.getPositions(mode, 'OPEN').length;
+    const inFlightCount = this.getInFlightBuyCount(mode);
+    const totalCommitted = openCount + inFlightCount;
+    const availableCapacity = Math.max(0, maxPositions - totalCommitted);
+    return {
+      openCount,
+      inFlightCount,
+      totalCommitted,
+      maxPositions,
+      availableCapacity,
+    };
   }
 
   // --- Engine & Server Telemetry ---

@@ -10,6 +10,7 @@ import {
   Percent,
 } from 'lucide-react';
 import { WalletBalance, Trade, Position } from '../types/index.ts';
+import { safeNum, formatCurrency, formatPercent, formatSignedCurrency } from '../utils/format.ts';
 
 interface PaperWalletViewProps {
   wallet: WalletBalance;
@@ -29,16 +30,16 @@ export const PaperWalletView: React.FC<PaperWalletViewProps> = ({
   const paperTrades = trades.filter(t => t.mode === 'PAPER');
   const paperPositions = positions.filter(p => p.mode === 'PAPER' && p.status === 'OPEN');
 
-  const winCount = paperTrades.filter(t => t.netPnL > 0).length;
-  const lossCount = paperTrades.filter(t => t.netPnL < 0).length;
+  const winCount = paperTrades.filter(t => safeNum(t.netPnL, 0) > 0).length;
+  const lossCount = paperTrades.filter(t => safeNum(t.netPnL, 0) < 0).length;
   const totalTrades = paperTrades.length;
   const winRate = totalTrades > 0 ? ((winCount / totalTrades) * 100).toFixed(1) : '0.0';
 
-  const grossProfit = paperTrades.filter(t => t.netPnL > 0).reduce((s, t) => s + t.netPnL, 0);
-  const grossLoss = Math.abs(paperTrades.filter(t => t.netPnL < 0).reduce((s, t) => s + t.netPnL, 0));
+  const grossProfit = paperTrades.filter(t => safeNum(t.netPnL, 0) > 0).reduce((s, t) => s + safeNum(t.netPnL, 0), 0);
+  const grossLoss = Math.abs(paperTrades.filter(t => safeNum(t.netPnL, 0) < 0).reduce((s, t) => s + safeNum(t.netPnL, 0), 0));
   const profitFactor = grossLoss > 0 ? (grossProfit / grossLoss).toFixed(2) : grossProfit > 0 ? '∞' : '0.00';
 
-  const avgTrade = totalTrades > 0 ? (wallet.realizedPnL / totalTrades).toFixed(2) : '0.00';
+  const avgTrade = totalTrades > 0 ? (safeNum(wallet.realizedPnL, 0) / totalTrades).toFixed(2) : '0.00';
 
   return (
     <div className="space-y-6">
@@ -77,17 +78,17 @@ export const PaperWalletView: React.FC<PaperWalletViewProps> = ({
         <div className="bg-[#0f172a] border border-slate-800 rounded-2xl p-4">
           <span className="text-[11px] text-slate-400 font-medium">Total Equity</span>
           <div className="text-2xl font-black font-mono text-slate-100 mt-1">
-            ${wallet.totalEquity.toFixed(2)}
+            ${formatCurrency(wallet.totalEquity, 2)}
           </div>
           <span className="text-[11px] text-slate-500 font-mono mt-1 block">
-            Starting: ${wallet.startingBalance || 1000} USDT
+            Starting: ${formatCurrency(wallet.startingBalance || 1000, 2)} USDT
           </span>
         </div>
 
         <div className="bg-[#0f172a] border border-slate-800 rounded-2xl p-4">
           <span className="text-[11px] text-slate-400 font-medium">Available USDT</span>
           <div className="text-2xl font-black font-mono text-emerald-400 mt-1">
-            ${wallet.usdtAvailable.toFixed(2)}
+            ${formatCurrency(wallet.usdtAvailable, 2)}
           </div>
           <span className="text-[11px] text-slate-500 font-mono mt-1 block">
             Ready for new BUY allocations
@@ -97,7 +98,7 @@ export const PaperWalletView: React.FC<PaperWalletViewProps> = ({
         <div className="bg-[#0f172a] border border-slate-800 rounded-2xl p-4">
           <span className="text-[11px] text-slate-400 font-medium">Allocated in Assets</span>
           <div className="text-2xl font-black font-mono text-amber-400 mt-1">
-            ${wallet.accountAssetValue.toFixed(2)}
+            ${formatCurrency(wallet.accountAssetValue, 2)}
           </div>
           <span className="text-[11px] text-slate-500 font-mono mt-1 block">
             {paperPositions.length} active positions
@@ -106,11 +107,11 @@ export const PaperWalletView: React.FC<PaperWalletViewProps> = ({
 
         <div className="bg-[#0f172a] border border-slate-800 rounded-2xl p-4">
           <span className="text-[11px] text-slate-400 font-medium">Total Realized PnL</span>
-          <div className={`text-2xl font-black font-mono mt-1 ${wallet.realizedPnL >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-            {wallet.realizedPnL >= 0 ? '+' : ''}${wallet.realizedPnL.toFixed(2)}
+          <div className={`text-2xl font-black font-mono mt-1 ${safeNum(wallet.realizedPnL, 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+            {formatSignedCurrency(wallet.realizedPnL, 2)}
           </div>
           <span className="text-[11px] text-slate-500 font-mono mt-1 block">
-            Fees: ${wallet.totalFeesPaid.toFixed(2)}
+            Fees: ${formatCurrency(wallet.totalFeesPaid, 2)}
           </span>
         </div>
       </div>
@@ -131,7 +132,7 @@ export const PaperWalletView: React.FC<PaperWalletViewProps> = ({
           <div className="p-3 bg-slate-900/80 rounded-xl border border-slate-800">
             <span className="text-slate-400">Profit Factor:</span>
             <div className="text-base font-bold text-slate-100 mt-0.5">{profitFactor}</div>
-            <span className="text-[10px] text-slate-500">Gross: +${grossProfit.toFixed(2)} / -${grossLoss.toFixed(2)}</span>
+            <span className="text-[10px] text-slate-500">Gross: +${formatCurrency(grossProfit, 2)} / -${formatCurrency(grossLoss, 2)}</span>
           </div>
           <div className="p-3 bg-slate-900/80 rounded-xl border border-slate-800">
             <span className="text-slate-400">Average Trade:</span>

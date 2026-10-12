@@ -20,7 +20,11 @@ import { SafetyGate } from './safety-gate.ts';
 import { PaperTradingExecutor, RealBinanceTradingExecutor, TradingExecutor } from './trading-executor.ts';
 import { Logger } from './logger.ts';
 import { evaluateExitDecision } from './exit-decision-engine.ts';
-import { evaluateEntryEligibility } from './entry-decision-engine.ts';
+import {
+  evaluateEntryEligibility,
+  BuyAuthorizationService,
+} from './entry-decision-engine.ts';
+import { CandidateRankInfo, BuyAuthorizationResult } from '../types/index.ts';
 
 type StateUpdateListener = (data: { type: string; payload: any }) => void;
 
@@ -404,13 +408,20 @@ export class AutoTradingEngine {
           else if (strategyState === 'WEAKENING') weakeningCount++;
           else neutralCount++;
 
-          // 3. Process automated trading decisions if enabled
-          if (settings.autoTrading && !this.isEmergencyStopped) {
-            await this.processTradingSignal(analysis, prevAnalysis?.strategyState, settings, currentMode, closedCandleCloseTime);
+          // Open positions are processed for exit in real time
+          const openPosition = Storage.getOpenPositionForSymbol(symbol, currentMode);
+          if (openPosition && openPosition.status === 'OPEN' && settings.autoTrading && !this.isEmergencyStopped) {
+            Storage.updateEngineTelemetry({ lastExitEvaluationAt: Date.now() });
+            await this.evaluateAndProcessPositionExit(openPosition, analysis, settings, currentMode);
           }
         } catch (symErr: any) {
           // continue with next symbol
         }
+      }
+
+      // 3. Process candidate evaluation, strict authorization, and ranking (Phases 2, 3, 4, 5, 7, 8)
+      if (settings.autoTrading && !this.isEmergencyStopped) {
+        await this.processScanCandidates(results, settings, currentMode);
       }
 
       // 4. Ensure all active open positions are audited every cycle even if not in the volume ticker list
@@ -492,6 +503,243 @@ export class AutoTradingEngine {
     }
   }
 
+  /**
+   * PHASES 2, 3, 4, 5, 7, 8:
+   * Evaluate all candidates, strictly authorize each, rank qualified candidates,
+   * reserve capacity up to maxOpenPositions, and execute authorized BUYs in rank order.
+   */
+  public async processScanCandidates(
+    analyses: TechnicalAnalysis[],
+    settings: TradingSettings,
+    mode: TradingMode
+  ): Promise<void> {
+    if (this.isEmergencyStopped || !settings.autoTrading) return;
+
+    Storage.updateEngineTelemetry({ lastEntryEvaluationAt: Date.now() });
+
+    // 1. Gather all candidates that have bullish signals and no existing position
+    const candidateAuthorizations: BuyAuthorizationResult[] = [];
+    const openPositions = Storage.getPositions(mode, 'OPEN');
+    const openPositionSymbols = new Set(openPositions.map(p => p.symbol));
+    const wallet = Storage.getWallet(mode);
+
+    for (const analysis of analyses) {
+      const symbol = analysis.symbol;
+      
+      // Skip if position already open (exit engine handles open positions)
+      if (openPositionSymbols.has(symbol)) {
+        continue;
+      }
+
+      // Check candle deduplication: if this closed 5m candle was already evaluated for this symbol, skip
+      const lastEvaluatedCandleTime = Storage.getLastEvaluatedCandle(symbol);
+      const candleCloseTime = analysis.timestamp;
+      if (lastEvaluatedCandleTime && candleCloseTime <= lastEvaluatedCandleTime) {
+        continue;
+      }
+
+      let symbolFilter;
+      try {
+        symbolFilter = await this.binance.getSymbolFilters(symbol);
+      } catch {}
+
+      // Authoritative deterministic BUY authorization evaluation
+      const authResult = await BuyAuthorizationService.authorizeBuy({
+        symbol,
+        mode,
+        analysis,
+        settings,
+        wallet,
+        openPositions,
+        symbolFilter,
+        closedCandleCloseTime: candleCloseTime,
+        isEmergencyStopped: this.isEmergencyStopped,
+      });
+
+      candidateAuthorizations.push(authResult);
+
+      // Save decision audit for rejected candidates immediately
+      if (!authResult.authorized) {
+        Storage.setLastEvaluatedCandle(symbol, candleCloseTime);
+        Storage.saveDecisionAudit({
+          timestamp: authResult.evaluatedAt,
+          symbol,
+          candleTimestamp: authResult.marketDataTimestamp,
+          timeframe: '5m',
+          score5m: authResult.technicalScore,
+          score15m: authResult.confirmationScore15m,
+          rsi: analysis.indicators?.rsi14?.slice(-1)[0],
+          price: authResult.entryPrice,
+          trend: analysis.marketStructure?.trend || 'NEUTRAL',
+          signalState: authResult.strategyState,
+          decision: 'REJECTED',
+          rejectionReason: authResult.rejectionReasons.join('; '),
+          mode,
+          tradeAmount: settings.fixedTradeAmount,
+          passedChecks: authResult.passedChecks,
+          failedChecks: authResult.failedChecks,
+          qualified: false,
+          orderSubmissionResult: 'REJECTED',
+        });
+      }
+    }
+
+    // 2. Rank ONLY candidates that passed every single mandatory check (Phase 5)
+    const rankedCandidates = BuyAuthorizationService.rankQualifiedCandidates(candidateAuthorizations);
+
+    if (rankedCandidates.length === 0) {
+      return;
+    }
+
+    Logger.info(
+      mode,
+      'STRATEGY',
+      `Identified ${rankedCandidates.length} fully qualified candidate(s) from scan universe: ${rankedCandidates.map(c => `${c.symbol} (Rank #${c.rank}, Score ${c.authorization.technicalScore})`).join(', ')}`
+    );
+
+    // 3. Check position capacity limit (Phase 4):
+    // "maxOpenPositions" is exclusively a hard upper bound.
+    // Buy only up to remaining capacity. Unused capacity remains unused if fewer candidates qualify.
+    for (const candidate of rankedCandidates) {
+      const auth = candidate.authorization;
+      const symbol = candidate.symbol;
+      const candleCloseTime = auth.marketDataTimestamp;
+
+      // Safe concurrency reservation: reserve position capacity & balance headroom
+      const reservation = Storage.reservePositionCapacity(symbol, mode, settings.fixedTradeAmount);
+      if (!reservation.reserved) {
+        Logger.info(
+          mode,
+          'STRATEGY',
+          `Qualified candidate ${symbol} (Rank #${candidate.rank}) waiting for capacity: ${reservation.reason}`
+        );
+        Storage.saveDecisionAudit({
+          timestamp: Date.now(),
+          symbol,
+          candleTimestamp: candleCloseTime,
+          timeframe: '5m',
+          score5m: auth.technicalScore,
+          score15m: auth.confirmationScore15m,
+          price: auth.entryPrice,
+          trend: 'BULLISH',
+          signalState: auth.strategyState,
+          decision: 'HOLD',
+          rejectionReason: reservation.reason,
+          mode,
+          tradeAmount: settings.fixedTradeAmount,
+          passedChecks: auth.passedChecks,
+          failedChecks: ['CAPACITY_WAITING'],
+          qualified: true,
+          rank: candidate.rank,
+          availableCapacity: reservation.availableCapacity,
+          capacityReserved: false,
+          orderSubmissionResult: 'NOT_SUBMITTED',
+        });
+        continue;
+      }
+
+      // 4. Execute authorized BUY
+      try {
+        await this.executeAuthorizedBuy(candidate, settings, mode);
+      } finally {
+        Storage.releasePositionCapacity(symbol, mode);
+      }
+    }
+  }
+
+  private async executeAuthorizedBuy(
+    candidate: CandidateRankInfo,
+    settings: TradingSettings,
+    mode: TradingMode
+  ): Promise<void> {
+    const { symbol, authorization: auth, rank } = candidate;
+    const closedCandleTime = auth.marketDataTimestamp;
+    const fixedAmount = settings.fixedTradeAmount;
+    const executor = this.getExecutor(mode);
+
+    // Deterministic & idempotent clientOrderId format: BOT_<MODE>_<SYMBOL>_<CANDLE_TIME>_BUY
+    const clientOrderId = `BOT_${mode}_${symbol}_${closedCandleTime}_BUY`.replace(/[^a-zA-Z0-9_]/g, '').slice(0, 36);
+    const orderRequest = {
+      symbol,
+      side: 'BUY' as const,
+      quoteAmount: fixedAmount,
+      reason: `Rank #${rank} Authorized Entry (Score: ${auth.technicalScore})`,
+      strategyState: auth.strategyState,
+      technicalScore: auth.technicalScore,
+      clientOrderId,
+    };
+
+    Logger.info(
+      mode,
+      'STRATEGY',
+      `BUY AUTHORIZED: ${symbol} (Rank #${rank}, ${auth.strategyState}) | Fixed Amount: ${fixedAmount} USDT | Score: ${auth.technicalScore} | Decision: ${auth.decisionId}`
+    );
+
+    let submissionResult: 'FILLED' | 'FAILED' | 'REJECTED' = 'FAILED';
+    let execError: string | null = null;
+
+    try {
+      const execResult = await executor.buy(orderRequest);
+      Storage.setLastEvaluatedCandle(symbol, closedCandleTime);
+
+      submissionResult = execResult.success ? 'FILLED' : 'FAILED';
+      execError = execResult.success ? null : (execResult.error || 'Execution failed');
+
+      Storage.saveDecisionAudit({
+        timestamp: Date.now(),
+        symbol,
+        candleTimestamp: closedCandleTime,
+        timeframe: '5m',
+        score5m: auth.technicalScore,
+        score15m: auth.confirmationScore15m,
+        price: auth.entryPrice,
+        trend: 'BULLISH',
+        signalState: auth.strategyState,
+        decision: execResult.success ? 'BUY' : 'REJECTED',
+        rejectionReason: execResult.success ? null : execResult.error,
+        mode,
+        tradeAmount: fixedAmount,
+        passedChecks: auth.passedChecks,
+        failedChecks: auth.failedChecks,
+        qualified: true,
+        rank,
+        availableCapacity: Storage.getAvailableCapacity(mode).availableCapacity,
+        capacityReserved: true,
+        orderSubmissionResult: submissionResult,
+      });
+
+      if (execResult.success) {
+        this.broadcast('order_executed', { mode, order: execResult.order, position: execResult.position });
+      }
+    } catch (err: any) {
+      execError = err.message;
+      submissionResult = 'FAILED';
+      Logger.error(mode, 'ORDER', `Execution of BUY failed for ${symbol}: ${err.message}`);
+
+      Storage.saveDecisionAudit({
+        timestamp: Date.now(),
+        symbol,
+        candleTimestamp: closedCandleTime,
+        timeframe: '5m',
+        score5m: auth.technicalScore,
+        score15m: auth.confirmationScore15m,
+        price: auth.entryPrice,
+        trend: 'BULLISH',
+        signalState: auth.strategyState,
+        decision: 'REJECTED',
+        rejectionReason: `EXECUTION_FAILED: ${err.message}`,
+        mode,
+        tradeAmount: fixedAmount,
+        passedChecks: auth.passedChecks,
+        failedChecks: ['ORDER_EXECUTION'],
+        qualified: true,
+        rank,
+        capacityReserved: true,
+        orderSubmissionResult: 'FAILED',
+      });
+    }
+  }
+
   private async processTradingSignal(
     analysis: TechnicalAnalysis,
     previousState: StrategyState | undefined,
@@ -500,11 +748,7 @@ export class AutoTradingEngine {
     closedCandleTime: number
   ): Promise<void> {
     const symbol = analysis.symbol;
-    const executor = this.getExecutor(mode);
     const openPosition = Storage.getOpenPositionForSymbol(symbol, mode);
-    const lockKey = `${mode}:${symbol}`;
-    const isPendingEntry = this.pendingBuyLocks.has(lockKey);
-    const cooldownCheck = Storage.isSymbolInCooldown(symbol, mode);
 
     // -------------------------------------------------------------
     // 1. POSITION MANAGEMENT & EXIT ARCHITECTURE (IF POSITION OPEN)
@@ -528,168 +772,102 @@ export class AutoTradingEngine {
     Storage.updateEngineTelemetry({ lastEntryEvaluationAt: Date.now() });
 
     // -------------------------------------------------------------
-    // 3. CENTRALIZED ENTRY DECISION EVALUATION (IF NO POSITION)
+    // 3. AUTHORITATIVE DETERMINISTIC BUY AUTHORIZATION SERVICE
+    // All automatic entry orders pass through BuyAuthorizationService
     // -------------------------------------------------------------
-    const entryDecision = evaluateEntryEligibility({
+    let symbolFilter;
+    try {
+      symbolFilter = await this.binance.getSymbolFilters(symbol);
+    } catch {}
+
+    const wallet = Storage.getWallet(mode);
+    const openPositions = Storage.getPositions(mode, 'OPEN');
+
+    const authResult = await BuyAuthorizationService.authorizeBuy({
       symbol,
-      strategyState: analysis.strategyState,
-      technicalScore: analysis.score,
-      hasOpenPosition: !!openPosition,
-      isPendingEntry,
-      isEmergencyStopped: this.isEmergencyStopped,
-      isInCooldown: cooldownCheck.inCooldown,
+      mode,
+      analysis,
       settings,
+      wallet,
+      openPositions,
+      symbolFilter,
+      closedCandleCloseTime: closedCandleTime,
+      isEmergencyStopped: this.isEmergencyStopped,
     });
 
-    if (!entryDecision.eligible) {
-      // Mark closed candle as evaluated so we don't spam checks for neutral/weakening
+    if (!authResult.authorized) {
       Storage.setLastEvaluatedCandle(symbol, closedCandleTime);
-      if (analysis.strategyState === 'PRE_BULLISH' || analysis.strategyState === 'STRONG_BULLISH') {
-        Logger.info(
-          mode,
-          'STRATEGY',
-          `Entry check for ${symbol}: ${entryDecision.reason}`,
-          {
-            symbol,
-            strategyState: analysis.strategyState,
-            technicalScore: analysis.score,
-          }
-        );
-      }
+      Storage.saveDecisionAudit({
+        timestamp: authResult.evaluatedAt,
+        symbol,
+        candleTimestamp: authResult.marketDataTimestamp,
+        timeframe: '5m',
+        score5m: authResult.technicalScore,
+        score15m: authResult.confirmationScore15m,
+        rsi: analysis.indicators?.rsi14?.slice(-1)[0],
+        price: authResult.entryPrice,
+        trend: analysis.marketStructure?.trend || 'NEUTRAL',
+        signalState: authResult.strategyState,
+        decision: 'REJECTED',
+        rejectionReason: authResult.rejectionReasons.join('; '),
+        mode,
+        tradeAmount: settings.fixedTradeAmount,
+        passedChecks: authResult.passedChecks,
+        failedChecks: authResult.failedChecks,
+        qualified: false,
+        orderSubmissionResult: 'REJECTED',
+      });
       return;
     }
 
-    // Acquire atomic per-symbol entry lock to prevent duplicate BUY in flight
-    this.pendingBuyLocks.add(lockKey);
-
-    try {
-      const fixedAmount = settings.fixedTradeAmount;
-      const wallet = Storage.getWallet(mode);
-      const openPositions = Storage.getPositions(mode, 'OPEN');
-
-      // Strict Binance Spot Symbol Validation: no legacy aliases or non-tradable pairs
-      const strictValidation = await BinanceSymbolValidator.getInstance().validateExactSpotUsdtSymbol(symbol);
-      if (!strictValidation.tradable) {
-        Logger.warn(mode, 'STRATEGY', `AUTO BUY BLOCKED: ${symbol} is not an exact current Binance Spot USDT symbol (${strictValidation.reason}).`);
-        Storage.setLastEvaluatedCandle(symbol, closedCandleTime);
-        Storage.saveDecisionAudit({
-          timestamp: Date.now(),
-          symbol,
-          candleTimestamp: closedCandleTime,
-          timeframe: '5m',
-          score5m: analysis.score,
-          price: analysis.price,
-          trend: analysis.marketStructure?.trend || 'NEUTRAL',
-          signalState: entryDecision.strategyState,
-          decision: 'REJECTED',
-          rejectionReason: `SYMBOL_NOT_TRADABLE: ${strictValidation.reason}`,
-          mode,
-          tradeAmount: fixedAmount,
-        });
-        return;
-      }
-
-      const symbolFilter = await this.binance.getSymbolFilters(symbol);
-
-      // Deterministic & idempotent clientOrderId format: BOT_<MODE>_<SYMBOL>_<CANDLE_TIME>_BUY
-      const clientOrderId = `BOT_${mode}_${symbol}_${closedCandleTime}_BUY`.replace(/[^a-zA-Z0-9_]/g, '').slice(0, 36);
-      const orderRequest = {
-        symbol,
-        side: 'BUY' as const,
-        quoteAmount: fixedAmount, // Strict invariant: exactly fixed trade amount
-        reason: entryDecision.reason,
-        strategyState: entryDecision.strategyState,
-        technicalScore: entryDecision.technicalScore,
-        clientOrderId,
-      };
-
-      const safetyResult = SafetyGate.validateBuy(
-        orderRequest,
-        mode,
-        settings,
-        wallet,
-        openPositions,
-        symbolFilter,
-        analysis.price,
-        this.isEmergencyStopped
-      );
-
-      if (!safetyResult.allowed) {
-        Logger.warn(
-          mode,
-          'STRATEGY',
-          `BUY Signal blocked by Safety Gate for ${symbol}: ${safetyResult.reason}`,
-          {
-            symbol,
-            strategyState: entryDecision.strategyState,
-            technicalScore: entryDecision.technicalScore,
-          }
-        );
-        Storage.setLastEvaluatedCandle(symbol, closedCandleTime);
-        Storage.saveDecisionAudit({
-          timestamp: Date.now(),
-          symbol,
-          candleTimestamp: closedCandleTime,
-          timeframe: '5m',
-          score5m: analysis.score,
-          score15m: analysis.multiTimeframe?.['15m']?.score,
-          score1h: analysis.multiTimeframe?.['1h']?.score,
-          score4h: analysis.multiTimeframe?.['4h']?.score,
-          price: analysis.price,
-          trend: analysis.marketStructure?.trend || 'NEUTRAL',
-          signalState: entryDecision.strategyState,
-          decision: 'REJECTED',
-          rejectionReason: safetyResult.reason,
-          mode,
-          tradeAmount: fixedAmount,
-        });
-        return;
-      }
-
+    // -------------------------------------------------------------
+    // 4. CAPACITY RESERVATION & EXECUTION
+    // "maxOpenPositions" is exclusively a hard upper bound.
+    // -------------------------------------------------------------
+    const reservation = Storage.reservePositionCapacity(symbol, mode, settings.fixedTradeAmount);
+    if (!reservation.reserved) {
       Logger.info(
         mode,
         'STRATEGY',
-        `BUY SIGNAL TRIGGERED: ${symbol} (${entryDecision.strategyState}) | Fixed Amount: ${fixedAmount} USDT | Score: ${entryDecision.technicalScore} | Closed Candle: ${new Date(closedCandleTime).toISOString()}`,
-        {
-          symbol,
-          strategyState: entryDecision.strategyState,
-          technicalScore: entryDecision.technicalScore,
-        }
+        `Qualified candidate ${symbol} waiting for capacity: ${reservation.reason}`
       );
-
-      const execResult = await executor.buy(orderRequest);
-      Storage.setLastEvaluatedCandle(symbol, closedCandleTime);
-
       Storage.saveDecisionAudit({
         timestamp: Date.now(),
         symbol,
         candleTimestamp: closedCandleTime,
         timeframe: '5m',
-        score5m: analysis.score,
-        score15m: analysis.multiTimeframe?.['15m']?.score,
-        score1h: analysis.multiTimeframe?.['1h']?.score,
-        score4h: analysis.multiTimeframe?.['4h']?.score,
-        price: analysis.price,
-        trend: analysis.marketStructure?.trend || 'NEUTRAL',
-        signalState: entryDecision.strategyState,
-        decision: execResult.success ? 'BUY' : 'REJECTED',
-        rejectionReason: execResult.success ? null : execResult.error,
+        score5m: authResult.technicalScore,
+        score15m: authResult.confirmationScore15m,
+        price: authResult.entryPrice,
+        trend: 'BULLISH',
+        signalState: authResult.strategyState,
+        decision: 'HOLD',
+        rejectionReason: reservation.reason,
         mode,
-        tradeAmount: fixedAmount,
+        tradeAmount: settings.fixedTradeAmount,
+        passedChecks: authResult.passedChecks,
+        failedChecks: ['CAPACITY_WAITING'],
+        qualified: true,
+        rank: 1,
+        availableCapacity: reservation.availableCapacity,
+        capacityReserved: false,
+        orderSubmissionResult: 'NOT_SUBMITTED',
       });
+      return;
+    }
 
-      if (execResult.success) {
-        this.broadcast('order_executed', { mode, order: execResult.order, position: execResult.position });
-      }
-    } catch (err: any) {
-      Logger.error(mode, 'ORDER', `Execution of BUY failed for ${symbol}: ${err.message}`, {
-        symbol,
-        strategyState: entryDecision.strategyState,
-        technicalScore: entryDecision.technicalScore,
-      });
+    try {
+      await this.executeAuthorizedBuy(
+        {
+          symbol,
+          authorization: authResult,
+          rank: 1,
+        },
+        settings,
+        mode
+      );
     } finally {
-      // Release atomic lock
-      this.pendingBuyLocks.delete(lockKey);
+      Storage.releasePositionCapacity(symbol, mode);
     }
   }
 

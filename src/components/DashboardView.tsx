@@ -28,6 +28,7 @@ import {
   SpotMarketStatusData,
   ServerEngineStatus,
 } from '../types/index.ts';
+import { safeNum, formatCurrency, formatPercent, formatSignedCurrency } from '../utils/format.ts';
 
 interface DashboardViewProps {
   mode: TradingMode;
@@ -142,7 +143,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               </span>
             </div>
             <p className="text-xs text-slate-400 mt-0.5">
-              Strategy Sizing Model: <strong className="text-amber-400 font-mono">{fixedTradeAmount.toFixed(2)} USDT</strong> per new trade. Paper & Real modes remain completely isolated.
+              Strategy Sizing Model: <strong className="text-amber-400 font-mono">{formatCurrency(fixedTradeAmount, 2)} USDT</strong> per new trade. Paper & Real modes remain completely isolated.
             </p>
           </div>
         </div>
@@ -176,10 +177,10 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         <div className="bg-[#0f172a] border border-slate-800 rounded-2xl p-4">
           <span className="text-[11px] text-slate-400 font-medium">Total Equity</span>
           <div className="text-xl sm:text-2xl font-black font-mono text-slate-100 mt-1">
-            ${(wallet.totalEquity ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            ${safeNum(wallet.totalEquity, 1000).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
           </div>
           <div className="text-[11px] text-slate-500 mt-1 font-mono">
-            Avail: ${(wallet.usdtAvailable ?? 0).toFixed(2)}
+            Avail: ${formatCurrency(wallet.usdtAvailable, 2)}
           </div>
         </div>
 
@@ -187,18 +188,18 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         <div className="bg-[#0f172a] border border-slate-800 rounded-2xl p-4">
           <span className="text-[11px] text-slate-400 font-medium">Available USDT</span>
           <div className="text-xl sm:text-2xl font-black font-mono text-emerald-400 mt-1">
-            ${(wallet.usdtAvailable ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            ${safeNum(wallet.usdtAvailable, 1000).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
           </div>
           <div className="text-[11px] text-slate-500 mt-1 font-mono">
-            Allocated: ${(wallet.accountAssetValue ?? 0).toFixed(2)}
+            Allocated: ${formatCurrency(wallet.accountAssetValue, 2)}
           </div>
         </div>
 
         {/* Unrealized PnL */}
         <div className="bg-[#0f172a] border border-slate-800 rounded-2xl p-4">
           <span className="text-[11px] text-slate-400 font-medium">Unrealized PnL</span>
-          <div className={`text-xl sm:text-2xl font-black font-mono mt-1 ${(wallet.unrealizedPnL ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-            {(wallet.unrealizedPnL ?? 0) >= 0 ? '+' : ''}${(wallet.unrealizedPnL ?? 0).toFixed(2)}
+          <div className={`text-xl sm:text-2xl font-black font-mono mt-1 ${safeNum(wallet.unrealizedPnL, 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+            {formatSignedCurrency(wallet.unrealizedPnL, 2)}
           </div>
           <div className="text-[11px] text-slate-500 mt-1">
             Across {activePositions.length} active positions
@@ -208,11 +209,11 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         {/* Realized PnL */}
         <div className="bg-[#0f172a] border border-slate-800 rounded-2xl p-4">
           <span className="text-[11px] text-slate-400 font-medium">Realized PnL</span>
-          <div className={`text-xl sm:text-2xl font-black font-mono mt-1 ${(wallet.realizedPnL ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-            {(wallet.realizedPnL ?? 0) >= 0 ? '+' : ''}${(wallet.realizedPnL ?? 0).toFixed(2)}
+          <div className={`text-xl sm:text-2xl font-black font-mono mt-1 ${safeNum(wallet.realizedPnL, 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+            {formatSignedCurrency(wallet.realizedPnL, 2)}
           </div>
           <div className="text-[11px] text-slate-500 mt-1">
-            Fees paid: ${(wallet.totalFeesPaid ?? 0).toFixed(2)}
+            Fees paid: ${formatCurrency(wallet.totalFeesPaid, 2)}
           </div>
         </div>
 
@@ -450,7 +451,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           <div className="bg-slate-900/60 border border-slate-800/80 rounded-xl p-3 text-xs text-slate-400 space-y-1.5">
             <div className="flex justify-between font-mono">
               <span>Strategy Invariant:</span>
-              <span className="text-amber-400 font-bold">{(fixedTradeAmount ?? 0).toFixed(2)} USDT per BUY</span>
+              <span className="text-amber-400 font-bold">{formatCurrency(fixedTradeAmount, 2)} USDT per BUY</span>
             </div>
             <div className="flex justify-between font-mono">
               <span>Max Simultaneous Positions:</span>
@@ -495,8 +496,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   </div>
                   <div className="flex items-center justify-between text-xs font-mono text-slate-400">
                     <span>${item.price ?? 0}</span>
-                    <span className={(item.priceChange24h ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
-                      {(item.priceChange24h ?? 0) >= 0 ? '+' : ''}{(item.priceChange24h ?? 0).toFixed(2)}%
+                    <span className={safeNum(item.priceChange24h, 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
+                      {formatPercent(item.priceChange24h, 2, true)}
                     </span>
                   </div>
                   <div className="text-[11px] text-slate-500 mt-2 line-clamp-1">
@@ -523,7 +524,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
         {activePositions.length === 0 ? (
           <div className="py-8 text-center text-xs text-slate-500 bg-slate-900/40 rounded-xl border border-dashed border-slate-800">
-            No active positions open in {mode} mode. When a symbol triggers PRE_BULLISH and passes the Safety Gate, a fixed {(fixedTradeAmount ?? 0).toFixed(2)} USDT position will open.
+            No active positions open in {mode} mode. When a symbol triggers PRE_BULLISH and passes the Safety Gate, a fixed {formatCurrency(fixedTradeAmount, 2)} USDT position will open.
           </div>
         ) : (
           <div className="overflow-x-auto">
@@ -542,13 +543,13 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               </thead>
               <tbody className="divide-y divide-slate-800/60 font-mono">
                 {activePositions.map(pos => {
-                  const netPnL = pos.estimatedNetPnL ?? pos.unrealizedPnL ?? 0;
-                  const netPnLPercent = pos.estimatedNetPnLPercent ?? pos.unrealizedPnLPercent ?? 0;
+                  const netPnL = safeNum(pos.estimatedNetPnL ?? pos.unrealizedPnL, 0);
+                  const netPnLPercent = pos.estimatedNetPnLPercent ?? pos.unrealizedPnLPercent;
                   return (
                     <tr key={pos.id} className="hover:bg-slate-900/40 transition-colors">
                       <td className="py-3 px-3 font-bold text-slate-100">{pos.symbol}</td>
                       <td className="py-3 px-3">
-                        <div className="text-amber-400">{pos.entryQuoteAmount ?? 0} USDT</div>
+                        <div className="text-amber-400">{formatCurrency(pos.entryQuoteAmount, 2)} USDT</div>
                         <div className="text-[10px] text-slate-500">Qty: {pos.remainingQuantity ?? 0}</div>
                       </td>
                       <td className="py-3 px-3 text-slate-300">${pos.entryPrice ?? 0}</td>
@@ -558,7 +559,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                         <div><span className="text-slate-500">TP:</span> <span className="text-emerald-400">${pos.takeProfitPrice ?? '-'}</span> | <span className="text-slate-500">SL:</span> <span className="text-rose-400">${pos.stopLossPrice ?? '-'}</span></div>
                       </td>
                       <td className={`py-3 px-3 font-bold ${netPnL >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                        {netPnL >= 0 ? '+' : ''}${netPnL.toFixed(2)} ({netPnLPercent >= 0 ? '+' : ''}{netPnLPercent}%)
+                        {formatSignedCurrency(netPnL, 2)} ({formatPercent(netPnLPercent, 2, true)})
                       </td>
                       <td className="py-3 px-3">
                         <div className="flex items-center gap-1.5">

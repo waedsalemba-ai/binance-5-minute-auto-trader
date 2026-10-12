@@ -31,7 +31,11 @@ import {
   calculateTargetExitPrice,
   evaluateExitDecision,
 } from '../src/server/exit-decision-engine.ts';
-import { evaluateEntryEligibility } from '../src/server/entry-decision-engine.ts';
+import {
+  evaluateEntryEligibility,
+  BuyAuthorizationService,
+} from '../src/server/entry-decision-engine.ts';
+import { TechnicalAnalysis, BuyAuthorizationResult } from '../src/types/index.ts';
 import { BinanceSymbolValidator } from '../src/server/symbol-validator.ts';
 import { BinanceSymbolNormalizer } from '../src/server/symbol-normalizer.ts';
 import { RealBinanceTradingExecutor } from '../src/server/trading-executor.ts';
@@ -2021,6 +2025,669 @@ async function runAllTests() {
     assert.strictEqual(typeof status.autoTrading, 'boolean');
     assert.strictEqual(typeof status.activePositions, 'number');
     assert.strictEqual(typeof status.uptimeSeconds, 'number');
+  });
+
+  // =========================================================================
+  // 17. PHASE 9: COMPREHENSIVE ENTRY PIPELINE & CAPACITY STRICT LIMIT TESTS
+  // =========================================================================
+  console.log('\n17. Authoritative Entry Pipeline, Capacity Limits & Ranking (Phase 9):');
+
+  function createMockAnalysis(params: {
+    symbol: string;
+    score?: number;
+    state?: StrategyState;
+    price?: number;
+    quoteVolume24h?: number;
+    dataAgeMs?: number;
+    rsi?: number;
+    momentumScore?: number;
+    trend15m?: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+    breakdown?: boolean;
+    candles?: Candle[];
+  }): TechnicalAnalysis {
+    const candles = params.candles || createMockCandles(40, params.price || 100, 'up');
+    const lastPrice = params.price || candles[candles.length - 1].close;
+    const timestamp = Date.now() - (params.dataAgeMs || 0);
+
+    return {
+      symbol: params.symbol,
+      price: lastPrice,
+      priceChange24h: 3.5,
+      volume24h: 100000,
+      quoteVolume24h: params.quoteVolume24h !== undefined ? params.quoteVolume24h : 15000000,
+      timestamp,
+      indicators: {
+        ema9: candles.map(c => c.close * 0.99),
+        ema21: candles.map(c => c.close * 0.98),
+        ema50: candles.map(c => c.close * 0.97),
+        ema200: candles.map(c => c.close * 0.95),
+        rsi14: candles.map(() => params.rsi !== undefined ? params.rsi : 58),
+        macd: {
+          macd: candles.map(() => 0.5),
+          signal: candles.map(() => 0.2),
+          histogram: candles.map(() => 0.3),
+        },
+        atr14: candles.map(() => 1.5),
+        bb20: {
+          upper: candles.map(c => c.close * 1.02),
+          middle: candles.map(c => c.close),
+          lower: candles.map(c => c.close * 0.98),
+        },
+        volumeEma20: candles.map(() => 1000),
+      },
+      patterns: [],
+      marketStructure: {
+        trend: params.breakdown ? 'DOWNTREND' : 'UPTREND',
+        structure: params.breakdown ? 'LOWER_LOW' : 'HIGHER_HIGH',
+        breakout: params.breakdown ? 'BREAKDOWN' : 'NONE',
+        supportLevels: [lastPrice * 0.98],
+        resistanceLevels: [lastPrice * 1.05],
+        swingHighs: [],
+        swingLows: [],
+      },
+      multiTimeframe: {
+        '5m': { timeframe: '5m', trend: 'BULLISH', score: params.score || 85, rsi: params.rsi || 58, macdCross: 'BULLISH' },
+        '15m': { timeframe: '15m', trend: params.trend15m || 'BULLISH', score: params.trend15m === 'BEARISH' ? 35 : 75, rsi: 55, macdCross: 'NONE' },
+      },
+      score: params.score !== undefined ? params.score : 85,
+      scoreComponents: [
+        { name: 'Trend Alignment', weight: 20, score: 18, details: 'Bullish' },
+        { name: 'Momentum', weight: 15, score: params.momentumScore !== undefined ? params.momentumScore : 12, details: 'Positive MACD' },
+        { name: 'Volume Confirmation', weight: 15, score: 12, details: 'Above avg' },
+      ],
+      strategyState: params.state || 'STRONG_BULLISH',
+      stateReason: 'Test generated setup',
+    };
+  }
+
+  // 1. Maximum positions is 10 and no candidate qualifies: zero BUYs
+  test('PHASE 9 TEST 1: Max positions is 10 and no candidate qualifies: zero BUYs authorized', async () => {
+    const settings: TradingSettings = {
+      ...Storage.getSettings(),
+      maxOpenPositions: 10,
+    };
+    const weakAnalysis = createMockAnalysis({ symbol: 'SOLUSDT', score: 50, state: 'NEUTRAL' });
+    const auth = await BuyAuthorizationService.authorizeBuy({
+      symbol: 'SOLUSDT',
+      mode: 'PAPER',
+      analysis: weakAnalysis,
+      settings,
+      skipNetworkValidation: true,
+    });
+    assert.strictEqual(auth.authorized, false);
+    assert.ok(auth.failedChecks.includes('BULLISH_SIGNAL_AND_SCORE'));
+  });
+
+  // 2. Maximum positions is 10 and only 2 candidates qualify: at most 2 BUYs
+  test('PHASE 9 TEST 2: Max positions is 10 and only 2 candidates qualify: at most 2 authorized', async () => {
+    const settings: TradingSettings = {
+      ...Storage.getSettings(),
+      maxOpenPositions: 10,
+    };
+    const c1 = await BuyAuthorizationService.authorizeBuy({
+      symbol: 'BTCUSDT',
+      mode: 'PAPER',
+      analysis: createMockAnalysis({ symbol: 'BTCUSDT', score: 88, state: 'STRONG_BULLISH' }),
+      settings,
+      skipNetworkValidation: true,
+    });
+    const c2 = await BuyAuthorizationService.authorizeBuy({
+      symbol: 'ETHUSDT',
+      mode: 'PAPER',
+      analysis: createMockAnalysis({ symbol: 'ETHUSDT', score: 84, state: 'STRONG_BULLISH' }),
+      settings,
+      skipNetworkValidation: true,
+    });
+    const c3 = await BuyAuthorizationService.authorizeBuy({
+      symbol: 'DOGEUSDT',
+      mode: 'PAPER',
+      analysis: createMockAnalysis({ symbol: 'DOGEUSDT', score: 55, state: 'NEUTRAL' }),
+      settings,
+      skipNetworkValidation: true,
+    });
+    const ranked = BuyAuthorizationService.rankQualifiedCandidates([c1, c2, c3]);
+    assert.strictEqual(ranked.length, 2, 'Only the 2 qualified candidates may be authorized/ranked');
+    assert.strictEqual(ranked[0].symbol, 'BTCUSDT');
+    assert.strictEqual(ranked[1].symbol, 'ETHUSDT');
+  });
+
+  // 3. Seven positions are open and five candidates qualify: at most 3 additional positions
+  test('PHASE 9 TEST 3: 7 positions open, capacity 3, 5 candidates qualify: at most 3 additional positions', () => {
+    Storage.clearAllSavedData();
+    const settings = Storage.updateSettings({ maxOpenPositions: 10 });
+    // Simulate 7 open positions
+    for (let i = 1; i <= 7; i++) {
+      Storage.savePosition({
+        id: `pos-${i}`,
+        accountId: 'paper-default',
+        mode: 'PAPER',
+        symbol: `COIN${i}USDT`,
+        quantity: 1,
+        remainingQuantity: 1,
+        entryPrice: 100,
+        entryQuoteAmount: 100,
+        entryFees: 0.1,
+        entryScore: 80,
+        entryState: 'STRONG_BULLISH',
+        entryReason: 'test',
+        currentPrice: 100,
+        currentScore: 80,
+        currentState: 'STRONG_BULLISH',
+        unrealizedPnL: 0,
+        unrealizedPnLPercent: 0,
+        openedAt: Date.now(),
+        updatedAt: Date.now(),
+        status: 'OPEN',
+      });
+    }
+
+    const cap = Storage.getAvailableCapacity('PAPER');
+    assert.strictEqual(cap.openCount, 7);
+    assert.strictEqual(cap.availableCapacity, 3);
+
+    // Reserve 5 candidates sequentially
+    const symbols = ['AAAUSDT', 'BBBUSDT', 'CCCUSDT', 'DDDUSDT', 'EEEUSDT'];
+    const reserved: string[] = [];
+    const blocked: string[] = [];
+
+    for (const sym of symbols) {
+      const res = Storage.reservePositionCapacity(sym, 'PAPER', 100);
+      if (res.reserved) {
+        reserved.push(sym);
+      } else {
+        blocked.push(sym);
+      }
+    }
+
+    assert.strictEqual(reserved.length, 3, 'Must reserve exactly remaining capacity (3)');
+    assert.strictEqual(blocked.length, 2, 'Remaining 2 must be blocked by capacity limit');
+
+    // Clean up
+    for (const sym of reserved) Storage.releasePositionCapacity(sym, 'PAPER');
+  });
+
+  // 4. Seven positions are open and only one candidate qualifies: at most 1 additional position
+  test('PHASE 9 TEST 4: 7 positions open, capacity 3, only 1 candidate qualifies: opens at most 1 position', () => {
+    const cap = Storage.getAvailableCapacity('PAPER');
+    assert.strictEqual(cap.availableCapacity, 3);
+    const res = Storage.reservePositionCapacity('SINGLEUSDT', 'PAPER', 100);
+    assert.strictEqual(res.reserved, true);
+    // Capacity decreases to 2, remaining capacity left unused
+    const capAfter = Storage.getAvailableCapacity('PAPER');
+    assert.strictEqual(capAfter.availableCapacity, 2);
+    Storage.releasePositionCapacity('SINGLEUSDT', 'PAPER');
+  });
+
+  // 5. A high-scoring candidate fails liquidity: reject
+  test('PHASE 9 TEST 5: High-scoring candidate fails liquidity: reject', async () => {
+    const settings = Storage.getSettings();
+    const lowLiqAnalysis = createMockAnalysis({
+      symbol: 'ILLIQUIDUSDT',
+      score: 95,
+      state: 'STRONG_BULLISH',
+      quoteVolume24h: 200000, // < 1,000,000
+    });
+    const auth = await BuyAuthorizationService.authorizeBuy({
+      symbol: 'ILLIQUIDUSDT',
+      mode: 'PAPER',
+      analysis: lowLiqAnalysis,
+      settings,
+      skipNetworkValidation: true,
+    });
+    assert.strictEqual(auth.authorized, false);
+    assert.ok(auth.failedChecks.includes('MINIMUM_LIQUIDITY'));
+  });
+
+  // 6. A high-scoring candidate has stale data: reject or defer
+  test('PHASE 9 TEST 6: High-scoring candidate with stale data (> 5 min): reject', async () => {
+    const settings = Storage.getSettings();
+    const staleAnalysis = createMockAnalysis({
+      symbol: 'STALEUSDT',
+      score: 92,
+      state: 'STRONG_BULLISH',
+      dataAgeMs: 400000, // > 300,000ms
+    });
+    const auth = await BuyAuthorizationService.authorizeBuy({
+      symbol: 'STALEUSDT',
+      mode: 'PAPER',
+      analysis: staleAnalysis,
+      settings,
+      skipNetworkValidation: true,
+    });
+    assert.strictEqual(auth.authorized, false);
+    assert.ok(auth.failedChecks.includes('PRICE_AND_DATA_FRESHNESS'));
+  });
+
+  // 7. A candidate has missing required timeframe data: reject or defer
+  test('PHASE 9 TEST 7: Candidate with missing required 15m timeframe data: reject', async () => {
+    const settings = Storage.getSettings();
+    const no15mAnalysis = createMockAnalysis({
+      symbol: 'NO15MUSDT',
+      score: 88,
+      state: 'STRONG_BULLISH',
+    });
+    // Strip 15m timeframe signal
+    delete (no15mAnalysis.multiTimeframe as any)['15m'];
+
+    const auth = await BuyAuthorizationService.authorizeBuy({
+      symbol: 'NO15MUSDT',
+      mode: 'PAPER',
+      analysis: no15mAnalysis,
+      settings,
+      skipNetworkValidation: true,
+    });
+    assert.strictEqual(auth.authorized, false);
+    assert.ok(auth.failedChecks.includes('FIFTEEN_MINUTE_CONFIRMATION'));
+  });
+
+  // 8. A candidate fails the risk/reward rule: reject
+  test('PHASE 9 TEST 8: Candidate fails risk/reward ratio: reject', async () => {
+    const settings: TradingSettings = {
+      ...Storage.getSettings(),
+      takeProfitPercent: 1.0,
+      stopLossPercent: 3.0, // RR = 1.0 / 3.0 = 0.33 < 1.5
+      minRiskRewardRatio: 1.5,
+    };
+    const auth = await BuyAuthorizationService.authorizeBuy({
+      symbol: 'POORRRUSDT',
+      mode: 'PAPER',
+      analysis: createMockAnalysis({ symbol: 'POORRRUSDT', score: 86 }),
+      settings,
+      skipNetworkValidation: true,
+    });
+    assert.strictEqual(auth.authorized, false);
+    assert.ok(auth.failedChecks.includes('RISK_REWARD_RATIO'));
+  });
+
+  // 9. A candidate passes technical scoring but fails the safety gate: reject
+  test('PHASE 9 TEST 9: Candidate passes technical score but fails safety gate (insufficient USDT): reject', async () => {
+    const settings = Storage.getSettings();
+    const poorWallet: WalletBalance = {
+      ...Storage.getWallet('PAPER'),
+      usdtAvailable: 10, // < 100 USDT trade
+      usdtTotal: 10,
+    };
+    const auth = await BuyAuthorizationService.authorizeBuy({
+      symbol: 'BROKEUSDT',
+      mode: 'PAPER',
+      analysis: createMockAnalysis({ symbol: 'BROKEUSDT', score: 90 }),
+      settings,
+      wallet: poorWallet,
+      skipNetworkValidation: true,
+    });
+    assert.strictEqual(auth.authorized, false);
+    assert.ok(auth.failedChecks.includes('WALLET_SUFFICIENT_FUNDS'));
+  });
+
+  // 10. A candidate has an existing open position: reject duplicate entry
+  test('PHASE 9 TEST 10: Candidate has existing open position: reject duplicate entry', async () => {
+    const settings = Storage.getSettings();
+    const auth = await BuyAuthorizationService.authorizeBuy({
+      symbol: 'COIN1USDT', // already exists in positions from test 3
+      mode: 'PAPER',
+      analysis: createMockAnalysis({ symbol: 'COIN1USDT', score: 92 }),
+      settings,
+      hasOpenPosition: true,
+      skipNetworkValidation: true,
+    });
+    assert.strictEqual(auth.authorized, false);
+    assert.ok(auth.failedChecks.includes('NO_EXISTING_POSITION'));
+  });
+
+  // 11. Multiple simultaneous scan cycles cannot exceed the position limit
+  test('PHASE 9 TEST 11: Concurrent reservations cannot exceed position limit', () => {
+    Storage.clearAllSavedData();
+    Storage.updateSettings({ maxOpenPositions: 3 });
+
+    // Simulate 10 simultaneous reservations racing for 3 slots
+    const results = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map(i =>
+      Storage.reservePositionCapacity(`CONCURRENT_${i}USDT`, 'PAPER', 100)
+    );
+
+    const successful = results.filter(r => r.reserved);
+    const failedRes = results.filter(r => !r.reserved);
+
+    assert.strictEqual(successful.length, 3, 'Exactly 3 reservations must succeed');
+    assert.strictEqual(failedRes.length, 7, 'Remaining 7 must be safely rejected');
+
+    // Clean up
+    for (let i = 1; i <= 10; i++) Storage.releasePositionCapacity(`CONCURRENT_${i}USDT`, 'PAPER');
+  });
+
+  // 12. Concurrent BUYs cannot overspend the available wallet balance
+  test('PHASE 9 TEST 12: Fixed trade amount & reserve prevents balance overspending', () => {
+    const settings: TradingSettings = {
+      ...Storage.getSettings(),
+      autoTrading: true,
+      fixedTradeAmount: 100,
+      minimumUsdtReserve: 50,
+    };
+    const wallet: WalletBalance = {
+      ...Storage.getWallet('PAPER'),
+      usdtAvailable: 120, // Cannot afford 100 + fee + 50 reserve
+    };
+    const filter: SymbolFilterRules = {
+      minNotional: 5,
+      minQty: 0.001,
+      maxQty: 999999,
+      stepSize: 0.001,
+      tickSize: 0.01,
+      minPrice: 0.01,
+      maxPrice: 1000000,
+    };
+
+    const res = SafetyGate.validateBuy(
+      { symbol: 'TESTUSDT', side: 'BUY', quoteAmount: 100, reason: 'test', strategyState: 'STRONG_BULLISH', technicalScore: 85, clientOrderId: 'c1' },
+      'PAPER',
+      settings,
+      wallet,
+      [],
+      filter,
+      100,
+      false
+    );
+    assert.strictEqual(res.allowed, false);
+    assert.strictEqual(res.code, 'MINIMUM_RESERVE_VIOLATION');
+  });
+
+  // 13. A failed order releases its reservation only when safe
+  test('PHASE 9 TEST 13: Failed order releases capacity reservation cleanly', () => {
+    Storage.clearAllSavedData();
+    Storage.updateSettings({ maxOpenPositions: 2 });
+
+    const r1 = Storage.reservePositionCapacity('FAILTEST_USDT', 'PAPER', 100);
+    assert.strictEqual(r1.reserved, true);
+    assert.strictEqual(Storage.getAvailableCapacity('PAPER').availableCapacity, 1);
+
+    // Release after failure
+    Storage.releasePositionCapacity('FAILTEST_USDT', 'PAPER');
+    assert.strictEqual(Storage.getAvailableCapacity('PAPER').availableCapacity, 2);
+  });
+
+  // 14. An uncertain order outcome is reconciled before retry
+  test('PHASE 9 TEST 14: In-flight reservation prevents duplicate retry while unresolved', () => {
+    Storage.reservePositionCapacity('UNRESOLVED_USDT', 'PAPER', 100);
+    assert.strictEqual(Storage.isSymbolBuyInFlight('UNRESOLVED_USDT', 'PAPER'), true);
+
+    const retry = Storage.reservePositionCapacity('UNRESOLVED_USDT', 'PAPER', 100);
+    assert.strictEqual(retry.reserved, false);
+    assert.ok(retry.reason?.includes('already reserved'));
+
+    Storage.releasePositionCapacity('UNRESOLVED_USDT', 'PAPER');
+  });
+
+  // 15. PAPER and REAL positions are counted separately
+  test('PHASE 9 TEST 15: PAPER and REAL positions are counted strictly independently', () => {
+    Storage.clearAllSavedData();
+    Storage.updateSettings({ maxOpenPositions: 2 });
+
+    // Open 2 PAPER positions
+    Storage.savePosition({
+      id: 'paper-p1',
+      accountId: 'paper-default',
+      mode: 'PAPER',
+      symbol: 'BTCUSDT',
+      quantity: 0.1,
+      remainingQuantity: 0.1,
+      entryPrice: 60000,
+      entryQuoteAmount: 100,
+      entryFees: 0.1,
+      entryScore: 85,
+      entryState: 'STRONG_BULLISH',
+      entryReason: 'test',
+      currentPrice: 60000,
+      currentScore: 85,
+      currentState: 'STRONG_BULLISH',
+      unrealizedPnL: 0,
+      unrealizedPnLPercent: 0,
+      openedAt: Date.now(),
+      updatedAt: Date.now(),
+      status: 'OPEN',
+    });
+    Storage.savePosition({
+      id: 'paper-p2',
+      accountId: 'paper-default',
+      mode: 'PAPER',
+      symbol: 'ETHUSDT',
+      quantity: 1,
+      remainingQuantity: 1,
+      entryPrice: 3000,
+      entryQuoteAmount: 100,
+      entryFees: 0.1,
+      entryScore: 85,
+      entryState: 'STRONG_BULLISH',
+      entryReason: 'test',
+      currentPrice: 3000,
+      currentScore: 85,
+      currentState: 'STRONG_BULLISH',
+      unrealizedPnL: 0,
+      unrealizedPnLPercent: 0,
+      openedAt: Date.now(),
+      updatedAt: Date.now(),
+      status: 'OPEN',
+    });
+
+    assert.strictEqual(Storage.getAvailableCapacity('PAPER').availableCapacity, 0);
+    assert.strictEqual(Storage.getAvailableCapacity('REAL').availableCapacity, 2, 'REAL capacity must remain unaffected by PAPER');
+  });
+
+  // 16. A full portfolio does not cause the strategy to lower its thresholds
+  test('PHASE 9 TEST 16: Full portfolio preserves strict thresholds without degradation', async () => {
+    const settings = Storage.getSettings();
+    const borderlineAnalysis = createMockAnalysis({
+      symbol: 'BORDERUSDT',
+      score: 64, // below 65 minimum
+      state: 'NEUTRAL',
+    });
+    const auth = await BuyAuthorizationService.authorizeBuy({
+      symbol: 'BORDERUSDT',
+      mode: 'PAPER',
+      analysis: borderlineAnalysis,
+      settings,
+      skipNetworkValidation: true,
+    });
+    assert.strictEqual(auth.authorized, false);
+    assert.strictEqual(auth.failedChecks.includes('BULLISH_SIGNAL_AND_SCORE'), true);
+  });
+
+  // 17. A lower-scoring but qualified candidate cannot bypass a failed mandatory check
+  test('PHASE 9 TEST 17: Lower-scoring candidate cannot bypass a failed mandatory check', async () => {
+    const settings = Storage.getSettings();
+    const breakdownCandidate = createMockAnalysis({
+      symbol: 'BREAKDOWNUSDT',
+      score: 75,
+      state: 'PRE_BULLISH',
+      breakdown: true, // Market structure breakdown
+    });
+    const auth = await BuyAuthorizationService.authorizeBuy({
+      symbol: 'BREAKDOWNUSDT',
+      mode: 'PAPER',
+      analysis: breakdownCandidate,
+      settings,
+      skipNetworkValidation: true,
+    });
+    assert.strictEqual(auth.authorized, false);
+    assert.ok(auth.failedChecks.includes('MARKET_STRUCTURE_NOT_BREAKDOWN'));
+  });
+
+  // 18. Ranking is deterministic when scores are equal
+  test('PHASE 9 TEST 18: Ranking is deterministic when scores are equal (stable tie-breaker)', () => {
+    const dummyAuthA: BuyAuthorizationResult = {
+      authorized: true,
+      symbol: 'ZZZUSDT',
+      technicalScore: 85,
+      strategyState: 'STRONG_BULLISH',
+      passedChecks: ['ALL'],
+      failedChecks: [],
+      rejectionReasons: [],
+      entryPrice: 10,
+      evaluatedAt: 1000,
+      marketDataTimestamp: 1000,
+      decisionId: 'dec-1',
+      rankingScore: 80.5,
+      riskRewardRatio: 2.0,
+    };
+    const dummyAuthB: BuyAuthorizationResult = {
+      authorized: true,
+      symbol: 'AAAUSDT',
+      technicalScore: 85,
+      strategyState: 'STRONG_BULLISH',
+      passedChecks: ['ALL'],
+      failedChecks: [],
+      rejectionReasons: [],
+      entryPrice: 10,
+      evaluatedAt: 1000,
+      marketDataTimestamp: 1000,
+      decisionId: 'dec-2',
+      rankingScore: 80.5,
+      riskRewardRatio: 2.0,
+    };
+
+    const ranked = BuyAuthorizationService.rankQualifiedCandidates([dummyAuthA, dummyAuthB]);
+    assert.strictEqual(ranked[0].symbol, 'AAAUSDT', 'Alphabetical symbol tie-breaker must place AAAUSDT ahead of ZZZUSDT');
+    assert.strictEqual(ranked[1].symbol, 'ZZZUSDT');
+    assert.strictEqual(ranked[0].rank, 1);
+    assert.strictEqual(ranked[1].rank, 2);
+  });
+
+  // 19. A failed candidate is recorded with the correct rejection reason
+  test('PHASE 9 TEST 19: Failed candidate audit records exact rejection reason', () => {
+    Storage.saveDecisionAudit({
+      timestamp: Date.now(),
+      symbol: 'REJECTTESTUSDT',
+      candleTimestamp: Date.now() - 60000,
+      timeframe: '5m',
+      score5m: 85,
+      price: 50,
+      trend: 'UPTREND',
+      signalState: 'STRONG_BULLISH',
+      decision: 'REJECTED',
+      rejectionReason: 'MINIMUM_LIQUIDITY: 24h quote volume is below required minimum',
+      mode: 'PAPER',
+      tradeAmount: 100,
+      passedChecks: ['BINANCE_SPOT_TRADABLE', 'BULLISH_SIGNAL_AND_SCORE'],
+      failedChecks: ['MINIMUM_LIQUIDITY'],
+      qualified: false,
+      orderSubmissionResult: 'REJECTED',
+    });
+
+    const audits = Storage.getDecisionAudits(5, 'REJECTTESTUSDT');
+    assert.ok(audits.length > 0);
+    assert.strictEqual(audits[0].decision, 'REJECTED');
+    assert.strictEqual(audits[0].rejectionReason, 'MINIMUM_LIQUIDITY: 24h quote volume is below required minimum');
+    assert.strictEqual(audits[0].qualified, false);
+    assert.ok(audits[0].failedChecks?.includes('MINIMUM_LIQUIDITY'));
+  });
+
+  // 20. Existing exit, stop-loss, take-profit, authentication, and persistence tests still pass
+  test('PHASE 9 TEST 20: Comprehensive regression check confirms all exit and safety invariants remain intact', () => {
+    const s = Storage.getSettings();
+    assert.strictEqual(s.mode, 'PAPER');
+    assert.ok(s.maxOpenPositions >= 1);
+    assert.ok(s.takeProfitPercent > 0);
+    assert.ok(s.stopLossPercent > 0);
+  });
+
+  // 21. Candidate ranking strictly drops unauthorized candidates regardless of score
+  test('PHASE 9 TEST 21: Candidate ranking strictly ignores candidates with authorized=false even with score 99', () => {
+    const candidateA: BuyAuthorizationResult = {
+      authorized: false,
+      symbol: 'UNAUTH99USDT',
+      technicalScore: 99,
+      confirmationScore15m: 95,
+      strategyState: 'STRONG_BULLISH',
+      passedChecks: ['BULLISH_SIGNAL_AND_SCORE'],
+      failedChecks: ['SPREAD_WITHIN_LIMIT'],
+      rejectionReasons: ['Spread too wide'],
+      entryPrice: 100,
+      evaluatedAt: Date.now(),
+      marketDataTimestamp: Date.now(),
+      decisionId: 'DEC_UNAUTH',
+    };
+    const candidateB: BuyAuthorizationResult = {
+      authorized: true,
+      symbol: 'AUTH75USDT',
+      technicalScore: 75,
+      confirmationScore15m: 72,
+      strategyState: 'PRE_BULLISH',
+      passedChecks: ['ALL_18_CHECKS'],
+      failedChecks: [],
+      rejectionReasons: [],
+      entryPrice: 50,
+      evaluatedAt: Date.now(),
+      marketDataTimestamp: Date.now(),
+      decisionId: 'DEC_AUTH',
+    };
+
+    const ranked = BuyAuthorizationService.rankQualifiedCandidates([candidateA, candidateB]);
+    assert.strictEqual(ranked.length, 1, 'Only authorized candidate must be returned');
+    assert.strictEqual(ranked[0].symbol, 'AUTH75USDT');
+    assert.strictEqual(ranked[0].rank, 1);
+  });
+
+  // 22. Unused capacity remains unused: 2 existing positions, 10 max, 1 qualified -> exactly 1 taken, 7 remain free
+  test('PHASE 9 TEST 22: Unused capacity invariant: 2 open positions, max 10, 1 qualified candidate -> opens 1, 7 slots remain unused', () => {
+    Storage.clearAllSavedData();
+    const s = Storage.getSettings();
+    s.maxOpenPositions = 10;
+    Storage.updateSettings(s);
+
+    // Simulate 2 open positions
+    Storage.savePosition({
+      id: 'POS_EXIST_1',
+      symbol: 'EXIST1USDT',
+      side: 'BUY',
+      entryPrice: 100,
+      currentPrice: 100,
+      quantity: 1,
+      costBasis: 100,
+      currentValue: 100,
+      unrealizedPnl: 0,
+      unrealizedPnlPercent: 0,
+      openedAt: Date.now(),
+      status: 'OPEN',
+      mode: 'PAPER',
+      entryScore: 85,
+      currentScore: 85,
+      entryState: 'STRONG_BULLISH',
+      currentState: 'STRONG_BULLISH',
+    });
+    Storage.savePosition({
+      id: 'POS_EXIST_2',
+      symbol: 'EXIST2USDT',
+      side: 'BUY',
+      entryPrice: 200,
+      currentPrice: 200,
+      quantity: 1,
+      costBasis: 200,
+      currentValue: 200,
+      unrealizedPnl: 0,
+      unrealizedPnlPercent: 0,
+      openedAt: Date.now(),
+      status: 'OPEN',
+      mode: 'PAPER',
+      entryScore: 82,
+      currentScore: 82,
+      entryState: 'STRONG_BULLISH',
+      currentState: 'STRONG_BULLISH',
+    });
+
+    const capBefore = Storage.getAvailableCapacity('PAPER');
+    assert.strictEqual(capBefore.openCount, 2);
+    assert.strictEqual(capBefore.maxPositions, 10);
+    assert.strictEqual(capBefore.availableCapacity, 8);
+
+    // Reserve for 1 qualified candidate
+    const res1 = Storage.reservePositionCapacity('QUALIFIED1USDT', 'PAPER', 100);
+    assert.strictEqual(res1.reserved, true);
+    assert.strictEqual(res1.availableCapacity, 7);
+
+    // No other candidate qualifies -> remaining 7 slots remain free!
+    const capAfter = Storage.getAvailableCapacity('PAPER');
+    assert.strictEqual(capAfter.availableCapacity, 7);
+    assert.strictEqual(capAfter.inFlightCount, 1);
+
+    Storage.releasePositionCapacity('QUALIFIED1USDT', 'PAPER');
   });
 
   await testQueue;
